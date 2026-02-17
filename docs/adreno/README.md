@@ -120,13 +120,27 @@ Each step records the debug method and a before/after outcome (image quality or 
 
 ## Tag Map
 
-Step tags are created as:
-- `adreno-step01` ... `adreno-step18`
+Tag policy:
+- Legacy index tags: `adreno-step01` ... `adreno-step18` (doc index only)
+- Canonical source tags (engineering): `adreno-stepXX-src`
+  - first canonical source tag: `adreno-step18-src` (`b07d269`)
 
 Each tag is an annotated tag whose message includes:
 - debug method summary
 - before/after result summary
 - pointer to this document section
+
+## Artifact Layout (Before/After Display)
+
+For each step, keep artifacts under:
+- `exp_*/stepXX_*/` for raw logs/tensors/images
+- `docs/adreno/steps/stepXX.md` for summary page
+- `docs/adreno/assets/stepXX/` for lightweight before/after images used in docs
+
+Step18 example images:
+- before (true-native baseline context): `exp_20260216_zimage_q40/step18_1024_flashon_mldrift/zimg_step18_native_s1_decode_only_oclvae.png`
+- after (optimized path, step4): `exp_20260216_zimage_q40/step18_1024_flashon_mldrift/step18new_q1_s4_after_kv4096patch_host_decode.png`
+- after (optimized path, step8): `exp_20260216_zimage_q40/step18_1024_flashon_mldrift/step18new_q1_s8_after_kv4096patch_host_decode.png`
 
 ## Branching Model in This Fork
 
