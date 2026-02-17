@@ -2,6 +2,8 @@
 #define __LLM_HPP__
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -22,6 +24,159 @@
 
 namespace LLM {
     constexpr int LLM_GRAPH_SIZE = 10240;
+
+    struct LlmDumpConfig {
+        bool enabled         = false;
+        bool repeat          = false;
+        bool dump_all_layers = false;
+        bool dump_embed      = false;
+        std::set<int> layers;
+    };
+
+    static inline bool& llm_dump_done_ref() {
+        static bool done = false;
+        return done;
+    }
+
+    static inline void llm_dump_mark_done() {
+        llm_dump_done_ref() = true;
+    }
+
+    static inline bool llm_dump_done() {
+        return llm_dump_done_ref();
+    }
+
+    static inline void llm_dump_parse_indices(const char* env, std::set<int>& out, bool& all_flag) {
+        if (env == nullptr || env[0] == '\0') {
+            return;
+        }
+        std::string s(env);
+        for (char& c : s) {
+            if (c == ';' || c == ' ') {
+                c = ',';
+            } else {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+        }
+        std::stringstream ss(s);
+        std::string tok;
+        while (std::getline(ss, tok, ',')) {
+            if (tok.empty()) {
+                continue;
+            }
+            if (tok == "all") {
+                all_flag = true;
+                continue;
+            }
+            char* end = nullptr;
+            long v    = std::strtol(tok.c_str(), &end, 10);
+            if (end && *end == '\0') {
+                out.insert(static_cast<int>(v));
+            }
+        }
+    }
+
+    static inline const LlmDumpConfig& llm_dump_config() {
+        static LlmDumpConfig cfg = []() {
+            LlmDumpConfig c;
+            const char* dir    = std::getenv("SD_LLM_DUMP_DIR");
+            if (dir == nullptr) {
+                dir = std::getenv("SD_DUMP_TENSOR_DIR");
+            }
+            const char* enable = std::getenv("SD_LLM_DUMP");
+            const char* all    = std::getenv("SD_LLM_DUMP_ALL");
+            const char* layers = std::getenv("SD_LLM_DUMP_LAYERS");
+            const char* emb    = std::getenv("SD_LLM_DUMP_EMBED");
+            const char* rep    = std::getenv("SD_LLM_DUMP_REPEAT");
+
+            if (enable != nullptr || all != nullptr) {
+                c.dump_all_layers = true;
+                c.dump_embed      = true;
+            }
+            llm_dump_parse_indices(layers, c.layers, c.dump_all_layers);
+            if (emb != nullptr) {
+                c.dump_embed = true;
+            }
+
+            c.repeat  = rep != nullptr;
+            c.enabled = (dir != nullptr) && (c.dump_embed || c.dump_all_layers || !c.layers.empty());
+            return c;
+        }();
+        return cfg;
+    }
+
+    static inline bool llm_dump_should_cache() {
+        const auto& cfg = llm_dump_config();
+        if (!cfg.enabled) {
+            return false;
+        }
+        if (cfg.repeat) {
+            return true;
+        }
+        return !llm_dump_done();
+    }
+
+    static inline bool llm_dump_should_cache_layer(int layer_idx) {
+        if (!llm_dump_should_cache()) {
+            return false;
+        }
+        const auto& cfg = llm_dump_config();
+        if (cfg.dump_all_layers) {
+            return true;
+        }
+        return cfg.layers.find(layer_idx) != cfg.layers.end();
+    }
+
+    static inline bool llm_dump_should_cache_embed() {
+        if (!llm_dump_should_cache()) {
+            return false;
+        }
+        const auto& cfg = llm_dump_config();
+        return cfg.dump_embed;
+    }
+
+    static inline bool llm_dump_should_cache_input_ids() {
+        return llm_dump_should_cache() && (std::getenv("SD_LLM_DUMP_INPUT_IDS") != nullptr);
+    }
+
+    static inline bool llm_dump_should_cache_norm() {
+        return llm_dump_should_cache();
+    }
+
+    static inline bool llm_dump_force_no_inplace() {
+        return std::getenv("SD_LLM_DUMP_NO_INPLACE") != nullptr;
+    }
+
+    static inline bool llm_debug_names_enabled() {
+        return std::getenv("SD_LLM_DEBUG_NAMES") != nullptr;
+    }
+
+    static inline ggml_tensor* llm_set_name_if_enabled(ggml_tensor* tensor, const std::string& name) {
+        if (tensor == nullptr) {
+            return tensor;
+        }
+        if (!llm_debug_names_enabled()) {
+            return tensor;
+        }
+        ggml_set_name(tensor, name.c_str());
+        return tensor;
+    }
+
+    static inline void llm_cache_tensor(GGMLRunnerContext* ctx, const std::string& name, struct ggml_tensor* tensor) {
+        if (ctx == nullptr || ctx->runner == nullptr || tensor == nullptr) {
+            return;
+        }
+        if (ctx->runner->is_building_for_reserve()) {
+            return;
+        }
+        if (std::getenv("SD_LLM_DUMP_CONTIG") != nullptr) {
+            tensor = ggml_cont(ctx->ggml_ctx, tensor);
+        }
+        if (std::getenv("SD_LLM_DUMP_PIN") != nullptr) {
+            ggml_set_output(tensor);
+        }
+        ctx->runner->cache(name, tensor);
+    }
 
     class BPETokenizer {
     protected:
@@ -259,6 +414,42 @@ namespace LLM {
             LOG_DEBUG("split prompt \"%s\" to tokens %s", original_text.c_str(), ss.str().c_str());
             // printf("split prompt \"%s\" to tokens %s \n", original_text.c_str(), ss.str().c_str());
             return bpe_tokens;
+        }
+
+        std::string decode(const std::vector<int>& tokens, bool skip_special_tokens = false) {
+            std::string out;
+            for (int token_id : tokens) {
+                auto iter = decoder.find(token_id);
+                if (iter == decoder.end()) {
+                    continue;
+                }
+                const std::u32string& token_u32 = iter->second;
+                const std::string token_utf8    = utf32_to_utf8(token_u32);
+                if (is_special_token(token_utf8)) {
+                    if (!skip_special_tokens) {
+                        out += token_utf8;
+                    }
+                    continue;
+                }
+
+                std::string bytes;
+                bytes.reserve(token_u32.size());
+                for (char32_t c : token_u32) {
+                    auto bit = byte_decoder.find(std::u32string(1, c));
+                    if (bit != byte_decoder.end()) {
+                        bytes.push_back(static_cast<char>(bit->second));
+                    } else {
+                        // Fallback keeps decoding resilient for non-byte-level entries.
+                        bytes += utf32_to_utf8(std::u32string(1, c));
+                    }
+                }
+                out += bytes;
+            }
+            return out;
+        }
+
+        int eos_token_id() const {
+            return EOS_TOKEN_ID;
         }
     };
 
@@ -515,7 +706,10 @@ namespace LLM {
 
     struct MLP : public GGMLBlock {
     public:
-        MLP(int64_t hidden_size, int64_t intermediate_size, bool bias = false) {
+        int layer_idx = -1;
+
+        MLP(int64_t hidden_size, int64_t intermediate_size, bool bias = false, int layer_idx_ = -1)
+            : layer_idx(layer_idx_) {
             blocks["gate_proj"] = std::shared_ptr<GGMLBlock>(new Linear(hidden_size, intermediate_size, bias));
             blocks["up_proj"]   = std::shared_ptr<GGMLBlock>(new Linear(hidden_size, intermediate_size, bias));
             blocks["down_proj"] = std::shared_ptr<GGMLBlock>(new Linear(intermediate_size, hidden_size, bias));
@@ -527,10 +721,67 @@ namespace LLM {
             auto up_proj   = std::dynamic_pointer_cast<Linear>(blocks["up_proj"]);
             auto down_proj = std::dynamic_pointer_cast<Linear>(blocks["down_proj"]);
 
+            auto set_mlp_name = [&](ggml_tensor* t, const char* tag) -> ggml_tensor* {
+                if (layer_idx < 0) {
+                    return t;
+                }
+                return llm_set_name_if_enabled(t, "llm_l" + std::to_string(layer_idx) + "_mlp_" + tag);
+            };
+
+            const bool force_no_inplace_mlp = llm_dump_force_no_inplace() ||
+                                              (std::getenv("SD_LLM_FORCE_NO_INPLACE_MLP") != nullptr);
+            if (std::getenv("SD_LLM_FORCE_CONTIG_MLP_IN") != nullptr) {
+                x = ggml_cont(ctx->ggml_ctx, x);
+            }
+            x = set_mlp_name(x, "in");
+
+            auto cache_mlp = [&](const char* tag, ggml_tensor* t) {
+                if (layer_idx < 0) {
+                    return;
+                }
+                if (std::getenv("SD_LLM_DUMP_MLP_DETAIL") == nullptr) {
+                    return;
+                }
+                if (!llm_dump_should_cache_layer(layer_idx)) {
+                    return;
+                }
+                if (std::getenv("SD_LLM_DUMP_LAYER_COPY") != nullptr) {
+                    t = ggml_dup(ctx->ggml_ctx, t);
+                }
+                llm_cache_tensor(ctx, "llm_layer_" + std::to_string(layer_idx) + "_mlp_" + tag, t);
+            };
+
+            cache_mlp("in", x);
+
             auto h = gate_proj->forward(ctx, x);
-            h      = ggml_silu_inplace(ctx->ggml_ctx, h);
-            h      = ggml_mul_inplace(ctx->ggml_ctx, h, up_proj->forward(ctx, x));
-            h      = down_proj->forward(ctx, h);
+            if (std::getenv("SD_LLM_FORCE_CONTIG_MLP_GATE") != nullptr) {
+                h = ggml_cont(ctx->ggml_ctx, h);
+            }
+            if (std::getenv("SD_LLM_PIN_MLP_GATE") != nullptr) {
+                ggml_set_output(h);
+            }
+            h = set_mlp_name(h, "gate_proj");
+            cache_mlp("gate_proj", h);
+            h = force_no_inplace_mlp ? ggml_silu(ctx->ggml_ctx, h)
+                                     : ggml_silu_inplace(ctx->ggml_ctx, h);
+            h = set_mlp_name(h, "gate_silu");
+            cache_mlp("gate_silu", h);
+            auto up = up_proj->forward(ctx, x);
+            if (std::getenv("SD_LLM_FORCE_CONTIG_MLP_UP") != nullptr) {
+                up = ggml_cont(ctx->ggml_ctx, up);
+            }
+            if (std::getenv("SD_LLM_PIN_MLP_UP") != nullptr) {
+                ggml_set_output(up);
+            }
+            up = set_mlp_name(up, "up_proj");
+            cache_mlp("up_proj", up);
+            h = force_no_inplace_mlp ? ggml_mul(ctx->ggml_ctx, h, up)
+                                     : ggml_mul_inplace(ctx->ggml_ctx, h, up);
+            h = set_mlp_name(h, "mul");
+            cache_mlp("mul", h);
+            h = down_proj->forward(ctx, h);
+            h = set_mlp_name(h, "down_proj");
+            cache_mlp("down_proj", h);
             return h;
         }
     };
@@ -821,10 +1072,16 @@ namespace LLM {
         int64_t num_heads;
         int64_t num_kv_heads;
         bool qk_norm;
+        int layer_idx = -1;
 
     public:
-        Attention(const LLMParams& params)
-            : arch(params.arch), num_heads(params.num_heads), num_kv_heads(params.num_kv_heads), head_dim(params.head_dim), qk_norm(params.qk_norm) {
+        Attention(const LLMParams& params, int layer_idx_ = -1)
+            : arch(params.arch),
+              num_heads(params.num_heads),
+              num_kv_heads(params.num_kv_heads),
+              head_dim(params.head_dim),
+              qk_norm(params.qk_norm),
+              layer_idx(layer_idx_) {
             blocks["q_proj"] = std::make_shared<Linear>(params.hidden_size, num_heads * head_dim, params.qkv_bias);
             blocks["k_proj"] = std::make_shared<Linear>(params.hidden_size, num_kv_heads * head_dim, params.qkv_bias);
             blocks["v_proj"] = std::make_shared<Linear>(params.hidden_size, num_kv_heads * head_dim, params.qkv_bias);
@@ -847,9 +1104,96 @@ namespace LLM {
             auto v_proj     = std::dynamic_pointer_cast<Linear>(blocks["v_proj"]);
             auto out_proj   = std::dynamic_pointer_cast<Linear>(blocks["o_proj"]);
 
+            if (std::getenv("SD_LLM_FORCE_CONTIG_QKV") != nullptr) {
+                x = ggml_cont(ctx->ggml_ctx, x);
+            }
+
+            auto set_attn_name = [&](ggml_tensor* t, const char* tag) -> ggml_tensor* {
+                if (layer_idx < 0) {
+                    return t;
+                }
+                return llm_set_name_if_enabled(t, "llm_l" + std::to_string(layer_idx) + "_attn_" + tag);
+            };
+
+            auto cache_attn = [&](const char* tag, ggml_tensor* t) {
+                if (layer_idx < 0) {
+                    return;
+                }
+                if (std::getenv("SD_LLM_DUMP_ATTN_DETAIL") == nullptr) {
+                    return;
+                }
+                if (!llm_dump_should_cache_layer(layer_idx)) {
+                    return;
+                }
+                if (std::getenv("SD_LLM_DUMP_LAYER_COPY") != nullptr) {
+                    t = ggml_dup(ctx->ggml_ctx, t);
+                }
+                llm_cache_tensor(ctx, "llm_layer_" + std::to_string(layer_idx) + "_attn_" + tag, t);
+            };
+
             auto q = q_proj->forward(ctx, x);  // [N, n_token, num_heads*head_dim]
+            q = set_attn_name(q, "q_proj");
+            if (std::getenv("SD_LLM_BYPASS_ATTN_QPROJ") != nullptr) {
+                cache_attn("q_proj", q);
+                // Keep input_pos/attention_mask in the graph so backend allocates them; no-op add.
+                if (input_pos != nullptr) {
+                    auto pos = ggml_cont(ctx->ggml_ctx, input_pos);
+                    pos      = ggml_sum(ctx->ggml_ctx, pos);
+                    pos      = ggml_scale(ctx->ggml_ctx, pos, 0.0f);
+                    auto rep = ggml_repeat(ctx->ggml_ctx, pos, q);
+                    q        = ggml_add(ctx->ggml_ctx, q, rep);
+                }
+                if (attention_mask != nullptr) {
+                    auto mask = ggml_cont(ctx->ggml_ctx, attention_mask);
+                    mask      = ggml_sum(ctx->ggml_ctx, mask);
+                    mask      = ggml_scale(ctx->ggml_ctx, mask, 0.0f);
+                    auto rep  = ggml_repeat(ctx->ggml_ctx, mask, q);
+                    q         = ggml_add(ctx->ggml_ctx, q, rep);
+                }
+                return out_proj->forward(ctx, q);
+            }
             auto k = k_proj->forward(ctx, x);  // [N, n_token, num_kv_heads*head_dim]
-            auto v = v_proj->forward(ctx, x);  // [N, n_token, num_kv_heads*head_dim]
+            k = set_attn_name(k, "k_proj");
+            auto v_in = x;
+#ifdef SD_USE_OPENCL
+            if (arch == LLMArch::QWEN3 && ggml_backend_is_opencl(ctx->backend) &&
+                std::getenv("SD_LLM_DUP_VPROJ_IN") != nullptr) {
+                v_in = ggml_dup(ctx->ggml_ctx, x);
+            }
+#endif
+            auto v = v_proj->forward(ctx, v_in);  // [N, n_token, num_kv_heads*head_dim]
+            v = set_attn_name(v, "v_proj");
+#ifdef SD_USE_OPENCL
+            if (arch == LLMArch::QWEN3 && ggml_backend_is_opencl(ctx->backend) &&
+                std::getenv("SD_LLM_DUP_VPROJ_OUT") != nullptr) {
+                v = ggml_dup(ctx->ggml_ctx, v);
+                v = set_attn_name(v, "v_proj_dup");
+            }
+#endif
+#ifdef SD_USE_OPENCL
+            if (arch == LLMArch::QWEN3 && ggml_backend_is_opencl(ctx->backend)) {
+                // Prevent OpenCL allocator from reusing v_proj buffer for k_proj, which corrupts v before attention.
+                ggml_set_output(v);
+            }
+#endif
+            if (std::getenv("SD_LLM_FORCE_DUP_QKV") != nullptr) {
+                q = ggml_dup(ctx->ggml_ctx, q);
+                k = ggml_dup(ctx->ggml_ctx, k);
+                v = ggml_dup(ctx->ggml_ctx, v);
+            }
+            if (std::getenv("SD_LLM_FORCE_CONTIG_QKV_OUT") != nullptr) {
+                q = ggml_cont(ctx->ggml_ctx, q);
+                k = ggml_cont(ctx->ggml_ctx, k);
+                v = ggml_cont(ctx->ggml_ctx, v);
+            }
+            if (std::getenv("SD_LLM_PIN_QKV") != nullptr) {
+                ggml_set_output(q);
+                ggml_set_output(k);
+                ggml_set_output(v);
+            }
+            cache_attn("q_proj", q);
+            cache_attn("k_proj", k);
+            cache_attn("v_proj", v);
 
             q = ggml_reshape_4d(ctx->ggml_ctx, q, head_dim, num_heads, n_token, N);     // [N, n_token, num_heads, head_dim]
             k = ggml_reshape_4d(ctx->ggml_ctx, k, head_dim, num_kv_heads, n_token, N);  // [N, n_token, num_kv_heads, head_dim]
@@ -860,7 +1204,9 @@ namespace LLM {
                 auto k_norm = std::dynamic_pointer_cast<RMSNorm>(blocks["k_norm"]);
 
                 q = q_norm->forward(ctx, q);
+                cache_attn("q_norm", q);
                 k = k_norm->forward(ctx, k);
+                cache_attn("k_norm", k);
             }
 
             if (arch == LLMArch::MISTRAL_SMALL_3_2) {
@@ -874,14 +1220,20 @@ namespace LLM {
                 q               = ggml_rope_multi(ctx->ggml_ctx, q, input_pos, nullptr, head_dim, sections, GGML_ROPE_TYPE_MROPE, 128000, 1000000.f, 1.f, 0.f, 1.f, 32.f, 1.f);
                 k               = ggml_rope_multi(ctx->ggml_ctx, k, input_pos, nullptr, head_dim, sections, GGML_ROPE_TYPE_MROPE, 128000, 1000000.f, 1.f, 0.f, 1.f, 32.f, 1.f);
             }
+            cache_attn("q_rope", q);
+            cache_attn("k_rope", k);
 
             q = ggml_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, q, 0, 2, 1, 3));  // [N, num_heads, n_token, head_dim]
             q = ggml_reshape_3d(ctx->ggml_ctx, q, q->ne[0], q->ne[1], q->ne[2] * q->ne[3]);      // [N*num_heads, n_token, head_dim]
+            cache_attn("q_3d", q);
 
             k = ggml_cont(ctx->ggml_ctx, ggml_ext_torch_permute(ctx->ggml_ctx, k, 0, 2, 1, 3));  // [N, num_kv_heads, n_token, head_dim]
             k = ggml_reshape_3d(ctx->ggml_ctx, k, k->ne[0], k->ne[1], k->ne[2] * k->ne[3]);      // [N*num_kv_heads, n_token, head_dim]
+            cache_attn("k_3d", k);
 
             x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, num_heads, attention_mask, true, false);  // [N, n_token, hidden_size]
+            x = set_attn_name(x, "ctx");
+            cache_attn("ctx", x);
 
             x = out_proj->forward(ctx, x);  // [N, n_token, hidden_size]
             return x;
@@ -890,9 +1242,12 @@ namespace LLM {
 
     struct TransformerBlock : public GGMLBlock {
     public:
-        TransformerBlock(const LLMParams& params) {
-            blocks["self_attn"]                = std::make_shared<Attention>(params);
-            blocks["mlp"]                      = std::make_shared<MLP>(params.hidden_size, params.intermediate_size);
+        int layer_idx = -1;
+
+        TransformerBlock(const LLMParams& params, int layer_idx_ = -1)
+            : layer_idx(layer_idx_) {
+            blocks["self_attn"]                = std::make_shared<Attention>(params, layer_idx_);
+            blocks["mlp"]                      = std::make_shared<MLP>(params.hidden_size, params.intermediate_size, false, layer_idx_);
             blocks["input_layernorm"]          = std::make_shared<RMSNorm>(params.hidden_size, params.rms_norm_eps);
             blocks["post_attention_layernorm"] = std::make_shared<RMSNorm>(params.hidden_size, params.rms_norm_eps);
         }
@@ -907,15 +1262,45 @@ namespace LLM {
             auto input_layernorm          = std::dynamic_pointer_cast<RMSNorm>(blocks["input_layernorm"]);
             auto post_attention_layernorm = std::dynamic_pointer_cast<RMSNorm>(blocks["post_attention_layernorm"]);
 
+            auto cache_detail = [&](const char* tag, ggml_tensor* t) {
+                if (layer_idx < 0) {
+                    return;
+                }
+                if (std::getenv("SD_LLM_DUMP_LAYER_DETAIL") == nullptr) {
+                    return;
+                }
+                if (!llm_dump_should_cache_layer(layer_idx)) {
+                    return;
+                }
+                if (std::getenv("SD_LLM_DUMP_LAYER_COPY") != nullptr) {
+                    t = ggml_dup(ctx->ggml_ctx, t);
+                }
+                llm_cache_tensor(ctx, "llm_layer_" + std::to_string(layer_idx) + "_" + tag, t);
+            };
+
             auto residual = x;
             x             = input_layernorm->forward(ctx, x);
+            if (layer_idx >= 0) {
+                llm_set_name_if_enabled(x, "llm_l" + std::to_string(layer_idx) + "_ln1");
+            }
+            cache_detail("ln1", x);
             x             = self_attn->forward(ctx, x, input_pos, attention_mask);
-            x             = ggml_add_inplace(ctx->ggml_ctx, x, residual);
+            cache_detail("attn", x);
+            x             = llm_dump_force_no_inplace() ? ggml_add(ctx->ggml_ctx, x, residual)
+                                                        : ggml_add_inplace(ctx->ggml_ctx, x, residual);
+            cache_detail("resid1", x);
 
             residual = x;
             x        = post_attention_layernorm->forward(ctx, x);
+            if (layer_idx >= 0) {
+                llm_set_name_if_enabled(x, "llm_l" + std::to_string(layer_idx) + "_ln2");
+            }
+            cache_detail("ln2", x);
             x        = mlp->forward(ctx, x);
-            x        = ggml_add_inplace(ctx->ggml_ctx, x, residual);
+            cache_detail("mlp", x);
+            x        = llm_dump_force_no_inplace() ? ggml_add(ctx->ggml_ctx, x, residual)
+                                                   : ggml_add_inplace(ctx->ggml_ctx, x, residual);
+            cache_detail("resid2", x);
 
             return x;
         }
@@ -930,9 +1315,16 @@ namespace LLM {
             : num_layers(params.num_layers) {
             blocks["embed_tokens"] = std::shared_ptr<GGMLBlock>(new Embedding(params.vocab_size, params.hidden_size));
             for (int i = 0; i < num_layers; i++) {
-                blocks["layers." + std::to_string(i)] = std::shared_ptr<GGMLBlock>(new TransformerBlock(params));
+                blocks["layers." + std::to_string(i)] = std::shared_ptr<GGMLBlock>(new TransformerBlock(params, i));
             }
             blocks["norm"] = std::shared_ptr<GGMLBlock>(new RMSNorm(params.hidden_size, params.rms_norm_eps));
+        }
+
+        struct ggml_tensor* embed_forward(GGMLRunnerContext* ctx,
+                                          struct ggml_tensor* input_ids) {
+            // input_ids: [N, n_token]
+            auto embed_tokens = std::dynamic_pointer_cast<Embedding>(blocks["embed_tokens"]);
+            return embed_tokens->forward(ctx, input_ids);
         }
 
         struct ggml_tensor* forward(GGMLRunnerContext* ctx,
@@ -947,7 +1339,22 @@ namespace LLM {
             auto embed_tokens = std::dynamic_pointer_cast<Embedding>(blocks["embed_tokens"]);
             auto norm         = std::dynamic_pointer_cast<RMSNorm>(blocks["norm"]);
 
+            if (llm_dump_should_cache_input_ids()) {
+                llm_cache_tensor(ctx, "llm_input_ids", input_ids);
+            }
+
             auto x = embed_tokens->forward(ctx, input_ids);
+            if (llm_dump_should_cache_embed()) {
+                if (std::getenv("SD_LLM_DUMP_EMBED_COPY") != nullptr) {
+                    auto x_dump = ggml_dup(ctx->ggml_ctx, x);
+                    llm_cache_tensor(ctx, "llm_embed", x_dump);
+                } else {
+                    llm_cache_tensor(ctx, "llm_embed", x);
+                    if (std::getenv("SD_LLM_DUMP_FREEZE") != nullptr) {
+                        x = ggml_dup(ctx->ggml_ctx, x);
+                    }
+                }
+            }
 
             std::vector<ggml_tensor*> intermediate_outputs;
 
@@ -994,6 +1401,14 @@ namespace LLM {
                 auto block = std::dynamic_pointer_cast<TransformerBlock>(blocks["layers." + std::to_string(i)]);
 
                 x = block->forward(ctx, x, input_pos, attention_mask);
+                if (llm_dump_should_cache_layer(i)) {
+                    if (std::getenv("SD_LLM_DUMP_LAYER_COPY") != nullptr) {
+                        auto x_dump = ggml_dup(ctx->ggml_ctx, x);
+                        llm_cache_tensor(ctx, "llm_layer_" + std::to_string(i), x_dump);
+                    } else {
+                        llm_cache_tensor(ctx, "llm_layer_" + std::to_string(i), x);
+                    }
+                }
                 if (out_layers.find(i + 1) != out_layers.end()) {
                     intermediate_outputs.push_back(x);
                 }
@@ -1006,6 +1421,9 @@ namespace LLM {
                 }
             } else {
                 x = norm->forward(ctx, x);
+                if (llm_dump_should_cache_norm()) {
+                    llm_cache_tensor(ctx, "llm_norm", x);
+                }
             }
             return x;
         }
@@ -1047,6 +1465,12 @@ namespace LLM {
 
             auto x = model->forward(ctx, input_ids, input_pos, attention_mask, image_embeds, out_layers);
             return x;
+        }
+
+        struct ggml_tensor* embed_forward(GGMLRunnerContext* ctx,
+                                          struct ggml_tensor* input_ids) {
+            auto model = std::dynamic_pointer_cast<TextModel>(blocks["model"]);
+            return model->embed_forward(ctx, input_ids);
         }
 
         struct ggml_tensor* vision_forward(GGMLRunnerContext* ctx,
@@ -1191,42 +1615,51 @@ namespace LLM {
                 image_embed.second = to_backend(image_embed.second);
             }
 
-            int64_t n_tokens = input_ids->ne[0];
-            if (params.arch == LLMArch::MISTRAL_SMALL_3_2 || params.arch == LLMArch::QWEN3) {
-                input_pos_vec.resize(n_tokens);
-                for (int i = 0; i < n_tokens; ++i) {
-                    input_pos_vec[i] = i;
-                }
-            } else {
-                input_pos_vec.resize(n_tokens * 4);
-                for (int i = 0; i < n_tokens; ++i) {
-                    input_pos_vec[i]                = i;
-                    input_pos_vec[n_tokens + i]     = i;
-                    input_pos_vec[2 * n_tokens + i] = i;
-                    input_pos_vec[3 * n_tokens + i] = 0;
-                }
-            }
+            int64_t n_tokens  = input_ids->ne[0];
+            bool bypass_attn  = std::getenv("SD_LLM_BYPASS_ATTN_QPROJ") != nullptr;
+            struct ggml_tensor* input_pos = nullptr;
 
-            auto input_pos = ggml_new_tensor_1d(compute_ctx,
-                                                GGML_TYPE_I32,
-                                                input_pos_vec.size());
-            set_backend_tensor_data(input_pos, input_pos_vec.data());
-
-            if (attention_mask != nullptr) {
-                attention_mask = to_backend(attention_mask);
-            } else {
-                attention_mask_vec.resize(n_tokens * n_tokens);
-                for (int i0 = 0; i0 < n_tokens; i0++) {
-                    for (int i1 = 0; i1 < n_tokens; i1++) {
-                        float value = 0.f;
-                        if (i0 > i1) {
-                            value = -INFINITY;
-                        }
-                        attention_mask_vec[i1 * n_tokens + i0] = value;
+            if (!bypass_attn) {
+                if (params.arch == LLMArch::MISTRAL_SMALL_3_2 || params.arch == LLMArch::QWEN3) {
+                    input_pos_vec.resize(n_tokens);
+                    for (int i = 0; i < n_tokens; ++i) {
+                        input_pos_vec[i] = i;
+                    }
+                } else {
+                    input_pos_vec.resize(n_tokens * 4);
+                    for (int i = 0; i < n_tokens; ++i) {
+                        input_pos_vec[i]                = i;
+                        input_pos_vec[n_tokens + i]     = i;
+                        input_pos_vec[2 * n_tokens + i] = i;
+                        input_pos_vec[3 * n_tokens + i] = 0;
                     }
                 }
-                attention_mask = ggml_new_tensor_2d(compute_ctx, GGML_TYPE_F32, n_tokens, n_tokens);
-                set_backend_tensor_data(attention_mask, attention_mask_vec.data());
+
+                input_pos = ggml_new_tensor_1d(compute_ctx,
+                                               GGML_TYPE_I32,
+                                               input_pos_vec.size());
+                set_backend_tensor_data(input_pos, input_pos_vec.data());
+            }
+
+            if (!bypass_attn) {
+                if (attention_mask != nullptr) {
+                    attention_mask = to_backend(attention_mask);
+                } else {
+                    attention_mask_vec.resize(n_tokens * n_tokens);
+                    for (int i0 = 0; i0 < n_tokens; i0++) {
+                        for (int i1 = 0; i1 < n_tokens; i1++) {
+                            float value = 0.f;
+                            if (i0 > i1) {
+                                value = -INFINITY;
+                            }
+                            attention_mask_vec[i1 * n_tokens + i0] = value;
+                        }
+                    }
+                    attention_mask = ggml_new_tensor_2d(compute_ctx, GGML_TYPE_F32, n_tokens, n_tokens);
+                    set_backend_tensor_data(attention_mask, attention_mask_vec.data());
+                }
+            } else {
+                attention_mask = nullptr;
             }
 
             auto runner_ctx = get_context();
@@ -1238,6 +1671,197 @@ namespace LLM {
             return gf;
         }
 
+        struct ggml_tensor* find_lm_head_weight() {
+            std::map<std::string, struct ggml_tensor*> tensors;
+            model.get_param_tensors(tensors, "");
+            const char* candidates[] = {
+                "embed_tokens.weight",
+                "model.embed_tokens.weight",
+                "text_encoders.llm.embed_tokens.weight",
+                "text_encoders.llm.model.embed_tokens.weight",
+            };
+            for (const char* name : candidates) {
+                auto it = tensors.find(name);
+                if (it != tensors.end()) {
+                    return it->second;
+                }
+            }
+            for (const auto& kv : tensors) {
+                if (ends_with(kv.first, ".embed_tokens.weight") || kv.first == "embed_tokens.weight") {
+                    return kv.second;
+                }
+            }
+            return nullptr;
+        }
+
+        struct ggml_cgraph* build_last_logits_graph(struct ggml_tensor* input_ids,
+                                                    struct ggml_tensor* attention_mask,
+                                                    std::vector<std::pair<int, ggml_tensor*>> image_embeds) {
+            struct ggml_cgraph* gf = ggml_new_graph(compute_ctx);
+
+            input_ids = to_backend(input_ids);
+
+            for (auto& image_embed : image_embeds) {
+                image_embed.second = to_backend(image_embed.second);
+            }
+
+            int64_t n_tokens  = input_ids->ne[0];
+            bool bypass_attn  = std::getenv("SD_LLM_BYPASS_ATTN_QPROJ") != nullptr;
+            struct ggml_tensor* input_pos = nullptr;
+
+            if (!bypass_attn) {
+                if (params.arch == LLMArch::MISTRAL_SMALL_3_2 || params.arch == LLMArch::QWEN3) {
+                    input_pos_vec.resize(n_tokens);
+                    for (int i = 0; i < n_tokens; ++i) {
+                        input_pos_vec[i] = i;
+                    }
+                } else {
+                    input_pos_vec.resize(n_tokens * 4);
+                    for (int i = 0; i < n_tokens; ++i) {
+                        input_pos_vec[i]                = i;
+                        input_pos_vec[n_tokens + i]     = i;
+                        input_pos_vec[2 * n_tokens + i] = i;
+                        input_pos_vec[3 * n_tokens + i] = 0;
+                    }
+                }
+
+                input_pos = ggml_new_tensor_1d(compute_ctx,
+                                               GGML_TYPE_I32,
+                                               input_pos_vec.size());
+                set_backend_tensor_data(input_pos, input_pos_vec.data());
+            }
+
+            if (!bypass_attn) {
+                if (attention_mask != nullptr) {
+                    attention_mask = to_backend(attention_mask);
+                } else {
+                    attention_mask_vec.resize(n_tokens * n_tokens);
+                    for (int i0 = 0; i0 < n_tokens; i0++) {
+                        for (int i1 = 0; i1 < n_tokens; i1++) {
+                            float value = 0.f;
+                            if (i0 > i1) {
+                                value = -INFINITY;
+                            }
+                            attention_mask_vec[i1 * n_tokens + i0] = value;
+                        }
+                    }
+                    attention_mask = ggml_new_tensor_2d(compute_ctx, GGML_TYPE_F32, n_tokens, n_tokens);
+                    set_backend_tensor_data(attention_mask, attention_mask_vec.data());
+                }
+            } else {
+                attention_mask = nullptr;
+            }
+
+            auto runner_ctx = get_context();
+            struct ggml_tensor* hidden_states = forward(&runner_ctx, input_ids, input_pos, attention_mask, image_embeds, {});
+
+            struct ggml_tensor* hidden_2d = ggml_reshape_2d(compute_ctx,
+                                                            hidden_states,
+                                                            hidden_states->ne[0],
+                                                            hidden_states->ne[1] * hidden_states->ne[2]);
+            const int64_t last_idx = hidden_2d->ne[1] - 1;
+            struct ggml_tensor* last_hidden = ggml_view_2d(compute_ctx,
+                                                           hidden_2d,
+                                                           hidden_2d->ne[0],
+                                                           1,
+                                                           hidden_2d->nb[1],
+                                                           hidden_2d->nb[1] * last_idx);
+            last_hidden = ggml_cont(compute_ctx, last_hidden);
+
+            struct ggml_tensor* lm_head_weight = find_lm_head_weight();
+            if (lm_head_weight == nullptr) {
+                LOG_ERROR("failed to find lm head weight (embed_tokens.weight)");
+                return gf;
+            }
+
+            struct ggml_tensor* logits = ggml_mul_mat(compute_ctx, lm_head_weight, last_hidden);
+            ggml_build_forward_expand(gf, logits);
+            return gf;
+        }
+
+        struct ggml_cgraph* build_embed_graph(struct ggml_tensor* input_ids) {
+            struct ggml_cgraph* gf = ggml_new_graph(compute_ctx);
+
+            input_ids = to_backend(input_ids);
+
+            auto runner_ctx = get_context();
+            struct ggml_tensor* hidden_states = model.embed_forward(&runner_ctx, input_ids);
+
+            ggml_build_forward_expand(gf, hidden_states);
+
+            return gf;
+        }
+
+        static bool dump_tensor_to_file(const std::string& path, const char* name, const ggml_tensor* tensor) {
+            if (tensor == nullptr) {
+                return false;
+            }
+            std::ofstream f(path, std::ios::binary);
+            if (!f.is_open()) {
+                return false;
+            }
+            const int32_t n_dims   = ggml_n_dims(tensor);
+            const int32_t name_len = name ? static_cast<int32_t>(std::char_traits<char>::length(name)) : 0;
+            const int32_t ttype    = static_cast<int32_t>(tensor->type);
+
+            std::vector<uint8_t> buf(ggml_nbytes(tensor));
+            if (tensor->buffer != nullptr) {
+                ggml_backend_tensor_get(tensor, buf.data(), 0, buf.size());
+            } else if (tensor->data != nullptr) {
+                memcpy(buf.data(), tensor->data, buf.size());
+            } else {
+                return false;
+            }
+
+            f.write(reinterpret_cast<const char*>(&n_dims), sizeof(n_dims));
+            f.write(reinterpret_cast<const char*>(&name_len), sizeof(name_len));
+            f.write(reinterpret_cast<const char*>(&ttype), sizeof(ttype));
+            for (int i = 0; i < n_dims; ++i) {
+                const int32_t ne = static_cast<int32_t>(tensor->ne[i]);
+                f.write(reinterpret_cast<const char*>(&ne), sizeof(ne));
+            }
+            if (name_len > 0) {
+                f.write(name, name_len);
+            }
+            f.write(reinterpret_cast<const char*>(buf.data()), buf.size());
+            f.flush();
+            return true;
+        }
+
+        bool dump_cached_tensors_if_needed() {
+            const auto& cfg = llm_dump_config();
+            if (!cfg.enabled || cache_ctx == nullptr) {
+                return false;
+            }
+            const char* dir = std::getenv("SD_LLM_DUMP_DIR");
+            if (dir == nullptr) {
+                dir = std::getenv("SD_DUMP_TENSOR_DIR");
+            }
+            if (dir == nullptr) {
+                return false;
+            }
+            const char* tag = std::getenv("SD_LLM_DUMP_TAG");
+            if (tag == nullptr) {
+                tag = std::getenv("SD_DUMP_TENSOR_TAG");
+            }
+            std::string base(dir);
+            if (!base.empty() && base.back() != '/') {
+                base.push_back('/');
+            }
+            std::string prefix = tag ? tag : "llm";
+            bool wrote          = false;
+            for (ggml_tensor* t = ggml_get_first_tensor(cache_ctx); t != nullptr; t = ggml_get_next_tensor(cache_ctx, t)) {
+                const char* name = ggml_get_name(t);
+                std::string fname = base + prefix + "_" + (name && name[0] ? name : "tensor") + ".tensor";
+                wrote |= dump_tensor_to_file(fname, name, t);
+            }
+            free_cache_ctx_and_buffer();
+            if (wrote && !cfg.repeat) {
+                llm_dump_mark_done();
+            }
+            return wrote;
+        }
+
         bool compute(const int n_threads,
                      struct ggml_tensor* input_ids,
                      struct ggml_tensor* attention_mask,
@@ -1247,6 +1871,36 @@ namespace LLM {
                      ggml_context* output_ctx = nullptr) {
             auto get_graph = [&]() -> struct ggml_cgraph* {
                 return build_graph(input_ids, attention_mask, image_embeds, out_layers);
+            };
+            const bool ok = GGMLRunner::compute(get_graph, n_threads, true, output, output_ctx);
+            if (ok) {
+                dump_cached_tensors_if_needed();
+            }
+            return ok;
+        }
+
+        bool compute_last_logits(const int n_threads,
+                                 struct ggml_tensor* input_ids,
+                                 struct ggml_tensor* attention_mask,
+                                 std::vector<std::pair<int, ggml_tensor*>> image_embeds,
+                                 ggml_tensor** output,
+                                 ggml_context* output_ctx = nullptr) {
+            auto get_graph = [&]() -> struct ggml_cgraph* {
+                return build_last_logits_graph(input_ids, attention_mask, image_embeds);
+            };
+            const bool ok = GGMLRunner::compute(get_graph, n_threads, true, output, output_ctx);
+            if (ok) {
+                dump_cached_tensors_if_needed();
+            }
+            return ok;
+        }
+
+        bool compute_embed(const int n_threads,
+                           struct ggml_tensor* input_ids,
+                           ggml_tensor** output,
+                           ggml_context* output_ctx = nullptr) {
+            auto get_graph = [&]() -> struct ggml_cgraph* {
+                return build_embed_graph(input_ids);
             };
             return GGMLRunner::compute(get_graph, n_threads, true, output, output_ctx);
         }

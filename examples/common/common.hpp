@@ -435,6 +435,8 @@ struct SDContextParams {
     std::string t5xxl_path;
     std::string llm_path;
     std::string llm_vision_path;
+    std::string cond_c_crossattn_path;
+    std::string uncond_c_crossattn_path;
     std::string diffusion_model_path;
     std::string high_noise_diffusion_model_path;
     std::string vae_path;
@@ -509,6 +511,14 @@ struct SDContextParams {
              "--llm_vision",
              "path to the llm vit",
              &llm_vision_path},
+            {"",
+             "--cond-crossattn",
+             "path to precomputed cond c_crossattn tensor (.tensor). If set, skip LLM forward",
+             &cond_c_crossattn_path},
+            {"",
+             "--uncond-crossattn",
+             "path to precomputed uncond c_crossattn tensor (.tensor) when cfg-scale != 1",
+             &uncond_c_crossattn_path},
             {"",
              "--qwen2vl",
              "alias of --llm. Deprecated.",
@@ -863,6 +873,15 @@ struct SDContextParams {
 
         build_embedding_map();
 
+        if (!cond_c_crossattn_path.empty() && !fs::exists(cond_c_crossattn_path)) {
+            LOG_ERROR("error: cond c_crossattn file not found: %s", cond_c_crossattn_path.c_str());
+            return false;
+        }
+        if (!uncond_c_crossattn_path.empty() && !fs::exists(uncond_c_crossattn_path)) {
+            LOG_ERROR("error: uncond c_crossattn file not found: %s", uncond_c_crossattn_path.c_str());
+            return false;
+        }
+
         return true;
     }
 
@@ -889,6 +908,8 @@ struct SDContextParams {
             << "  t5xxl_path: \"" << t5xxl_path << "\",\n"
             << "  llm_path: \"" << llm_path << "\",\n"
             << "  llm_vision_path: \"" << llm_vision_path << "\",\n"
+            << "  cond_c_crossattn_path: \"" << cond_c_crossattn_path << "\",\n"
+            << "  uncond_c_crossattn_path: \"" << uncond_c_crossattn_path << "\",\n"
             << "  diffusion_model_path: \"" << diffusion_model_path << "\",\n"
             << "  high_noise_diffusion_model_path: \"" << high_noise_diffusion_model_path << "\",\n"
             << "  vae_path: \"" << vae_path << "\",\n"
@@ -987,6 +1008,8 @@ struct SDContextParams {
             chroma_t5_mask_pad,
             qwen_image_zero_cond_t,
             flow_shift,
+            cond_c_crossattn_path.c_str(),
+            uncond_c_crossattn_path.c_str(),
         };
         return sd_ctx_params;
     }

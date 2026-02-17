@@ -1764,8 +1764,17 @@ bool ModelLoader::save_to_gguf_file(const std::string& file_path, ggml_type type
             }
         }
 
-        if (tensor_should_be_converted(tensor_storage, dst_type)) {
+        const bool should_convert = tensor_should_be_converted(tensor_storage, dst_type);
+        if (should_convert) {
             tensor_type = dst_type;
+        }
+
+        // Keep quantized exports BF16-free: tensors skipped from quantization
+        // are still cast to F16 to avoid BF16-only runtime gaps on some backends.
+        if (!should_convert &&
+            tensor_type == GGML_TYPE_BF16 &&
+            (dst_type == GGML_TYPE_F16 || ggml_is_quantized(dst_type))) {
+            tensor_type = GGML_TYPE_F16;
         }
 
         std::lock_guard<std::mutex> lock(tensor_mutex);

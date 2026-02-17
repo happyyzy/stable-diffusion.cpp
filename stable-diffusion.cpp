@@ -1,5 +1,15 @@
 #include "ggml_extend.hpp"
 
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+#ifdef SD_USE_HEXAGON
+#include "ggml-hexagon.h"
+#endif
+
 #include "model.h"
 #include "rng.hpp"
 #include "rng_mt19937.hpp"
@@ -53,6 +63,284 @@ const char* model_version_to_str[] = {
     "Z-Image",
     "Ovis Image",
 };
+
+static bool sd_dump_tensor_to_file(const std::string& path, const char* name, const ggml_tensor* tensor) {
+    if (tensor == nullptr) {
+        LOG_ERROR("dump tensor failed: tensor is null");
+        return false;
+    }
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (f == nullptr) {
+        LOG_ERROR("dump tensor failed: cannot open '%s'", path.c_str());
+        return false;
+    }
+
+    const int32_t n_dims   = ggml_n_dims(tensor);
+    const int32_t name_len = name ? static_cast<int32_t>(std::strlen(name)) : 0;
+    const int32_t ttype    = static_cast<int32_t>(tensor->type);
+
+    std::fwrite(&n_dims, sizeof(n_dims), 1, f);
+    std::fwrite(&name_len, sizeof(name_len), 1, f);
+    std::fwrite(&ttype, sizeof(ttype), 1, f);
+    for (int i = 0; i < n_dims; ++i) {
+        const int32_t ne = static_cast<int32_t>(tensor->ne[i]);
+        std::fwrite(&ne, sizeof(ne), 1, f);
+    }
+    if (name_len > 0) {
+        std::fwrite(name, 1, name_len, f);
+    }
+    const size_t nbytes = ggml_nbytes(tensor);
+    if (tensor->buffer != nullptr) {
+        std::vector<uint8_t> buf(nbytes);
+        ggml_backend_tensor_get(tensor, buf.data(), 0, buf.size());
+        std::fwrite(buf.data(), 1, buf.size(), f);
+    } else if (tensor->data != nullptr) {
+        std::fwrite(tensor->data, 1, nbytes, f);
+    } else {
+        std::fclose(f);
+        LOG_ERROR("dump tensor failed: tensor has no data");
+        return false;
+    }
+    std::fflush(f);
+    std::fclose(f);
+    return true;
+}
+
+struct sd_tensor_stats {
+    int64_t n_elem = 0;
+    int64_t n_nan  = 0;
+    int64_t n_inf  = 0;
+    double max_abs = 0.0;
+    double mean_abs = 0.0;
+    double rms = 0.0;
+};
+
+static bool sd_fill_stats_from_f32(const float* data, int64_t n, sd_tensor_stats& out) {
+    if (data == nullptr || n <= 0) {
+        return false;
+    }
+    out.n_elem = n;
+    double sum_abs = 0.0;
+    double sum_sq  = 0.0;
+    double max_abs = 0.0;
+    int64_t n_nan = 0;
+    int64_t n_inf = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        const float v = data[i];
+        if (std::isnan(v)) {
+            n_nan++;
+            continue;
+        }
+        if (!std::isfinite(v)) {
+            n_inf++;
+            continue;
+        }
+        const double av = std::fabs((double)v);
+        sum_abs += av;
+        sum_sq  += av * av;
+        if (av > max_abs) {
+            max_abs = av;
+        }
+    }
+    out.n_nan   = n_nan;
+    out.n_inf   = n_inf;
+    out.max_abs = max_abs;
+    const int64_t n_finite = n - n_nan - n_inf;
+    if (n_finite > 0) {
+        out.mean_abs = sum_abs / (double)n_finite;
+        out.rms      = std::sqrt(sum_sq / (double)n_finite);
+    }
+    return true;
+}
+
+static bool sd_fill_stats_from_f16(const ggml_fp16_t* data, int64_t n, sd_tensor_stats& out) {
+    if (data == nullptr || n <= 0) {
+        return false;
+    }
+    out.n_elem = n;
+    double sum_abs = 0.0;
+    double sum_sq  = 0.0;
+    double max_abs = 0.0;
+    int64_t n_nan = 0;
+    int64_t n_inf = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        const float v = ggml_fp16_to_fp32(data[i]);
+        if (std::isnan(v)) {
+            n_nan++;
+            continue;
+        }
+        if (!std::isfinite(v)) {
+            n_inf++;
+            continue;
+        }
+        const double av = std::fabs((double)v);
+        sum_abs += av;
+        sum_sq  += av * av;
+        if (av > max_abs) {
+            max_abs = av;
+        }
+    }
+    out.n_nan   = n_nan;
+    out.n_inf   = n_inf;
+    out.max_abs = max_abs;
+    const int64_t n_finite = n - n_nan - n_inf;
+    if (n_finite > 0) {
+        out.mean_abs = sum_abs / (double)n_finite;
+        out.rms      = std::sqrt(sum_sq / (double)n_finite);
+    }
+    return true;
+}
+
+static bool sd_get_tensor_stats_host(const ggml_tensor* tensor, sd_tensor_stats& out);
+
+static bool sd_get_tensor_stats_backend(const ggml_tensor* tensor, sd_tensor_stats& out) {
+    if (tensor == nullptr) {
+        return false;
+    }
+    const int64_t n_elem = (int64_t)ggml_nelements(tensor);
+    if (n_elem <= 0) {
+        return false;
+    }
+    if (tensor->buffer == nullptr) {
+        return sd_get_tensor_stats_host(tensor, out);
+    }
+    const size_t nbytes = ggml_nbytes(tensor);
+    std::vector<uint8_t> buf(nbytes);
+    ggml_backend_tensor_get(tensor, buf.data(), 0, nbytes);
+    if (tensor->type == GGML_TYPE_F32) {
+        return sd_fill_stats_from_f32(reinterpret_cast<const float*>(buf.data()), n_elem, out);
+    }
+    if (tensor->type == GGML_TYPE_F16) {
+        return sd_fill_stats_from_f16(reinterpret_cast<const ggml_fp16_t*>(buf.data()), n_elem, out);
+    }
+    return false;
+}
+
+static bool sd_get_tensor_stats_host(const ggml_tensor* tensor, sd_tensor_stats& out) {
+    if (tensor == nullptr || tensor->data == nullptr) {
+        return false;
+    }
+    const int64_t n_elem = (int64_t)ggml_nelements(tensor);
+    if (n_elem <= 0) {
+        return false;
+    }
+    if (tensor->type == GGML_TYPE_F32) {
+        return sd_fill_stats_from_f32(reinterpret_cast<const float*>(tensor->data), n_elem, out);
+    }
+    if (tensor->type == GGML_TYPE_F16) {
+        return sd_fill_stats_from_f16(reinterpret_cast<const ggml_fp16_t*>(tensor->data), n_elem, out);
+    }
+    return false;
+}
+
+static void sd_log_tensor_stats(const char* tag, int step, const ggml_tensor* tensor, bool compare_host) {
+    if (tag == nullptr || tensor == nullptr) {
+        return;
+    }
+    const bool has_backend = (tensor->buffer != nullptr);
+    sd_tensor_stats bstats;
+    if (!sd_get_tensor_stats_backend(tensor, bstats)) {
+        LOG_INFO("[dbg] step %d %s: stats unavailable (type=%s)", step, tag, ggml_type_name(tensor->type));
+        return;
+    }
+    if (!compare_host || !has_backend) {
+        LOG_INFO("[dbg] step %d %s: backend n=%" PRId64 " nan=%" PRId64 " inf=%" PRId64 " max_abs=%.6g mean_abs=%.6g rms=%.6g",
+                 step, tag, bstats.n_elem, bstats.n_nan, bstats.n_inf, bstats.max_abs, bstats.mean_abs, bstats.rms);
+        return;
+    }
+    sd_tensor_stats hstats;
+    bool has_host = sd_get_tensor_stats_host(tensor, hstats);
+    if (!has_host) {
+        LOG_INFO("[dbg] step %d %s: backend n=%" PRId64 " nan=%" PRId64 " inf=%" PRId64 " max_abs=%.6g mean_abs=%.6g rms=%.6g (host_ptr=null)",
+                 step, tag, bstats.n_elem, bstats.n_nan, bstats.n_inf, bstats.max_abs, bstats.mean_abs, bstats.rms);
+        return;
+    }
+    double max_diff = 0.0;
+    if (tensor->type == GGML_TYPE_F32) {
+        const float* h = reinterpret_cast<const float*>(tensor->data);
+        const int64_t n = bstats.n_elem;
+        std::vector<uint8_t> buf(ggml_nbytes(tensor));
+        ggml_backend_tensor_get(tensor, buf.data(), 0, buf.size());
+        const float* b = reinterpret_cast<const float*>(buf.data());
+        for (int64_t i = 0; i < n; ++i) {
+            const double d = std::fabs((double)h[i] - (double)b[i]);
+            if (d > max_diff) {
+                max_diff = d;
+            }
+        }
+    } else if (tensor->type == GGML_TYPE_F16) {
+        const ggml_fp16_t* h = reinterpret_cast<const ggml_fp16_t*>(tensor->data);
+        const int64_t n = bstats.n_elem;
+        std::vector<uint8_t> buf(ggml_nbytes(tensor));
+        ggml_backend_tensor_get(tensor, buf.data(), 0, buf.size());
+        const ggml_fp16_t* b = reinterpret_cast<const ggml_fp16_t*>(buf.data());
+        for (int64_t i = 0; i < n; ++i) {
+            const double d = std::fabs((double)ggml_fp16_to_fp32(h[i]) - (double)ggml_fp16_to_fp32(b[i]));
+            if (d > max_diff) {
+                max_diff = d;
+            }
+        }
+    }
+    LOG_INFO("[dbg] step %d %s: backend n=%" PRId64 " nan=%" PRId64 " inf=%" PRId64 " max_abs=%.6g mean_abs=%.6g rms=%.6g | host n=%" PRId64 " nan=%" PRId64 " inf=%" PRId64 " max_abs=%.6g mean_abs=%.6g rms=%.6g | max_diff=%.6g",
+             step, tag,
+             bstats.n_elem, bstats.n_nan, bstats.n_inf, bstats.max_abs, bstats.mean_abs, bstats.rms,
+             hstats.n_elem, hstats.n_nan, hstats.n_inf, hstats.max_abs, hstats.mean_abs, hstats.rms,
+             max_diff);
+}
+
+static ggml_tensor* sd_load_tensor_from_file(struct ggml_context* ctx, const std::string& path) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        LOG_ERROR("load tensor failed: cannot open '%s'", path.c_str());
+        return nullptr;
+    }
+    int32_t n_dims = 0;
+    int32_t name_len = 0;
+    int32_t ttype = 0;
+    if (std::fread(&n_dims, sizeof(n_dims), 1, f) != 1 ||
+        std::fread(&name_len, sizeof(name_len), 1, f) != 1 ||
+        std::fread(&ttype, sizeof(ttype), 1, f) != 1) {
+        std::fclose(f);
+        LOG_ERROR("load tensor failed: bad header '%s'", path.c_str());
+        return nullptr;
+    }
+    if (n_dims <= 0 || n_dims > GGML_MAX_DIMS) {
+        std::fclose(f);
+        LOG_ERROR("load tensor failed: invalid dims '%s'", path.c_str());
+        return nullptr;
+    }
+    int64_t ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
+    for (int i = 0; i < n_dims; ++i) {
+        int32_t v = 0;
+        if (std::fread(&v, sizeof(v), 1, f) != 1) {
+            std::fclose(f);
+            LOG_ERROR("load tensor failed: bad shape '%s'", path.c_str());
+            return nullptr;
+        }
+        ne[i] = v;
+    }
+    if (name_len > 0) {
+        std::vector<char> tmp(static_cast<size_t>(name_len));
+        (void) std::fread(tmp.data(), 1, tmp.size(), f);
+    }
+
+    ggml_type type = (ttype == 0) ? GGML_TYPE_F32 : (ttype == 1 ? GGML_TYPE_F16 : GGML_TYPE_COUNT);
+    if (type == GGML_TYPE_COUNT) {
+        std::fclose(f);
+        LOG_ERROR("load tensor failed: unsupported type '%s' (%d)", path.c_str(), ttype);
+        return nullptr;
+    }
+
+    struct ggml_tensor* t = ggml_new_tensor(ctx, type, n_dims, ne);
+    size_t nbytes = ggml_nbytes(t);
+    if (std::fread(t->data, 1, nbytes, f) != nbytes) {
+        std::fclose(f);
+        LOG_ERROR("load tensor failed: bad data '%s'", path.c_str());
+        return nullptr;
+    }
+    std::fclose(f);
+    return t;
+}
 
 const char* sampling_methods_str[] = {
     "Euler",
@@ -135,6 +423,8 @@ public:
     sd_tiling_params_t vae_tiling_params = {false, 0, 0, 0.5f, 0, 0};
     bool offload_params_to_cpu           = false;
     bool use_pmid                        = false;
+    std::string cond_c_crossattn_path;
+    std::string uncond_c_crossattn_path;
 
     bool is_using_v_parameterization     = false;
     bool is_using_edm_v_parameterization = false;
@@ -211,6 +501,10 @@ public:
         LOG_DEBUG("Using SYCL backend");
         backend = ggml_backend_sycl_init(0);
 #endif
+#ifdef SD_USE_HEXAGON
+        LOG_DEBUG("Using Hexagon backend");
+        backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_ACCEL, nullptr);
+#endif
 
         if (!backend) {
             LOG_DEBUG("Using CPU backend");
@@ -230,11 +524,21 @@ public:
 
     bool init(const sd_ctx_params_t* sd_ctx_params) {
         n_threads               = sd_ctx_params->n_threads;
+        int load_n_threads      = n_threads;
+        if (const char* env = std::getenv("SD_LOAD_THREADS")) {
+            int v = std::atoi(env);
+            if (v > 0) {
+                load_n_threads = v;
+                LOG_INFO("override load_n_threads = %d (runtime n_threads = %d)", load_n_threads, n_threads);
+            }
+        }
         vae_decode_only         = sd_ctx_params->vae_decode_only;
         free_params_immediately = sd_ctx_params->free_params_immediately;
         taesd_path              = SAFE_STR(sd_ctx_params->taesd_path);
         use_tiny_autoencoder    = taesd_path.size() > 0;
         offload_params_to_cpu   = sd_ctx_params->offload_params_to_cpu;
+        cond_c_crossattn_path   = SAFE_STR(sd_ctx_params->cond_c_crossattn_path);
+        uncond_c_crossattn_path = SAFE_STR(sd_ctx_params->uncond_c_crossattn_path);
 
         rng = get_rng(sd_ctx_params->rng_type);
         if (sd_ctx_params->sampler_rng_type != RNG_TYPE_COUNT && sd_ctx_params->sampler_rng_type != sd_ctx_params->rng_type) {
@@ -698,7 +1002,7 @@ public:
                     }
                     return false;
                 };
-                if (!pmid_lora->load_from_file(n_threads, lora_tensor_filter)) {
+                if (!pmid_lora->load_from_file(load_n_threads, lora_tensor_filter)) {
                     LOG_WARN("load photomaker lora tensors from %s failed", sd_ctx_params->photo_maker_path);
                     return false;
                 }
@@ -793,7 +1097,7 @@ public:
         if (version == VERSION_SVD) {
             ignore_tensors.insert("conditioner.embedders.3");
         }
-        bool success = model_loader.load_tensors(tensors, ignore_tensors, n_threads, sd_ctx_params->enable_mmap);
+        bool success = model_loader.load_tensors(tensors, ignore_tensors, load_n_threads, sd_ctx_params->enable_mmap);
         if (!success) {
             LOG_ERROR("load tensors from model loader failed");
             ggml_free(ctx);
@@ -813,7 +1117,7 @@ public:
                 vae_params_mem_size = first_stage_model->get_params_buffer_size();
             }
             if (use_tiny_autoencoder || version == VERSION_SDXS) {
-                if (use_tiny_autoencoder && !tae_first_stage->load_from_file(taesd_path, n_threads)) {
+                if (use_tiny_autoencoder && !tae_first_stage->load_from_file(taesd_path, load_n_threads)) {
                     return false;
                 }
                 use_tiny_autoencoder = true;  // now the processing is identical for VERSION_SDXS
@@ -821,7 +1125,7 @@ public:
             }
             size_t control_net_params_mem_size = 0;
             if (control_net) {
-                if (!control_net->load_from_file(SAFE_STR(sd_ctx_params->control_net_path), n_threads)) {
+                if (!control_net->load_from_file(SAFE_STR(sd_ctx_params->control_net_path), load_n_threads)) {
                     return false;
                 }
                 control_net_params_mem_size = control_net->get_params_buffer_size();
@@ -2059,6 +2363,21 @@ public:
 
             bool current_step_skipped = cache_step_is_skipped();
 
+            {
+                const char* dbg_env = std::getenv("SD_DEBUG_STEP_STATS");
+                if (dbg_env != nullptr) {
+                    const char* dbg_step_env = std::getenv("SD_DEBUG_STEP");
+                    const int dbg_step = dbg_step_env ? std::atoi(dbg_step_env) : -1;
+                    if (dbg_step <= 0 || step == dbg_step) {
+                        const float dbg_t0 = timesteps_vec.empty() ? NAN : timesteps_vec[0];
+                        LOG_INFO("[dbg] step %d scalars: sigma=%.9g t=%.9g timestep0=%.9g c_skip=%.9g c_out=%.9g c_in=%.9g has_uncond=%d has_img_cond=%d",
+                                 step, sigma, t, dbg_t0, c_skip, c_out, c_in, has_unconditioned ? 1 : 0, has_img_cond ? 1 : 0);
+                        sd_log_tensor_stats("input", step, input, false);
+                        sd_log_tensor_stats("out_cond", step, out_cond, true);
+                    }
+                }
+            }
+
             float* negative_data = nullptr;
             if (has_unconditioned) {
                 // uncond
@@ -2130,6 +2449,31 @@ public:
             float* positive_data = (float*)out_cond->data;
             int ne_elements      = (int)ggml_nelements(denoised);
 
+            {
+                static bool dump_done = false;
+                const char* dump_dir  = std::getenv("SD_DUMP_TENSOR_DIR");
+                const char* step_env  = std::getenv("SD_DUMP_TENSOR_STEP");
+                const char* dump_tag  = std::getenv("SD_DUMP_TENSOR_TAG");
+                const int dump_step   = step_env ? std::atoi(step_env) : -1;
+                if (!dump_done && dump_dir != nullptr && dump_step > 0 && step == dump_step) {
+                    std::string base(dump_dir);
+                    if (!base.empty() && base.back() != '/') {
+                        base.push_back('/');
+                    }
+                    const std::string tag = dump_tag ? dump_tag : "flux2_klein";
+                    sd_dump_tensor_to_file(base + tag + "_input_s" + std::to_string(step) + ".tensor", "input", input);
+                    sd_dump_tensor_to_file(base + tag + "_out_cond_s" + std::to_string(step) + ".tensor", "out_cond", out_cond);
+                    if (has_unconditioned && out_uncond != nullptr) {
+                        sd_dump_tensor_to_file(base + tag + "_out_uncond_s" + std::to_string(step) + ".tensor", "out_uncond", out_uncond);
+                    }
+                    if (has_img_cond && out_img_cond != nullptr) {
+                        sd_dump_tensor_to_file(base + tag + "_out_img_cond_s" + std::to_string(step) + ".tensor", "out_img_cond", out_img_cond);
+                    }
+                    dump_done = true;
+                    LOG_INFO("dumped diffusion tensors to '%s' at step %d", dump_dir, step);
+                }
+            }
+
             if (shifted_timestep > 0 && sd_version_is_sdxl(version)) {
                 int64_t shifted_t_idx              = static_cast<int64_t>(roundf(timesteps_vec[0]));
                 float shifted_sigma                = denoiser->t_to_sigma((float)shifted_t_idx);
@@ -2163,6 +2507,23 @@ public:
                 // v = latent_result, eps = latent_result
                 // denoised = (v * c_out + input * c_skip) or (input + eps * c_out)
                 vec_denoised[i] = latent_result * c_out + vec_input[i] * c_skip;
+            }
+
+            {
+                const char* dbg_env = std::getenv("SD_DEBUG_STEP_STATS");
+                if (dbg_env != nullptr) {
+                    const char* dbg_step_env = std::getenv("SD_DEBUG_STEP");
+                    const int dbg_step = dbg_step_env ? std::atoi(dbg_step_env) : -1;
+                    if (dbg_step <= 0 || step == dbg_step) {
+                        if (has_unconditioned && out_uncond != nullptr) {
+                            sd_log_tensor_stats("out_uncond", step, out_uncond, true);
+                        }
+                        if (has_img_cond && out_img_cond != nullptr) {
+                            sd_log_tensor_stats("out_img_cond", step, out_img_cond, true);
+                        }
+                        sd_log_tensor_stats("denoised", step, denoised, false);
+                    }
+                }
             }
 
             if (denoise_mask != nullptr) {
@@ -2922,6 +3283,8 @@ void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_params->chroma_use_t5_mask      = false;
     sd_ctx_params->chroma_t5_mask_pad      = 1;
     sd_ctx_params->flow_shift              = INFINITY;
+    sd_ctx_params->cond_c_crossattn_path   = nullptr;
+    sd_ctx_params->uncond_c_crossattn_path = nullptr;
 }
 
 char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
@@ -2962,7 +3325,9 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "circular_y: %s\n"
              "chroma_use_dit_mask: %s\n"
              "chroma_use_t5_mask: %s\n"
-             "chroma_t5_mask_pad: %d\n",
+             "chroma_t5_mask_pad: %d\n"
+             "cond_c_crossattn_path: %s\n"
+             "uncond_c_crossattn_path: %s\n",
              SAFE_STR(sd_ctx_params->model_path),
              SAFE_STR(sd_ctx_params->clip_l_path),
              SAFE_STR(sd_ctx_params->clip_g_path),
@@ -2994,7 +3359,9 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              BOOL_STR(sd_ctx_params->circular_y),
              BOOL_STR(sd_ctx_params->chroma_use_dit_mask),
              BOOL_STR(sd_ctx_params->chroma_use_t5_mask),
-             sd_ctx_params->chroma_t5_mask_pad);
+             sd_ctx_params->chroma_t5_mask_pad,
+             SAFE_STR(sd_ctx_params->cond_c_crossattn_path),
+             SAFE_STR(sd_ctx_params->uncond_c_crossattn_path));
 
     return buf;
 }
@@ -3249,26 +3616,70 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
     SDCondition id_cond = sd_ctx->sd->get_pmid_conditon(work_ctx, pm_params, condition_params);
 
     // Get learned condition
-    condition_params.zero_out_masked = false;
-    SDCondition cond                 = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
-                                                                                           sd_ctx->sd->n_threads,
-                                                                                           condition_params);
+    const bool need_uncond =
+        guidance.txt_cfg != 1.0 ||
+        (sd_version_is_inpaint_or_unet_edit(sd_ctx->sd->version) && guidance.txt_cfg != guidance.img_cfg);
+    const bool use_precomputed_cond = !sd_ctx->sd->cond_c_crossattn_path.empty();
 
+    SDCondition cond;
     SDCondition uncond;
-    if (guidance.txt_cfg != 1.0 ||
-        (sd_version_is_inpaint_or_unet_edit(sd_ctx->sd->version) && guidance.txt_cfg != guidance.img_cfg)) {
-        bool zero_out_masked = false;
-        if (sd_version_is_sdxl(sd_ctx->sd->version) && negative_prompt.size() == 0 && !sd_ctx->sd->is_using_edm_v_parameterization) {
-            zero_out_masked = true;
+    if (use_precomputed_cond) {
+        if (sd_ctx->sd->diffusion_model->get_adm_in_channels() > 0) {
+            LOG_WARN("precomputed cond crossattn does not include pooled embeddings (c_vector); ensure your model does not require them");
         }
-        condition_params.text            = negative_prompt;
-        condition_params.zero_out_masked = zero_out_masked;
-        uncond                           = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
-                                                                                               sd_ctx->sd->n_threads,
-                                                                                               condition_params);
+        cond.c_crossattn = sd_load_tensor_from_file(work_ctx, sd_ctx->sd->cond_c_crossattn_path.c_str());
+        if (cond.c_crossattn == nullptr) {
+            LOG_ERROR("failed to load cond.c_crossattn from '%s'", sd_ctx->sd->cond_c_crossattn_path.c_str());
+            return nullptr;
+        }
+        if (need_uncond) {
+            if (sd_ctx->sd->uncond_c_crossattn_path.empty()) {
+                LOG_ERROR("uncond crossattn required (cfg-scale != 1). Provide --uncond-crossattn or set --cfg-scale 1");
+                return nullptr;
+            }
+            uncond.c_crossattn = sd_load_tensor_from_file(work_ctx, sd_ctx->sd->uncond_c_crossattn_path.c_str());
+            if (uncond.c_crossattn == nullptr) {
+                LOG_ERROR("failed to load uncond.c_crossattn from '%s'", sd_ctx->sd->uncond_c_crossattn_path.c_str());
+                return nullptr;
+            }
+        }
+        LOG_INFO("using precomputed cond crossattn: %s", sd_ctx->sd->cond_c_crossattn_path.c_str());
+    } else {
+        condition_params.zero_out_masked = false;
+        cond                             = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
+                                                                                              sd_ctx->sd->n_threads,
+                                                                                              condition_params);
+
+        if (need_uncond) {
+            bool zero_out_masked = false;
+            if (sd_version_is_sdxl(sd_ctx->sd->version) && negative_prompt.size() == 0 && !sd_ctx->sd->is_using_edm_v_parameterization) {
+                zero_out_masked = true;
+            }
+            condition_params.text            = negative_prompt;
+            condition_params.zero_out_masked = zero_out_masked;
+            uncond                           = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
+                                                                                                   sd_ctx->sd->n_threads,
+                                                                                                   condition_params);
+        }
     }
     int64_t t1 = ggml_time_ms();
     LOG_INFO("get_learned_condition completed, taking %" PRId64 " ms", t1 - t0);
+
+    if (!use_precomputed_cond) {
+        const char* dump_cond_path = std::getenv("SD_DUMP_COND_CROSSATTN");
+        if (dump_cond_path != nullptr && cond.c_crossattn != nullptr) {
+            sd_dump_tensor_to_file(dump_cond_path, "cond_c_crossattn", cond.c_crossattn);
+            LOG_INFO("dumped cond.c_crossattn to '%s'", dump_cond_path);
+        }
+        const char* load_cond_path = std::getenv("SD_LOAD_COND_CROSSATTN");
+        if (load_cond_path != nullptr) {
+            struct ggml_tensor* loaded = sd_load_tensor_from_file(work_ctx, load_cond_path);
+            if (loaded != nullptr) {
+                cond.c_crossattn = loaded;
+                LOG_INFO("loaded cond.c_crossattn from '%s'", load_cond_path);
+            }
+        }
+    }
 
     if (sd_ctx->sd->free_params_immediately) {
         sd_ctx->sd->cond_stage_model->free_params_buffer();
@@ -3422,6 +3833,11 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
         if (x_0 != nullptr) {
             // print_ggml_tensor(x_0);
             LOG_INFO("sampling completed, taking %.2fs", (sampling_end - sampling_start) * 1.0f / 1000);
+            const char* dump_latent_path = std::getenv("SD_DUMP_LATENT");
+            if (dump_latent_path != nullptr) {
+                sd_dump_tensor_to_file(dump_latent_path, "latent_x0", x_0);
+                LOG_INFO("dumped latent x0 to '%s'", dump_latent_path);
+            }
             final_latents.push_back(x_0);
         } else {
             LOG_ERROR("sampling for image %d/%d failed after %.2fs", b + 1, batch_count, (sampling_end - sampling_start) * 1.0f / 1000);
@@ -3764,6 +4180,49 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_g
     return result_images;
 }
 
+SD_API sd_image_t* decode_latent_file(sd_ctx_t* sd_ctx, const char* latent_path) {
+    if (sd_ctx == nullptr || latent_path == nullptr) {
+        return nullptr;
+    }
+
+    struct ggml_init_params params;
+    params.mem_size   = static_cast<size_t>(1024) * 1024 * 1024;
+    params.mem_buffer = nullptr;
+    params.no_alloc   = false;
+
+    struct ggml_context* work_ctx = ggml_init(params);
+    if (!work_ctx) {
+        LOG_ERROR("ggml_init() failed for latent decode");
+        return nullptr;
+    }
+
+    struct ggml_tensor* latent = sd_load_tensor_from_file(work_ctx, latent_path);
+    if (latent == nullptr) {
+        ggml_free(work_ctx);
+        return nullptr;
+    }
+
+    struct ggml_tensor* img = sd_ctx->sd->decode_first_stage(work_ctx, latent);
+    if (img == nullptr) {
+        ggml_free(work_ctx);
+        return nullptr;
+    }
+
+    sd_image_t* results = (sd_image_t*)calloc(1, sizeof(sd_image_t));
+    if (results == nullptr) {
+        ggml_free(work_ctx);
+        return nullptr;
+    }
+
+    results[0].width   = (int)img->ne[0];
+    results[0].height  = (int)img->ne[1];
+    results[0].channel = (int)img->ne[2];
+    results[0].data    = ggml_tensor_to_sd_image(img, 0, false);
+
+    ggml_free(work_ctx);
+    return results;
+}
+
 SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* sd_vid_gen_params, int* num_frames_out) {
     if (sd_ctx == nullptr || sd_vid_gen_params == nullptr) {
         return nullptr;
@@ -4060,20 +4519,50 @@ SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* s
     condition_params.zero_out_masked = true;
     condition_params.text            = prompt;
 
-    int64_t t1       = ggml_time_ms();
-    SDCondition cond = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
-                                                                           sd_ctx->sd->n_threads,
-                                                                           condition_params);
-    cond.c_concat    = concat_latent;
-    cond.c_vector    = clip_vision_output;
+    int64_t t1                  = ggml_time_ms();
+    const bool need_uncond      = sd_vid_gen_params->sample_params.guidance.txt_cfg != 1.0 ||
+                             sd_vid_gen_params->high_noise_sample_params.guidance.txt_cfg != 1.0;
+    const bool use_precomputed_cond = !sd_ctx->sd->cond_c_crossattn_path.empty();
+
+    SDCondition cond;
     SDCondition uncond;
-    if (sd_vid_gen_params->sample_params.guidance.txt_cfg != 1.0 || sd_vid_gen_params->high_noise_sample_params.guidance.txt_cfg != 1.0) {
-        condition_params.text = negative_prompt;
-        uncond                = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
-                                                                                    sd_ctx->sd->n_threads,
-                                                                                    condition_params);
-        uncond.c_concat       = concat_latent;
-        uncond.c_vector       = clip_vision_output;
+    if (use_precomputed_cond) {
+        if (sd_ctx->sd->diffusion_model->get_adm_in_channels() > 0) {
+            LOG_WARN("precomputed cond crossattn does not include pooled embeddings (c_vector); ensure your model does not require them");
+        }
+        cond.c_crossattn = sd_load_tensor_from_file(work_ctx, sd_ctx->sd->cond_c_crossattn_path.c_str());
+        if (cond.c_crossattn == nullptr) {
+            LOG_ERROR("failed to load cond.c_crossattn from '%s'", sd_ctx->sd->cond_c_crossattn_path.c_str());
+            return nullptr;
+        }
+        if (need_uncond) {
+            if (sd_ctx->sd->uncond_c_crossattn_path.empty()) {
+                LOG_ERROR("uncond crossattn required (cfg-scale != 1). Provide --uncond-crossattn or set --cfg-scale 1");
+                return nullptr;
+            }
+            uncond.c_crossattn = sd_load_tensor_from_file(work_ctx, sd_ctx->sd->uncond_c_crossattn_path.c_str());
+            if (uncond.c_crossattn == nullptr) {
+                LOG_ERROR("failed to load uncond.c_crossattn from '%s'", sd_ctx->sd->uncond_c_crossattn_path.c_str());
+                return nullptr;
+            }
+        }
+        LOG_INFO("using precomputed cond crossattn: %s", sd_ctx->sd->cond_c_crossattn_path.c_str());
+    } else {
+        cond = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
+                                                                   sd_ctx->sd->n_threads,
+                                                                   condition_params);
+        if (need_uncond) {
+            condition_params.text = negative_prompt;
+            uncond                = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
+                                                                                        sd_ctx->sd->n_threads,
+                                                                                        condition_params);
+        }
+    }
+    cond.c_concat = concat_latent;
+    cond.c_vector = clip_vision_output;
+    if (need_uncond) {
+        uncond.c_concat = concat_latent;
+        uncond.c_vector = clip_vision_output;
     }
     int64_t t2 = ggml_time_ms();
     LOG_INFO("get_learned_condition completed, taking %" PRId64 " ms", t2 - t1);

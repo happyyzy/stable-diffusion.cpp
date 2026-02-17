@@ -1,7 +1,14 @@
 #ifndef __FLUX_HPP__
 #define __FLUX_HPP__
 
+#include <cctype>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
+#include <sstream>
+#include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "ggml_extend.hpp"
@@ -11,6 +18,332 @@
 #define FLUX_GRAPH_SIZE 10240
 
 namespace Flux {
+
+    struct FluxDumpConfig {
+        bool enabled         = false;
+        bool dump_all        = false;
+        bool dump_pre        = false;
+        bool dump_final      = false;
+        bool dump_double_all = false;
+        bool dump_single_all = false;
+        bool repeat          = false;
+        bool debug_stats     = false;
+        std::unordered_set<int> double_idx;
+        std::unordered_set<int> single_idx;
+    };
+
+    static inline bool& flux_dump_done_ref() {
+        static bool done = false;
+        return done;
+    }
+
+    static inline bool flux_dump_done() {
+        return flux_dump_done_ref();
+    }
+
+    static inline void flux_dump_mark_done() {
+        flux_dump_done_ref() = true;
+    }
+
+    static inline void flux_dump_parse_indices(const char* env, std::unordered_set<int>& out, bool& all_flag) {
+        if (env == nullptr || env[0] == '\0') {
+            return;
+        }
+        std::string s(env);
+        for (char& c : s) {
+            if (c == ';' || c == ' ') {
+                c = ',';
+            } else {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+        }
+        std::stringstream ss(s);
+        std::string tok;
+        while (std::getline(ss, tok, ',')) {
+            if (tok.empty()) {
+                continue;
+            }
+            if (tok == "all") {
+                all_flag = true;
+                continue;
+            }
+            char* end = nullptr;
+            long v    = std::strtol(tok.c_str(), &end, 10);
+            if (end && *end == '\0') {
+                out.insert(static_cast<int>(v));
+            }
+        }
+    }
+
+    static inline bool flux_debug_stats_enabled() {
+        const char* dbg = std::getenv("SD_FLUX_DEBUG_STATS");
+        return dbg != nullptr;
+    }
+
+    static inline const FluxDumpConfig& flux_dump_config() {
+        static FluxDumpConfig cfg = []() {
+            FluxDumpConfig c;
+            const char* dir = std::getenv("SD_DUMP_TENSOR_DIR");
+            const char* all = std::getenv("SD_FLUX_DUMP_ALL");
+            const char* pre = std::getenv("SD_FLUX_DUMP_PRE");
+            const char* fin = std::getenv("SD_FLUX_DUMP_FINAL");
+            const char* dbl = std::getenv("SD_FLUX_DUMP_DOUBLE");
+            const char* sgl = std::getenv("SD_FLUX_DUMP_SINGLE");
+            const char* rep = std::getenv("SD_FLUX_DUMP_REPEAT");
+            const char* dbg = std::getenv("SD_FLUX_DEBUG_STATS");
+
+            c.dump_all   = all != nullptr;
+            c.dump_pre   = c.dump_all || pre != nullptr;
+            c.dump_final = c.dump_all || fin != nullptr;
+            c.repeat     = rep != nullptr;
+            c.debug_stats = dbg != nullptr;
+
+            flux_dump_parse_indices(dbl, c.double_idx, c.dump_double_all);
+            flux_dump_parse_indices(sgl, c.single_idx, c.dump_single_all);
+            if (c.dump_all) {
+                c.dump_double_all = true;
+                c.dump_single_all = true;
+            }
+
+            const bool has_dir = (dir != nullptr);
+            c.enabled = (has_dir || c.debug_stats) &&
+                        (c.dump_pre || c.dump_final || c.dump_double_all || c.dump_single_all ||
+                         !c.double_idx.empty() || !c.single_idx.empty());
+            return c;
+        }();
+        return cfg;
+    }
+
+    static inline bool flux_dump_should_cache() {
+        const auto& cfg = flux_dump_config();
+        if (!cfg.enabled) {
+            return false;
+        }
+        if (cfg.repeat) {
+            return true;
+        }
+        return !flux_dump_done();
+    }
+
+    struct FluxStats {
+        int64_t n_elem = 0;
+        int64_t n_nan  = 0;
+        int64_t n_inf  = 0;
+        double max_abs = 0.0;
+        double mean_abs = 0.0;
+        double rms = 0.0;
+    };
+
+    static inline bool flux_stats_from_buffer_f32(const float* data, int64_t n, FluxStats& out) {
+        if (data == nullptr || n <= 0) {
+            return false;
+        }
+        out.n_elem = n;
+        double sum_abs = 0.0;
+        double sum_sq  = 0.0;
+        double max_abs = 0.0;
+        int64_t n_nan = 0;
+        int64_t n_inf = 0;
+        for (int64_t i = 0; i < n; ++i) {
+            const float v = data[i];
+            if (std::isnan(v)) {
+                n_nan++;
+                continue;
+            }
+            if (!std::isfinite(v)) {
+                n_inf++;
+                continue;
+            }
+            const double av = std::fabs((double)v);
+            sum_abs += av;
+            sum_sq  += av * av;
+            if (av > max_abs) {
+                max_abs = av;
+            }
+        }
+        out.n_nan   = n_nan;
+        out.n_inf   = n_inf;
+        out.max_abs = max_abs;
+        const int64_t n_finite = n - n_nan - n_inf;
+        if (n_finite > 0) {
+            out.mean_abs = sum_abs / (double)n_finite;
+            out.rms      = std::sqrt(sum_sq / (double)n_finite);
+        }
+        return true;
+    }
+
+    static inline bool flux_stats_from_buffer_f16(const ggml_fp16_t* data, int64_t n, FluxStats& out) {
+        if (data == nullptr || n <= 0) {
+            return false;
+        }
+        out.n_elem = n;
+        double sum_abs = 0.0;
+        double sum_sq  = 0.0;
+        double max_abs = 0.0;
+        int64_t n_nan = 0;
+        int64_t n_inf = 0;
+        for (int64_t i = 0; i < n; ++i) {
+            const float v = ggml_fp16_to_fp32(data[i]);
+            if (std::isnan(v)) {
+                n_nan++;
+                continue;
+            }
+            if (!std::isfinite(v)) {
+                n_inf++;
+                continue;
+            }
+            const double av = std::fabs((double)v);
+            sum_abs += av;
+            sum_sq  += av * av;
+            if (av > max_abs) {
+                max_abs = av;
+            }
+        }
+        out.n_nan   = n_nan;
+        out.n_inf   = n_inf;
+        out.max_abs = max_abs;
+        const int64_t n_finite = n - n_nan - n_inf;
+        if (n_finite > 0) {
+            out.mean_abs = sum_abs / (double)n_finite;
+            out.rms      = std::sqrt(sum_sq / (double)n_finite);
+        }
+        return true;
+    }
+
+    static inline bool flux_tensor_stats_backend(const ggml_tensor* tensor, FluxStats& out) {
+        if (tensor == nullptr || tensor->buffer == nullptr) {
+            return false;
+        }
+        const int64_t n_elem = (int64_t)ggml_nelements(tensor);
+        if (n_elem <= 0) {
+            return false;
+        }
+        const size_t nbytes = ggml_nbytes(tensor);
+        std::vector<uint8_t> buf(nbytes);
+        ggml_backend_tensor_get(tensor, buf.data(), 0, nbytes);
+        if (tensor->type == GGML_TYPE_F32) {
+            return flux_stats_from_buffer_f32(reinterpret_cast<const float*>(buf.data()), n_elem, out);
+        }
+        if (tensor->type == GGML_TYPE_F16) {
+            return flux_stats_from_buffer_f16(reinterpret_cast<const ggml_fp16_t*>(buf.data()), n_elem, out);
+        }
+        return false;
+    }
+
+    static inline std::vector<std::string> flux_debug_filter_tokens() {
+        std::vector<std::string> out;
+        const char* env = std::getenv("SD_FLUX_DEBUG_FILTER");
+        if (env == nullptr || env[0] == '\0') {
+            return out;
+        }
+        std::string s(env);
+        for (char& c : s) {
+            if (c == ';' || c == ' ') {
+                c = ',';
+            }
+        }
+        std::stringstream ss(s);
+        std::string tok;
+        while (std::getline(ss, tok, ',')) {
+            if (!tok.empty()) {
+                out.push_back(tok);
+            }
+        }
+        return out;
+    }
+
+    static inline bool flux_debug_filter_match(const std::string& name, const std::vector<std::string>& filters) {
+        if (filters.empty()) {
+            return true;
+        }
+        for (const auto& f : filters) {
+            if (name.find(f) != std::string::npos) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static inline const std::vector<std::string>& flux_dump_filter_tokens() {
+        static std::vector<std::string> tokens = []() {
+            std::vector<std::string> out;
+            const char* env = std::getenv("SD_FLUX_DUMP_FILTER");
+            if (env == nullptr || env[0] == '\0') {
+                return out;
+            }
+            std::string s(env);
+            for (char& c : s) {
+                if (c == ';' || c == ' ') {
+                    c = ',';
+                }
+            }
+            std::stringstream ss(s);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                if (!tok.empty()) {
+                    out.push_back(tok);
+                }
+            }
+            return out;
+        }();
+        return tokens;
+    }
+
+    static inline bool flux_debug_mod_enabled() {
+        return std::getenv("SD_FLUX_DEBUG_MOD_MLP") != nullptr;
+    }
+
+    static inline bool flux_dump_qkv_linear_enabled() {
+        return std::getenv("SD_FLUX_DUMP_QKV_LINEAR") != nullptr;
+    }
+
+    static inline bool flux_qkv_chunk_contiguous() {
+        return std::getenv("SD_FLUX_QKV_CHUNK_NOCONT") == nullptr;
+    }
+
+    static inline std::vector<std::string> flux_debug_mod_filter_tokens() {
+        const char* env = std::getenv("SD_FLUX_DEBUG_MOD_FILTER");
+        if (env == nullptr || env[0] == '\0') {
+            return {};
+        }
+        std::vector<std::string> out;
+        std::string s(env);
+        for (char& c : s) {
+            if (c == ';' || c == ' ') {
+                c = ',';
+            }
+        }
+        std::stringstream ss(s);
+        std::string tok;
+        while (std::getline(ss, tok, ',')) {
+            if (!tok.empty()) {
+                out.push_back(tok);
+            }
+        }
+        return out;
+    }
+
+    static inline int& flux_debug_step_counter() {
+        static int step = 0;
+        return step;
+    }
+
+    static inline void flux_cache_tensor(GGMLRunnerContext* ctx, const std::string& name, struct ggml_tensor* tensor) {
+        if (ctx == nullptr || ctx->runner == nullptr || tensor == nullptr) {
+            return;
+        }
+        const auto& filters = flux_dump_filter_tokens();
+        if (!flux_debug_filter_match(name, filters)) {
+            return;
+        }
+        if (std::getenv("SD_FLUX_DUMP_CONTIG") != nullptr) {
+            tensor = ggml_cont(ctx->ggml_ctx, tensor);
+        }
+        if (std::getenv("SD_FLUX_DUMP_PIN") != nullptr) {
+            ggml_set_output(tensor);
+        }
+        ctx->runner->cache(name, tensor);
+    }
 
     struct MLPEmbedder : public UnaryBlock {
     public:
@@ -98,18 +431,35 @@ namespace Flux {
             blocks["proj"]   = std::shared_ptr<GGMLBlock>(new Linear(dim, dim, proj_bias));
         }
 
-        std::vector<struct ggml_tensor*> pre_attention(GGMLRunnerContext* ctx, struct ggml_tensor* x) {
+        std::vector<struct ggml_tensor*> pre_attention(GGMLRunnerContext* ctx,
+                                                       struct ggml_tensor* x,
+                                                       const std::string& dump_prefix = "") {
             auto qkv_proj = std::dynamic_pointer_cast<Linear>(blocks["qkv"]);
             auto norm     = std::dynamic_pointer_cast<QKNorm>(blocks["norm"]);
 
-            auto qkv         = qkv_proj->forward(ctx, x);
-            auto qkv_vec     = ggml_ext_chunk(ctx->ggml_ctx, qkv, 3, 0, true);
+            const bool dump_qkv_linear = Flux::flux_dump_qkv_linear_enabled() && !dump_prefix.empty();
+
+            auto qkv = qkv_proj->forward(ctx, x);
+            if (dump_qkv_linear) {
+                Flux::flux_cache_tensor(ctx, dump_prefix + "qkv_linear", qkv);
+            }
+            const bool qkv_chunk_cont = Flux::flux_qkv_chunk_contiguous();
+            auto qkv_vec              = ggml_ext_chunk(ctx->ggml_ctx, qkv, 3, 0, qkv_chunk_cont);
             int64_t head_dim = qkv_vec[0]->ne[0] / num_heads;
-            auto q           = ggml_reshape_4d(ctx->ggml_ctx, qkv_vec[0], head_dim, num_heads, qkv_vec[0]->ne[1], qkv_vec[0]->ne[2]);
-            auto k           = ggml_reshape_4d(ctx->ggml_ctx, qkv_vec[1], head_dim, num_heads, qkv_vec[1]->ne[1], qkv_vec[1]->ne[2]);
+            auto q_raw       = ggml_reshape_4d(ctx->ggml_ctx, qkv_vec[0], head_dim, num_heads, qkv_vec[0]->ne[1], qkv_vec[0]->ne[2]);
+            auto k_raw       = ggml_reshape_4d(ctx->ggml_ctx, qkv_vec[1], head_dim, num_heads, qkv_vec[1]->ne[1], qkv_vec[1]->ne[2]);
             auto v           = ggml_reshape_4d(ctx->ggml_ctx, qkv_vec[2], head_dim, num_heads, qkv_vec[2]->ne[1], qkv_vec[2]->ne[2]);
-            q                = norm->query_norm(ctx, q);
-            k                = norm->key_norm(ctx, k);
+            if (dump_qkv_linear) {
+                Flux::flux_cache_tensor(ctx, dump_prefix + "q_raw", q_raw);
+                Flux::flux_cache_tensor(ctx, dump_prefix + "k_raw", k_raw);
+                Flux::flux_cache_tensor(ctx, dump_prefix + "v_raw", v);
+            }
+            auto q = norm->query_norm(ctx, q_raw);
+            auto k = norm->key_norm(ctx, k_raw);
+            if (dump_qkv_linear) {
+                Flux::flux_cache_tensor(ctx, dump_prefix + "q_post_norm", q);
+                Flux::flux_cache_tensor(ctx, dump_prefix + "k_post_norm", k);
+            }
             return {q, k, v};
         }
 
@@ -202,10 +552,11 @@ namespace Flux {
     public:
         bool is_double;
         int multiplier;
+        std::string dbg_name;
 
     public:
-        Modulation(int64_t dim, bool is_double, bool bias = true)
-            : is_double(is_double) {
+        Modulation(int64_t dim, bool is_double, bool bias = true, const std::string& dbg_name = "")
+            : is_double(is_double), dbg_name(dbg_name) {
             multiplier    = is_double ? 6 : 3;
             blocks["lin"] = std::shared_ptr<GGMLBlock>(new Linear(dim, dim * multiplier, bias));
         }
@@ -215,15 +566,38 @@ namespace Flux {
             // return: [ModulationOut, ModulationOut]
             auto lin = std::dynamic_pointer_cast<Linear>(blocks["lin"]);
 
+            const bool dbg_mod = flux_debug_mod_enabled();
+            const auto dbg_filters = dbg_mod ? flux_debug_mod_filter_tokens() : std::vector<std::string>();
+            auto cache_dbg = [&](const std::string& tag, struct ggml_tensor* t) {
+                if (!dbg_mod || t == nullptr) {
+                    return;
+                }
+                std::string name = dbg_name.empty() ? tag : (dbg_name + "_" + tag);
+                if (!flux_debug_filter_match(name, dbg_filters)) {
+                    return;
+                }
+                flux_cache_tensor(ctx, name, t);
+            };
+
             auto out = ggml_silu(ctx->ggml_ctx, vec);
-            out      = lin->forward(ctx, out);  // [N, multiplier*dim]
+            cache_dbg("silu", out);
+            out = lin->forward(ctx, out);  // [N, multiplier*dim]
+            cache_dbg("lin", out);
 
             auto m = ggml_reshape_3d(ctx->ggml_ctx, out, vec->ne[0], multiplier, vec->ne[1]);  // [N, multiplier, dim]
             m      = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, m, 0, 2, 1, 3));     // [multiplier, N, dim]
+            cache_dbg("m", m);
 
             ModulationOut m_0 = ModulationOut(ctx, m, 0);
+            cache_dbg("shift1", m_0.shift);
+            cache_dbg("scale1", m_0.scale);
+            cache_dbg("gate1", m_0.gate);
             if (is_double) {
-                return {m_0, ModulationOut(ctx, m, 3)};
+                ModulationOut m_1 = ModulationOut(ctx, m, 3);
+                cache_dbg("shift2", m_1.shift);
+                cache_dbg("scale2", m_1.scale);
+                cache_dbg("gate2", m_1.gate);
+                return {m_0, m_1};
             }
 
             return {m_0, ModulationOut()};
@@ -266,7 +640,7 @@ namespace Flux {
             int64_t mlp_hidden_dim = static_cast<int64_t>(hidden_size * mlp_ratio);
 
             if (!prune_mod && !share_modulation) {
-                blocks["img_mod"] = std::shared_ptr<GGMLBlock>(new Modulation(hidden_size, true));
+                blocks["img_mod"] = std::shared_ptr<GGMLBlock>(new Modulation(hidden_size, true, true, "ds" + std::to_string(idx) + "_img"));
             }
             blocks["img_norm1"] = std::shared_ptr<GGMLBlock>(new LayerNorm(hidden_size, 1e-6f, false));
             blocks["img_attn"]  = std::shared_ptr<GGMLBlock>(new SelfAttention(hidden_size, num_heads, qkv_bias, mlp_proj_bias));
@@ -279,7 +653,7 @@ namespace Flux {
             }
 
             if (!prune_mod && !share_modulation) {
-                blocks["txt_mod"] = std::shared_ptr<GGMLBlock>(new Modulation(hidden_size, true));
+                blocks["txt_mod"] = std::shared_ptr<GGMLBlock>(new Modulation(hidden_size, true, true, "ds" + std::to_string(idx) + "_txt"));
             }
             blocks["txt_norm1"] = std::shared_ptr<GGMLBlock>(new LayerNorm(hidden_size, 1e-6f, false));
             blocks["txt_attn"]  = std::shared_ptr<GGMLBlock>(new SelfAttention(hidden_size, num_heads, qkv_bias, mlp_proj_bias));
@@ -334,6 +708,13 @@ namespace Flux {
             auto txt_norm2 = std::dynamic_pointer_cast<LayerNorm>(blocks["txt_norm2"]);
             auto txt_mlp   = std::dynamic_pointer_cast<UnaryBlock>(blocks["txt_mlp"]);
 
+            const auto& dump_cfg = flux_dump_config();
+            const bool dump_active = flux_dump_should_cache();
+            const bool dump_detail = dump_active &&
+                                     (std::getenv("SD_FLUX_DUMP_DOUBLE_DETAIL") != nullptr) &&
+                                     (dump_cfg.dump_double_all || dump_cfg.double_idx.count(idx) > 0);
+            const std::string dump_prefix = dump_detail ? ("flux_ds" + std::to_string(idx) + "_") : "";
+
             if (img_mods.empty()) {
                 if (prune_mod) {
                     img_mods = get_distil_img_mod(ctx, vec);
@@ -354,22 +735,60 @@ namespace Flux {
             }
             ModulationOut txt_mod1 = txt_mods[0];
             ModulationOut txt_mod2 = txt_mods[1];
+            if (dump_detail) {
+                flux_cache_tensor(ctx, dump_prefix + "img_shift1", img_mod1.shift);
+                flux_cache_tensor(ctx, dump_prefix + "img_scale1", img_mod1.scale);
+                flux_cache_tensor(ctx, dump_prefix + "img_gate1", img_mod1.gate);
+                flux_cache_tensor(ctx, dump_prefix + "img_shift2", img_mod2.shift);
+                flux_cache_tensor(ctx, dump_prefix + "img_scale2", img_mod2.scale);
+                flux_cache_tensor(ctx, dump_prefix + "img_gate2", img_mod2.gate);
+                flux_cache_tensor(ctx, dump_prefix + "txt_shift1", txt_mod1.shift);
+                flux_cache_tensor(ctx, dump_prefix + "txt_scale1", txt_mod1.scale);
+                flux_cache_tensor(ctx, dump_prefix + "txt_gate1", txt_mod1.gate);
+                flux_cache_tensor(ctx, dump_prefix + "txt_shift2", txt_mod2.shift);
+                flux_cache_tensor(ctx, dump_prefix + "txt_scale2", txt_mod2.scale);
+                flux_cache_tensor(ctx, dump_prefix + "txt_gate2", txt_mod2.gate);
+            }
 
             // prepare image for attention
-            auto img_modulated = img_norm1->forward(ctx, img);
+            auto img_norm1_out = img_norm1->forward(ctx, img);
+            if (dump_detail) {
+                flux_cache_tensor(ctx, dump_prefix + "img_norm1", img_norm1_out);
+            }
+            auto img_modulated = img_norm1_out;
             img_modulated      = Flux::modulate(ctx->ggml_ctx, img_modulated, img_mod1.shift, img_mod1.scale);
-            auto img_qkv       = img_attn->pre_attention(ctx, img_modulated);  // q,k,v: [N, n_img_token, n_head, d_head]
+            if (dump_detail) {
+                flux_cache_tensor(ctx, dump_prefix + "img_mod", img_modulated);
+            }
+            auto img_qkv       = img_attn->pre_attention(ctx, img_modulated, dump_detail ? (dump_prefix + "img_") : "");  // q,k,v: [N, n_img_token, n_head, d_head]
             auto img_q         = img_qkv[0];
             auto img_k         = img_qkv[1];
             auto img_v         = img_qkv[2];
+            if (dump_detail) {
+                flux_cache_tensor(ctx, dump_prefix + "img_q", img_q);
+                flux_cache_tensor(ctx, dump_prefix + "img_k", img_k);
+                flux_cache_tensor(ctx, dump_prefix + "img_v", img_v);
+            }
 
             // prepare txt for attention
-            auto txt_modulated = txt_norm1->forward(ctx, txt);
+            auto txt_norm1_out = txt_norm1->forward(ctx, txt);
+            if (dump_detail) {
+                flux_cache_tensor(ctx, dump_prefix + "txt_norm1", txt_norm1_out);
+            }
+            auto txt_modulated = txt_norm1_out;
             txt_modulated      = Flux::modulate(ctx->ggml_ctx, txt_modulated, txt_mod1.shift, txt_mod1.scale);
-            auto txt_qkv       = txt_attn->pre_attention(ctx, txt_modulated);  // q,k,v: [N, n_txt_token, n_head, d_head]
+            if (dump_detail) {
+                flux_cache_tensor(ctx, dump_prefix + "txt_mod", txt_modulated);
+            }
+            auto txt_qkv       = txt_attn->pre_attention(ctx, txt_modulated, dump_detail ? (dump_prefix + "txt_") : "");  // q,k,v: [N, n_txt_token, n_head, d_head]
             auto txt_q         = txt_qkv[0];
             auto txt_k         = txt_qkv[1];
             auto txt_v         = txt_qkv[2];
+            if (dump_detail) {
+                flux_cache_tensor(ctx, dump_prefix + "txt_q", txt_q);
+                flux_cache_tensor(ctx, dump_prefix + "txt_k", txt_k);
+                flux_cache_tensor(ctx, dump_prefix + "txt_v", txt_v);
+            }
 
             // run actual attention
             auto q = ggml_concat(ctx->ggml_ctx, txt_q, img_q, 2);  // [N, n_txt_token + n_img_token, n_head, d_head]
@@ -377,6 +796,9 @@ namespace Flux {
             auto v = ggml_concat(ctx->ggml_ctx, txt_v, img_v, 2);  // [N, n_txt_token + n_img_token, n_head, d_head]
 
             auto attn         = Rope::attention(ctx, q, k, v, pe, mask);  // [N, n_txt_token + n_img_token, n_head*d_head]
+            if (dump_detail) {
+                flux_cache_tensor(ctx, dump_prefix + "attn", attn);
+            }
             auto txt_attn_out = ggml_view_3d(ctx->ggml_ctx,
                                              attn,
                                              attn->ne[0],
@@ -393,18 +815,36 @@ namespace Flux {
                                              attn->nb[1],
                                              attn->nb[2],
                                              txt->ne[1] * attn->nb[1]);  // [N, n_img_token, hidden_size]
+            if (dump_detail && std::getenv("SD_FLUX_DUMP_SKIP_VIEWS") == nullptr) {
+                flux_cache_tensor(ctx, dump_prefix + "txt_attn_out", txt_attn_out);
+                flux_cache_tensor(ctx, dump_prefix + "img_attn_out", img_attn_out);
+            }
 
             // calculate the img bloks
-            img = ggml_add(ctx->ggml_ctx, img, ggml_mul(ctx->ggml_ctx, img_attn->post_attention(ctx, img_attn_out), img_mod1.gate));
+            auto img_attn_proj = img_attn->post_attention(ctx, img_attn_out);
+            if (dump_detail) {
+                flux_cache_tensor(ctx, dump_prefix + "img_attn_proj", img_attn_proj);
+            }
+            img = ggml_add(ctx->ggml_ctx, img, ggml_mul(ctx->ggml_ctx, img_attn_proj, img_mod1.gate));
 
             auto img_mlp_out = img_mlp->forward(ctx, Flux::modulate(ctx->ggml_ctx, img_norm2->forward(ctx, img), img_mod2.shift, img_mod2.scale));
+            if (dump_detail) {
+                flux_cache_tensor(ctx, dump_prefix + "img_mlp_out", img_mlp_out);
+            }
 
             img = ggml_add(ctx->ggml_ctx, img, ggml_mul(ctx->ggml_ctx, img_mlp_out, img_mod2.gate));
 
             // calculate the txt bloks
-            txt = ggml_add(ctx->ggml_ctx, txt, ggml_mul(ctx->ggml_ctx, txt_attn->post_attention(ctx, txt_attn_out), txt_mod1.gate));
+            auto txt_attn_proj = txt_attn->post_attention(ctx, txt_attn_out);
+            if (dump_detail) {
+                flux_cache_tensor(ctx, dump_prefix + "txt_attn_proj", txt_attn_proj);
+            }
+            txt = ggml_add(ctx->ggml_ctx, txt, ggml_mul(ctx->ggml_ctx, txt_attn_proj, txt_mod1.gate));
 
             auto txt_mlp_out = txt_mlp->forward(ctx, Flux::modulate(ctx->ggml_ctx, txt_norm2->forward(ctx, txt), txt_mod2.shift, txt_mod2.scale));
+            if (dump_detail) {
+                flux_cache_tensor(ctx, dump_prefix + "txt_mlp_out", txt_mlp_out);
+            }
             txt              = ggml_add(ctx->ggml_ctx, txt, ggml_mul(ctx->ggml_ctx, txt_mlp_out, txt_mod2.gate));
 
             return {img, txt};
@@ -451,7 +891,7 @@ namespace Flux {
             blocks["pre_norm"] = std::shared_ptr<GGMLBlock>(new LayerNorm(hidden_size, 1e-6f, false));
             // mlp_act is nn.GELU(approximate="tanh")
             if (!prune_mod && !share_modulation) {
-                blocks["modulation"] = std::shared_ptr<GGMLBlock>(new Modulation(hidden_size, false));
+                blocks["modulation"] = std::shared_ptr<GGMLBlock>(new Modulation(hidden_size, false, true, "ss" + std::to_string(idx)));
             }
         }
 
@@ -840,9 +1280,9 @@ namespace Flux {
             }
 
             if (params.share_modulation) {
-                blocks["double_stream_modulation_img"] = std::make_shared<Modulation>(params.hidden_size, true, !params.disable_bias);
-                blocks["double_stream_modulation_txt"] = std::make_shared<Modulation>(params.hidden_size, true, !params.disable_bias);
-                blocks["single_stream_modulation"]     = std::make_shared<Modulation>(params.hidden_size, false, !params.disable_bias);
+                blocks["double_stream_modulation_img"] = std::make_shared<Modulation>(params.hidden_size, true, !params.disable_bias, "mod_img");
+                blocks["double_stream_modulation_txt"] = std::make_shared<Modulation>(params.hidden_size, true, !params.disable_bias, "mod_txt");
+                blocks["single_stream_modulation"]     = std::make_shared<Modulation>(params.hidden_size, false, !params.disable_bias, "mod_single");
             }
         }
 
@@ -853,11 +1293,14 @@ namespace Flux {
 
             int pad_h = (params.patch_size - H % params.patch_size) % params.patch_size;
             int pad_w = (params.patch_size - W % params.patch_size) % params.patch_size;
+            if (pad_h == 0 && pad_w == 0) {
+                return x;
+            }
             x         = ggml_ext_pad(ctx->ggml_ctx, x, pad_w, pad_h, 0, 0, ctx->circular_x_enabled, ctx->circular_y_enabled);
             return x;
         }
 
-        struct ggml_tensor* patchify(struct ggml_context* ctx,
+        struct ggml_tensor* patchify(GGMLRunnerContext* ctx,
                                      struct ggml_tensor* x) {
             // x: [N, C, H, W]
             // return: [N, h*w, C * patch_size * patch_size]
@@ -871,11 +1314,20 @@ namespace Flux {
 
             GGML_ASSERT(h * p == H && w * p == W);
 
-            x = ggml_reshape_4d(ctx, x, p, w, p, h * C * N);       // [N*C*h, p, w, p]
-            x = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));  // [N*C*h, w, p, p]
-            x = ggml_reshape_4d(ctx, x, p * p, w * h, C, N);       // [N, C, h*w, p*p]
-            x = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));  // [N, h*w, C, p*p]
-            x = ggml_reshape_3d(ctx, x, p * p * C, w * h, N);      // [N, h*w, C*p*p]
+            const auto& dump_cfg = flux_dump_config();
+            const bool dump_active = flux_dump_should_cache();
+
+            x = ggml_reshape_4d(ctx->ggml_ctx, x, p, w, p, h * C * N);  // [N*C*h, p, w, p]
+            x = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 0, 2, 1, 3));  // [N*C*h, w, p, p]
+            if (dump_active && dump_cfg.dump_pre) {
+                flux_cache_tensor(ctx, "flux_patchify_c0", x);
+            }
+            x = ggml_reshape_4d(ctx->ggml_ctx, x, p * p, w * h, C, N);  // [N, C, h*w, p*p]
+            x = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 0, 2, 1, 3));  // [N, h*w, C, p*p]
+            if (dump_active && dump_cfg.dump_pre) {
+                flux_cache_tensor(ctx, "flux_patchify_c1", x);
+            }
+            x = ggml_reshape_3d(ctx->ggml_ctx, x, p * p * C, w * h, N);  // [N, h*w, C*p*p]
             return x;
         }
 
@@ -883,7 +1335,7 @@ namespace Flux {
                                         struct ggml_tensor* x) {
             // img = rearrange(x, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch_size, pw=patch_size)
             x = pad_to_patch_size(ctx, x);
-            x = patchify(ctx->ggml_ctx, x);
+            x = patchify(ctx, x);
             return x;
         }
 
@@ -923,6 +1375,12 @@ namespace Flux {
             auto txt_in      = std::dynamic_pointer_cast<Linear>(blocks["txt_in"]);
             auto final_layer = std::dynamic_pointer_cast<LastLayer>(blocks["final_layer"]);
 
+            const auto& dump_cfg = flux_dump_config();
+            const bool dump_active = flux_dump_should_cache();
+            if (dump_active && dump_cfg.dump_pre) {
+                flux_cache_tensor(ctx, "flux_in_img", img);
+            }
+
             if (img_in) {
                 img = img_in->forward(ctx, img);
             }
@@ -956,7 +1414,11 @@ namespace Flux {
                 }
             } else {
                 auto time_in = std::dynamic_pointer_cast<MLPEmbedder>(blocks["time_in"]);
-                vec          = time_in->forward(ctx, ggml_ext_timestep_embedding(ctx->ggml_ctx, timesteps, 256, 10000, 1000.f));
+                auto t_embed = ggml_ext_timestep_embedding(ctx->ggml_ctx, timesteps, 256, 10000, 1000.f);
+                if (dump_active && std::getenv("SD_FLUX_DUMP_VEC_DETAIL") != nullptr) {
+                    flux_cache_tensor(ctx, "flux_t_embed", t_embed);
+                }
+                vec          = time_in->forward(ctx, t_embed);
                 if (params.guidance_embed) {
                     GGML_ASSERT(guidance != nullptr);
                     auto guidance_in = std::dynamic_pointer_cast<MLPEmbedder>(blocks["guidance_in"]);
@@ -969,6 +1431,13 @@ namespace Flux {
                     auto vector_in = std::dynamic_pointer_cast<MLPEmbedder>(blocks["vector_in"]);
                     vec            = ggml_add(ctx->ggml_ctx, vec, vector_in->forward(ctx, y));
                 }
+            }
+
+            if (dump_active && dump_cfg.dump_pre) {
+                flux_cache_tensor(ctx, "flux_vec", vec);
+                if (timesteps) flux_cache_tensor(ctx, "flux_timesteps", timesteps);
+                if (guidance) flux_cache_tensor(ctx, "flux_guidance", guidance);
+                if (pe) flux_cache_tensor(ctx, "flux_pe", pe);
             }
 
             std::vector<ModulationOut> ds_img_mods;
@@ -990,7 +1459,15 @@ namespace Flux {
                 txt = semantic_txt_norm->forward(ctx, txt);
             }
 
+            if (dump_active && dump_cfg.dump_pre) {
+                flux_cache_tensor(ctx, "flux_in_txt", txt);
+            }
+
             txt = txt_in->forward(ctx, txt);
+            if (dump_active && dump_cfg.dump_pre) {
+                flux_cache_tensor(ctx, "flux_pre_img", img);
+                flux_cache_tensor(ctx, "flux_pre_txt", txt);
+            }
 
             for (int i = 0; i < params.depth; i++) {
                 if (skip_layers.size() > 0 && std::find(skip_layers.begin(), skip_layers.end(), i) != skip_layers.end()) {
@@ -1002,6 +1479,11 @@ namespace Flux {
                 auto img_txt = block->forward(ctx, img, txt, vec, pe, txt_img_mask, ds_img_mods, ds_txt_mods);
                 img          = img_txt.first;   // [N, n_img_token, hidden_size]
                 txt          = img_txt.second;  // [N, n_txt_token, hidden_size]
+
+                if (dump_active && (dump_cfg.dump_double_all || dump_cfg.double_idx.count(i) > 0)) {
+                    flux_cache_tensor(ctx, "flux_ds" + std::to_string(i) + "_img", img);
+                    flux_cache_tensor(ctx, "flux_ds" + std::to_string(i) + "_txt", txt);
+                }
             }
 
             auto txt_img = ggml_concat(ctx->ggml_ctx, txt, img, 1);  // [N, n_txt_token + n_img_token, hidden_size]
@@ -1012,6 +1494,10 @@ namespace Flux {
                 auto block = std::dynamic_pointer_cast<SingleStreamBlock>(blocks["single_blocks." + std::to_string(i)]);
 
                 txt_img = block->forward(ctx, txt_img, vec, pe, txt_img_mask, ss_mods);
+
+                if (dump_active && (dump_cfg.dump_single_all || dump_cfg.single_idx.count(i) > 0)) {
+                    flux_cache_tensor(ctx, "flux_ss" + std::to_string(i) + "_txt_img", txt_img);
+                }
             }
 
             img = ggml_view_3d(ctx->ggml_ctx,
@@ -1025,6 +1511,10 @@ namespace Flux {
 
             if (final_layer) {
                 img = final_layer->forward(ctx, img, vec);  // (N, T, patch_size ** 2 * out_channels)
+            }
+
+            if (dump_active && dump_cfg.dump_final) {
+                flux_cache_tensor(ctx, "flux_final_img", img);
             }
 
             return img;
@@ -1082,7 +1572,7 @@ namespace Flux {
             auto nerf_image_embedder   = std::dynamic_pointer_cast<NerfEmbedder>(blocks["nerf_image_embedder"]);
             auto nerf_final_layer_conv = std::dynamic_pointer_cast<NerfFinalLayerConv>(blocks["nerf_final_layer_conv"]);
 
-            auto nerf_pixels    = patchify(ctx->ggml_ctx, orig_img);  // [N, num_patches, C * patch_size * patch_size]
+            auto nerf_pixels    = patchify(ctx, orig_img);  // [N, num_patches, C * patch_size * patch_size]
             int64_t num_patches = nerf_pixels->ne[1];
             nerf_pixels         = ggml_reshape_3d(ctx->ggml_ctx,
                                                   nerf_pixels,
@@ -1133,6 +1623,12 @@ namespace Flux {
             int patch_size = params.patch_size;
             int pad_h      = (patch_size - H % patch_size) % patch_size;
             int pad_w      = (patch_size - W % patch_size) % patch_size;
+
+            const auto& dump_cfg = flux_dump_config();
+            const bool dump_active = flux_dump_should_cache();
+            if (dump_active && dump_cfg.dump_pre) {
+                flux_cache_tensor(ctx, "flux_x_in", x);
+            }
 
             auto img           = process_img(ctx, x);
             int64_t img_tokens = img->ne[1];
@@ -1519,6 +2015,93 @@ namespace Flux {
             return gf;
         }
 
+        static bool dump_tensor_to_file(const std::string& path, const char* name, const ggml_tensor* tensor) {
+            if (tensor == nullptr) {
+                return false;
+            }
+            FILE* f = std::fopen(path.c_str(), "wb");
+            if (f == nullptr) {
+                return false;
+            }
+            const int32_t n_dims   = ggml_n_dims(tensor);
+            const int32_t name_len = name ? static_cast<int32_t>(std::strlen(name)) : 0;
+            const int32_t ttype    = static_cast<int32_t>(tensor->type);
+
+            std::vector<uint8_t> buf(ggml_nbytes(tensor));
+            ggml_backend_tensor_get(tensor, buf.data(), 0, buf.size());
+
+            std::fwrite(&n_dims, sizeof(n_dims), 1, f);
+            std::fwrite(&name_len, sizeof(name_len), 1, f);
+            std::fwrite(&ttype, sizeof(ttype), 1, f);
+            for (int i = 0; i < n_dims; ++i) {
+                const int32_t ne = static_cast<int32_t>(tensor->ne[i]);
+                std::fwrite(&ne, sizeof(ne), 1, f);
+            }
+            if (name_len > 0) {
+                std::fwrite(name, 1, name_len, f);
+            }
+            std::fwrite(buf.data(), 1, buf.size(), f);
+            std::fflush(f);
+            std::fclose(f);
+            return true;
+        }
+
+        bool dump_cached_tensors_if_needed() {
+            const auto& cfg = flux_dump_config();
+            if (!cfg.enabled || cache_ctx == nullptr) {
+                return false;
+            }
+            const char* dir = std::getenv("SD_DUMP_TENSOR_DIR");
+            const char* tag = std::getenv("SD_DUMP_TENSOR_TAG");
+            std::string base;
+            if (dir != nullptr) {
+                base.assign(dir);
+                if (!base.empty() && base.back() != '/') {
+                    base.push_back('/');
+                }
+            }
+            std::string prefix = tag ? tag : "flux";
+            bool wrote = false;
+
+            bool dbg_stats = cfg.debug_stats;
+            int dbg_step = -1;
+            if (dbg_stats) {
+                dbg_step = ++flux_debug_step_counter();
+                const char* dbg_step_env = std::getenv("SD_FLUX_DEBUG_STEP");
+                if (dbg_step_env != nullptr) {
+                    int want = std::atoi(dbg_step_env);
+                    if (want > 0 && dbg_step != want) {
+                        dbg_stats = false;
+                    }
+                }
+            }
+            std::vector<std::string> filters = dbg_stats ? flux_debug_filter_tokens() : std::vector<std::string>();
+
+            for (ggml_tensor* t = ggml_get_first_tensor(cache_ctx); t != nullptr; t = ggml_get_next_tensor(cache_ctx, t)) {
+                const char* name = ggml_get_name(t);
+                const std::string tname = (name && name[0]) ? name : "tensor";
+                if (!base.empty()) {
+                    std::string fname = base + prefix + "_" + tname + ".tensor";
+                    wrote |= dump_tensor_to_file(fname, name, t);
+                }
+                if (dbg_stats && flux_debug_filter_match(tname, filters)) {
+                    FluxStats st;
+                    if (flux_tensor_stats_backend(t, st)) {
+                        LOG_INFO("[fluxdbg] step %d %s: n=%" PRId64 " nan=%" PRId64 " inf=%" PRId64 " max_abs=%.6g mean_abs=%.6g rms=%.6g",
+                                 dbg_step, tname.c_str(), st.n_elem, st.n_nan, st.n_inf, st.max_abs, st.mean_abs, st.rms);
+                    } else {
+                        LOG_INFO("[fluxdbg] step %d %s: stats unavailable (type=%s)",
+                                 dbg_step, tname.c_str(), ggml_type_name(t->type));
+                    }
+                }
+            }
+            free_cache_ctx_and_buffer();
+            if ((wrote || cfg.debug_stats) && !cfg.repeat) {
+                flux_dump_mark_done();
+            }
+            return wrote;
+        }
+
         bool compute(int n_threads,
                      struct ggml_tensor* x,
                      struct ggml_tensor* timesteps,
@@ -1539,8 +2122,11 @@ namespace Flux {
             auto get_graph = [&]() -> struct ggml_cgraph* {
                 return build_graph(x, timesteps, context, c_concat, y, guidance, ref_latents, increase_ref_index, skip_layers);
             };
-
-            return GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
+            const bool ok = GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
+            if (ok) {
+                dump_cached_tensors_if_needed();
+            }
+            return ok;
         }
 
         void test() {

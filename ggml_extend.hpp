@@ -6,6 +6,7 @@
 #include <stdarg.h>
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -46,6 +47,10 @@
 
 #ifdef SD_USE_SYCL
 #include "ggml-sycl.h"
+#endif
+
+#ifdef SD_USE_HEXAGON
+#include "ggml-hexagon.h"
 #endif
 
 #include "rng.hpp"
@@ -1292,10 +1297,44 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_attention_ext(struct ggml_context
         C         = d_head * n_head;
     }
 
+    const bool force_contig = std::getenv("SD_FORCE_ATTN_CONTIG") != nullptr;
+    bool need_contig = force_contig;
+#ifdef SD_USE_OPENCL
+    need_contig = need_contig || ggml_backend_is_opencl(backend);
+#endif
+    if (need_contig) {
+        if (!ggml_is_contiguous(q)) {
+            q = ggml_cont(ctx, q);
+        }
+        if (!ggml_is_contiguous(k)) {
+            k = ggml_cont(ctx, k);
+        }
+        if (!ggml_is_contiguous(v)) {
+            v = ggml_cont(ctx, v);
+        }
+    }
+
+    if (std::getenv("SD_DEBUG_ATTN_LAYOUT") != nullptr) {
+        auto log_tensor = [](const char* name, const ggml_tensor* t) {
+            LOG_INFO("attn_layout %s: ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] nb=[%zu,%zu,%zu,%zu] cont=%d perm=%d trans=%d type=%s",
+                     name,
+                     t->ne[0], t->ne[1], t->ne[2], t->ne[3],
+                     (size_t)t->nb[0], (size_t)t->nb[1], (size_t)t->nb[2], (size_t)t->nb[3],
+                     (int)ggml_is_contiguous(t), (int)ggml_is_permuted(t), (int)ggml_is_transposed(t),
+                     ggml_type_name(t->type));
+        };
+        log_tensor("q", q);
+        log_tensor("k", k);
+        log_tensor("v", v);
+    }
+
     float scale = (1.0f / sqrt((float)d_head));
 
     int kv_pad       = 0;
     ggml_tensor* kqv = nullptr;
+
+    const bool flash_kv_f32 = std::getenv("GGML_OPENCL_FLASH_FORCE_F32") != nullptr ||
+                              std::getenv("SD_FLASH_KV_F32") != nullptr;
 
     auto build_kqv = [&](ggml_tensor* q_in, ggml_tensor* k_in, ggml_tensor* v_in, ggml_tensor* mask_in) -> ggml_tensor* {
         if (kv_pad != 0) {
@@ -1304,7 +1343,9 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_attention_ext(struct ggml_context
         if (kv_scale != 1.0f) {
             k_in = ggml_ext_scale(ctx, k_in, kv_scale);
         }
-        k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
+        if (!flash_kv_f32) {
+            k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
+        }
 
         v_in = ggml_ext_cont(ctx, ggml_permute(ctx, v_in, 0, 2, 1, 3));
         v_in = ggml_reshape_3d(ctx, v_in, d_head, L_k, n_kv_head * N);
@@ -1314,7 +1355,9 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_attention_ext(struct ggml_context
         if (kv_scale != 1.0f) {
             v_in = ggml_ext_scale(ctx, v_in, kv_scale);
         }
-        v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
+        if (!flash_kv_f32) {
+            v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
+        }
 
         if (mask_in != nullptr) {
             mask_in = ggml_transpose(ctx, mask_in);
@@ -1600,7 +1643,10 @@ struct WeightAdapter {
     virtual size_t get_extra_graph_size()                                                                     = 0;
 };
 
+struct GGMLRunner;
+
 struct GGMLRunnerContext {
+    GGMLRunner* runner                          = nullptr;
     ggml_backend_t backend                        = nullptr;
     ggml_context* ggml_ctx                        = nullptr;
     bool flash_attn_enabled                       = false;
@@ -1616,12 +1662,17 @@ protected:
 
     ggml_backend_t params_backend  = nullptr;
     ggml_backend_t runtime_backend = nullptr;
+    ggml_backend_t cpu_backend     = nullptr;
+    ggml_backend_sched_t backend_sched = nullptr;
+    bool use_backend_sched         = false;
+    bool sched_reserved            = false;
 
     struct ggml_context* params_ctx             = nullptr;
     ggml_backend_buffer_t params_buffer         = nullptr;
     struct ggml_context* offload_ctx            = nullptr;
     ggml_backend_buffer_t runtime_params_buffer = nullptr;
     bool params_on_runtime_backend              = false;
+    bool building_for_reserve                   = false;
 
     struct ggml_context* cache_ctx     = nullptr;
     ggml_backend_buffer_t cache_buffer = nullptr;
@@ -1734,16 +1785,68 @@ protected:
             auto result = ggml_graph_node(gf, -1);
             ggml_set_name(result, final_result_name.c_str());
         }
+        if (!cache_tensor_map.empty()) {
+            for (const auto& kv : cache_tensor_map) {
+                ggml_build_forward_expand(gf, kv.second);
+            }
+        }
         prepare_build_in_tensor_after(gf);
         return gf;
     }
 
     bool alloc_compute_buffer(get_graph_cb_t get_graph) {
+        if (use_backend_sched) {
+            if (sched_reserved) {
+                return true;
+            }
+            reset_compute_ctx();
+            building_for_reserve = true;
+            struct ggml_cgraph* gf = get_compute_graph(get_graph);
+            building_for_reserve = false;
+            backend_tensor_data_map.clear();
+            ggml_backend_sched_reset(backend_sched);
+
+            if (!ggml_backend_sched_reserve(backend_sched, gf)) {
+                LOG_ERROR("%s alloc compute graph failed", get_desc().c_str());
+                return false;
+            }
+
+            sched_reserved = true;
+
+            size_t total_size   = 0;
+            size_t runtime_size = ggml_backend_sched_get_buffer_size(backend_sched, runtime_backend);
+            if (runtime_size > 0) {
+                LOG_DEBUG("%s compute buffer size: %.2f MB(%s)",
+                          get_desc().c_str(),
+                          runtime_size / 1024.0 / 1024.0,
+                          ggml_backend_name(runtime_backend));
+                total_size += runtime_size;
+            }
+            if (cpu_backend != nullptr) {
+                size_t cpu_size = ggml_backend_sched_get_buffer_size(backend_sched, cpu_backend);
+                if (cpu_size > 0) {
+                    LOG_DEBUG("%s compute buffer size: %.2f MB(%s)",
+                              get_desc().c_str(),
+                              cpu_size / 1024.0 / 1024.0,
+                              ggml_backend_name(cpu_backend));
+                    total_size += cpu_size;
+                }
+            }
+            if (total_size > 0) {
+                LOG_DEBUG("%s total compute buffer size: %.2f MB",
+                          get_desc().c_str(),
+                          total_size / 1024.0 / 1024.0);
+            }
+            return true;
+        }
+
         if (compute_allocr != nullptr) {
             return true;
         }
         reset_compute_ctx();
+        building_for_reserve = true;
         struct ggml_cgraph* gf = get_compute_graph(get_graph);
+        building_for_reserve = false;
         backend_tensor_data_map.clear();
         compute_allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(runtime_backend));
 
@@ -1787,7 +1890,58 @@ protected:
         cache_buffer       = ggml_backend_alloc_ctx_tensors(cache_ctx, runtime_backend);
         GGML_ASSERT(cache_buffer != nullptr);
         for (auto kv : runtime_tensor_to_cache_tensor) {
-            ggml_backend_tensor_copy(kv.first, kv.second);
+            if (kv.second->buffer == nullptr) {
+                LOG_ERROR("%s cache copy skipped: tensor '%s' dst buffer is null (src=%p op=%s)",
+                          get_desc().c_str(),
+                          ggml_get_name(kv.first),
+                          (void *)kv.first->buffer,
+                          ggml_op_desc(kv.first));
+                continue;
+            }
+            if (kv.first->buffer == nullptr) {
+                {
+                    const struct ggml_tensor* base = kv.first;
+                    size_t view_offs = 0;
+                    while (base->view_src != nullptr) {
+                        view_offs += base->view_offs;
+                        base = base->view_src;
+                    }
+                    if (base != kv.first) {
+                        const size_t nbytes = ggml_nbytes(kv.second);
+                        if (base->buffer != nullptr) {
+                            std::vector<uint8_t> tmp(nbytes);
+                            ggml_backend_tensor_get(base, tmp.data(), view_offs, nbytes);
+                            ggml_backend_tensor_set(kv.second, tmp.data(), 0, nbytes);
+                            continue;
+                        }
+                        if (base->data != nullptr) {
+                            const char* src = static_cast<const char*>(base->data) + view_offs;
+                            ggml_backend_tensor_set(kv.second, src, 0, nbytes);
+                            continue;
+                        }
+                    }
+                }
+                if (kv.first->data == nullptr) {
+                    LOG_ERROR("%s cache copy skipped: tensor '%s' src buffer/data is null (src=%p op=%s)",
+                              get_desc().c_str(),
+                              ggml_get_name(kv.first),
+                              (void *)kv.first->buffer,
+                              ggml_op_desc(kv.first));
+                    continue;
+                }
+                size_t nbytes = ggml_nbytes(kv.second);
+                ggml_backend_tensor_set(kv.second, kv.first->data, 0, nbytes);
+                continue;
+            }
+            if (ggml_are_same_shape(kv.first, kv.second) && ggml_are_same_stride(kv.first, kv.second)) {
+                ggml_backend_tensor_copy(kv.first, kv.second);
+            } else {
+                // Fallback for view/permute debug dumps whose runtime/backend layouts differ.
+                size_t nbytes = ggml_nbytes(kv.second);
+                std::vector<uint8_t> tmp(nbytes);
+                ggml_backend_tensor_get(kv.first, tmp.data(), 0, nbytes);
+                ggml_backend_tensor_set(kv.second, tmp.data(), 0, nbytes);
+            }
         }
         ggml_backend_synchronize(runtime_backend);
         cache_tensor_map.clear();
@@ -1903,11 +2057,33 @@ public:
         } else {
             params_backend = runtime_backend;
         }
+
+#ifdef SD_USE_HEXAGON
+        if (ggml_backend_is_hexagon(runtime_backend)) {
+            cpu_backend = ggml_backend_cpu_init();
+            ggml_backend_t backends[2] = { runtime_backend, cpu_backend };
+            backend_sched = ggml_backend_sched_new(backends, nullptr, 2, MAX_GRAPH_SIZE, false, true);
+            if (backend_sched != nullptr) {
+                use_backend_sched = true;
+            } else {
+                ggml_backend_free(cpu_backend);
+                cpu_backend = nullptr;
+            }
+        }
+#endif
     }
 
     virtual ~GGMLRunner() {
         free_params_buffer();
         free_compute_buffer();
+        if (backend_sched != nullptr) {
+            ggml_backend_sched_free(backend_sched);
+            backend_sched = nullptr;
+        }
+        if (cpu_backend != nullptr) {
+            ggml_backend_free(cpu_backend);
+            cpu_backend = nullptr;
+        }
         free_params_ctx();
         free_compute_ctx();
         if (params_backend != runtime_backend) {
@@ -1918,6 +2094,7 @@ public:
 
     virtual GGMLRunnerContext get_context() {
         GGMLRunnerContext runner_ctx;
+        runner_ctx.runner                = this;
         runner_ctx.ggml_ctx              = compute_ctx;
         runner_ctx.backend               = runtime_backend;
         runner_ctx.flash_attn_enabled    = flash_attn_enabled;
@@ -1975,6 +2152,9 @@ public:
             ggml_gallocr_free(compute_allocr);
             compute_allocr = nullptr;
         }
+        if (use_backend_sched) {
+            sched_reserved = false;
+        }
         offload_params_to_params_backend();
     }
 
@@ -2016,29 +2196,76 @@ public:
                  bool free_compute_buffer_immediately = true,
                  struct ggml_tensor** output          = nullptr,
                  struct ggml_context* output_ctx      = nullptr) {
+        const bool split_timing = std::getenv("GGML_RUNNER_SPLIT_TIMING") != nullptr;
+        const int64_t t_begin = split_timing ? ggml_time_ms() : 0;
         if (!offload_params_to_runtime_backend()) {
             LOG_ERROR("%s offload params to runtime backend failed", get_desc().c_str());
             return false;
         }
+        const int64_t t_after_offload = split_timing ? ggml_time_ms() : 0;
         if (!alloc_compute_buffer(get_graph)) {
             LOG_ERROR("%s alloc compute buffer failed", get_desc().c_str());
             return false;
         }
+        const int64_t t_after_reserve = split_timing ? ggml_time_ms() : 0;
         reset_compute_ctx();
         struct ggml_cgraph* gf = get_compute_graph(get_graph);
-        if (!ggml_gallocr_alloc_graph(compute_allocr, gf)) {
-            LOG_ERROR("%s alloc compute graph failed", get_desc().c_str());
-            return false;
-        }
-        copy_data_to_backend_tensor();
-        if (ggml_backend_is_cpu(runtime_backend)) {
-            ggml_backend_cpu_set_n_threads(runtime_backend, n_threads);
-        }
+        const int64_t t_after_graph = split_timing ? ggml_time_ms() : 0;
+        if (use_backend_sched) {
+            ggml_backend_sched_reset(backend_sched);
+            if (!ggml_backend_sched_alloc_graph(backend_sched, gf)) {
+                LOG_ERROR("%s alloc compute graph failed", get_desc().c_str());
+                return false;
+            }
+            copy_data_to_backend_tensor();
+            const int64_t t_after_copy = split_timing ? ggml_time_ms() : 0;
+            if (cpu_backend != nullptr) {
+                ggml_backend_cpu_set_n_threads(cpu_backend, n_threads);
+            }
 
-        ggml_status status = ggml_backend_graph_compute(runtime_backend, gf);
-        if (status != GGML_STATUS_SUCCESS) {
-            LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
-            return false;
+            ggml_status status = ggml_backend_sched_graph_compute(backend_sched, gf);
+            if (status != GGML_STATUS_SUCCESS) {
+                LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
+                return false;
+            }
+            if (split_timing) {
+                const int64_t t_after_compute = ggml_time_ms();
+                LOG_INFO("%s split(ms): offload=%lld reserve=%lld graph=%lld copy=%lld compute=%lld total=%lld",
+                         get_desc().c_str(),
+                         (long long)(t_after_offload - t_begin),
+                         (long long)(t_after_reserve - t_after_offload),
+                         (long long)(t_after_graph - t_after_reserve),
+                         (long long)(t_after_copy - t_after_graph),
+                         (long long)(t_after_compute - t_after_copy),
+                         (long long)(t_after_compute - t_begin));
+            }
+        } else {
+            if (!ggml_gallocr_alloc_graph(compute_allocr, gf)) {
+                LOG_ERROR("%s alloc compute graph failed", get_desc().c_str());
+                return false;
+            }
+            copy_data_to_backend_tensor();
+            const int64_t t_after_copy = split_timing ? ggml_time_ms() : 0;
+            if (ggml_backend_is_cpu(runtime_backend)) {
+                ggml_backend_cpu_set_n_threads(runtime_backend, n_threads);
+            }
+
+            ggml_status status = ggml_backend_graph_compute(runtime_backend, gf);
+            if (status != GGML_STATUS_SUCCESS) {
+                LOG_ERROR("%s compute failed: %s", get_desc().c_str(), ggml_status_to_string(status));
+                return false;
+            }
+            if (split_timing) {
+                const int64_t t_after_compute = ggml_time_ms();
+                LOG_INFO("%s split(ms): offload=%lld reserve=%lld graph=%lld copy=%lld compute=%lld total=%lld",
+                         get_desc().c_str(),
+                         (long long)(t_after_offload - t_begin),
+                         (long long)(t_after_reserve - t_after_offload),
+                         (long long)(t_after_graph - t_after_reserve),
+                         (long long)(t_after_copy - t_after_graph),
+                         (long long)(t_after_compute - t_after_copy),
+                         (long long)(t_after_compute - t_begin));
+            }
         }
 #ifdef GGML_PERF
         ggml_graph_print(gf);
@@ -2075,6 +2302,10 @@ public:
 
     void set_weight_adapter(const std::shared_ptr<WeightAdapter>& adapter) {
         weight_adapter = adapter;
+    }
+
+    bool is_building_for_reserve() const {
+        return building_for_reserve;
     }
 };
 
@@ -2114,6 +2345,11 @@ public:
             prefix = prefix + ".";
         }
         init_params(ctx, tensor_storage_map, prefix);
+        for (auto& pair : params) {
+            if (pair.second != nullptr && pair.second->name[0] == '\0') {
+                ggml_set_name(pair.second, (prefix + pair.first).c_str());
+            }
+        }
         init_blocks(ctx, tensor_storage_map, prefix);
     }
 
@@ -2226,6 +2462,12 @@ public:
         if (bias) {
             b = params["bias"];
         }
+#ifdef SD_USE_OPENCL
+        // Adreno Q4 matmul expects contiguous activations; enforce when needed to avoid incorrect results.
+        if (ggml_backend_is_opencl(ctx->backend) && !ggml_is_contiguous(x)) {
+            x = ggml_cont(ctx->ggml_ctx, x);
+        }
+#endif
         if (ctx->weight_adapter) {
             WeightAdapter::ForwardParams forward_params;
             forward_params.op_type               = WeightAdapter::ForwardParams::op_type_t::OP_LINEAR;

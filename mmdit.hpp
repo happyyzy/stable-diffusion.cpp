@@ -1,12 +1,58 @@
 #ifndef __MMDIT_HPP__
 #define __MMDIT_HPP__
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
+#include <vector>
 
 #include "ggml_extend.hpp"
 #include "model.h"
 
 #define MMDIT_GRAPH_SIZE 10240
+
+static inline bool mmdit_dump_tensor_to_file(const std::string& path, const char* name, const ggml_tensor* tensor) {
+    if (tensor == nullptr) {
+        LOG_ERROR("mmdit dump tensor failed: tensor is null");
+        return false;
+    }
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (f == nullptr) {
+        LOG_ERROR("mmdit dump tensor failed: cannot open '%s'", path.c_str());
+        return false;
+    }
+
+    const int32_t n_dims   = ggml_n_dims(tensor);
+    const int32_t name_len = name ? static_cast<int32_t>(std::strlen(name)) : 0;
+    const int32_t ttype    = static_cast<int32_t>(tensor->type);
+
+    std::fwrite(&n_dims, sizeof(n_dims), 1, f);
+    std::fwrite(&name_len, sizeof(name_len), 1, f);
+    std::fwrite(&ttype, sizeof(ttype), 1, f);
+    for (int i = 0; i < n_dims; ++i) {
+        const int32_t ne = static_cast<int32_t>(tensor->ne[i]);
+        std::fwrite(&ne, sizeof(ne), 1, f);
+    }
+    if (name_len > 0) {
+        std::fwrite(name, 1, name_len, f);
+    }
+    const size_t nbytes = ggml_nbytes(tensor);
+    if (tensor->buffer != nullptr) {
+        std::vector<uint8_t> buf(nbytes);
+        ggml_backend_tensor_get(tensor, buf.data(), 0, buf.size());
+        std::fwrite(buf.data(), 1, buf.size(), f);
+    } else if (tensor->data != nullptr) {
+        std::fwrite(tensor->data, 1, nbytes, f);
+    } else {
+        std::fclose(f);
+        LOG_ERROR("mmdit dump tensor failed: tensor has no data");
+        return false;
+    }
+    std::fflush(f);
+    std::fclose(f);
+    return true;
+}
 
 struct Mlp : public GGMLBlock {
 public:
@@ -76,6 +122,9 @@ public:
         // x: [N, C, H, W]
         // return: [N, H*W, embed_dim]
         auto proj = std::dynamic_pointer_cast<Conv2d>(blocks["proj"]);
+        static bool dump_once = false;
+        const char* dump_dir  = std::getenv("SD_DUMP_PATCHIFY_DIR");
+        const bool do_dump    = (!dump_once && dump_dir != nullptr && dump_dir[0] != '\0' && ctx != nullptr && ctx->runner != nullptr);
 
         if (dynamic_img_pad) {
             int64_t W = x->ne[0];
@@ -84,11 +133,29 @@ public:
             int pad_w = (patch_size - W % patch_size) % patch_size;
             x         = ggml_pad(ctx->ggml_ctx, x, pad_w, pad_h, 0, 0);  // TODO: reflect pad mode
         }
-        x = proj->forward(ctx, x);
+        auto x_proj = proj->forward(ctx, x);
+        if (do_dump) {
+            ctx->runner->cache("patchify_proj", x_proj);
+        }
 
         if (flatten) {
-            x = ggml_reshape_3d(ctx->ggml_ctx, x, x->ne[0] * x->ne[1], x->ne[2], x->ne[3]);
-            x = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, x, 1, 0, 2, 3));
+            auto x_reshape = ggml_reshape_3d(ctx->ggml_ctx, x_proj, x_proj->ne[0] * x_proj->ne[1], x_proj->ne[2], x_proj->ne[3]);
+            if (do_dump) {
+                ctx->runner->cache("patchify_reshape", x_reshape);
+            }
+            auto x_permute = ggml_permute(ctx->ggml_ctx, x_reshape, 1, 0, 2, 3);
+            if (do_dump) {
+                ctx->runner->cache("patchify_permute", x_permute);
+            }
+            x = ggml_cont(ctx->ggml_ctx, x_permute);
+            if (do_dump) {
+                ctx->runner->cache("patchify_cont", x);
+            }
+        } else {
+            x = x_proj;
+        }
+        if (do_dump) {
+            dump_once = true;
         }
         return x;
     }
@@ -899,7 +966,25 @@ struct MMDiTRunner : public GGMLRunner {
             return build_graph(x, timesteps, context, y, skip_layers);
         };
 
-        return GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
+        bool ok = GGMLRunner::compute(get_graph, n_threads, false, output, output_ctx);
+        static bool dump_done = false;
+        const char* dump_dir  = std::getenv("SD_DUMP_PATCHIFY_DIR");
+        if (ok && !dump_done && dump_dir != nullptr && dump_dir[0] != '\0') {
+            std::string base(dump_dir);
+            if (!base.empty() && base.back() != '/') {
+                base.push_back('/');
+            }
+            const char* names[] = {"patchify_proj", "patchify_reshape", "patchify_permute", "patchify_cont"};
+            for (const char* name : names) {
+                auto t = get_cache_tensor_by_name(name);
+                if (t != nullptr) {
+                    mmdit_dump_tensor_to_file(base + std::string(name) + ".tensor", name, t);
+                }
+            }
+            dump_done = true;
+            LOG_INFO("dumped patchify tensors to '%s'", dump_dir);
+        }
+        return ok;
     }
 
     void test() {

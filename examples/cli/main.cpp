@@ -2,20 +2,30 @@
 #include <string.h>
 #include <time.h>
 #include <cctype>
+#include <inttypes.h>
 #include <filesystem>
 #include <functional>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <random>
 #include <regex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 // #include "preprocessing.hpp"
 #include "stable-diffusion.h"
 
 #include "common/common.hpp"
+#include "llm.hpp"
+#include "conditioner.hpp"
+#include "flux.hpp"
+
+#ifdef SD_USE_HEXAGON
+#include "ggml-hexagon.h"
+#endif
 
 #include "avi_writer.h"
 
@@ -32,6 +42,7 @@ struct SDCliParams {
     SDMode mode             = IMG_GEN;
     std::string output_path = "output.png";
     int output_begin_idx    = -1;
+    std::string load_latent_path;
 
     bool verbose          = false;
     bool canny_preprocess = false;
@@ -45,6 +56,39 @@ struct SDCliParams {
     bool preview_noisy       = false;
     bool color               = false;
 
+    bool llm_embed_only       = false;
+    int llm_embed_id          = -1;
+    int llm_embed_n           = 1;
+    std::string llm_embed_dump = "llm_embed_only.tensor";
+    std::string llm_embed_arch = "qwen3";
+    bool llm_forward_only       = false;
+    bool llm_generate_only      = false;
+    int llm_max_new_tokens      = 32;
+    std::string llm_forward_dump;
+    std::string llm_generate_dump;
+    std::string llm_version      = "flux2_klein";
+    bool q4_matmul_bench         = false;
+    std::string q4_weight       = "q_proj";
+    int q4_layer                = 0;
+    int q4_n_token              = 1;
+    std::string q4_input;
+    std::string q4_dump         = "q4_matmul.tensor";
+    bool rmsnorm_bench          = false;
+    std::string rmsnorm_weight  = "q_norm";
+    std::string rmsnorm_input;
+    std::string rmsnorm_dump    = "rmsnorm.tensor";
+    float rmsnorm_eps           = 1e-6f;
+    bool attn_bench             = false;
+    std::string attn_q_input;
+    std::string attn_k_input;
+    std::string attn_v_input;
+    int attn_n_head             = 32;
+    std::string attn_dump        = "attn.tensor";
+    bool flux_fwd_bench         = false;
+    int flux_bench_runs         = 1;
+    int flux_bench_warmup       = 0;
+    int flux_bench_ctx          = 256;
+
     bool normal_exit = false;
 
     ArgOptions get_options() {
@@ -56,9 +100,73 @@ struct SDCliParams {
              "path to write result image to. you can use printf-style %d format specifiers for image sequences (default: ./output.png) (eg. output_%03d.png)",
              &output_path},
             {"",
+             "--load-latent",
+             "path to latent tensor dump to decode with VAE (ggml .tensor format)",
+             &load_latent_path},
+            {"",
              "--preview-path",
              "path to write preview image to (default: ./preview.png)",
              &preview_path},
+            {"",
+             "--llm-embed-dump",
+             "path to write embedding tensor dump (default: ./llm_embed_only.tensor)",
+             &llm_embed_dump},
+            {"",
+             "--llm-embed-arch",
+             "llm arch for embed-only: qwen3 | mistral-small3.2 (default: qwen3)",
+             &llm_embed_arch},
+            {"",
+             "--llm-forward-dump",
+             "path to write llm hidden_states dump (c_crossattn) for llm-forward-only",
+             &llm_forward_dump},
+            {"",
+             "--llm-generate-dump",
+             "path to write llm generated text for llm-generate-only",
+             &llm_generate_dump},
+            {"",
+             "--llm-version",
+             "llm version for llm-forward-only: flux2_klein | flux2 | z_image | ovis_image | qwen_image (default: flux2_klein)",
+             &llm_version},
+            {"",
+             "--q4-weight",
+             "q4 matmul weight name: q_proj | k_proj | v_proj | gate_proj | up_proj | down_proj (default: q_proj)",
+             &q4_weight},
+            {"",
+             "--q4-dump",
+             "path to write q4 matmul output tensor (default: ./q4_matmul.tensor)",
+             &q4_dump},
+            {"",
+             "--q4-input",
+             "path to load input tensor dump for q4 matmul (overrides --q4-n-token)",
+             &q4_input},
+            {"",
+             "--rmsnorm-weight",
+             "rmsnorm weight name: q_norm | k_norm | input_layernorm | post_attention_layernorm (default: q_norm)",
+             &rmsnorm_weight},
+            {"",
+             "--rmsnorm-input",
+             "path to load input tensor dump for rmsnorm",
+             &rmsnorm_input},
+            {"",
+             "--rmsnorm-dump",
+             "path to write rmsnorm output tensor (default: ./rmsnorm.tensor)",
+             &rmsnorm_dump},
+            {"",
+             "--attn-q",
+             "path to load attention q tensor dump",
+             &attn_q_input},
+            {"",
+             "--attn-k",
+             "path to load attention k tensor dump",
+             &attn_k_input},
+            {"",
+             "--attn-v",
+             "path to load attention v tensor dump",
+             &attn_v_input},
+            {"",
+             "--attn-dump",
+             "path to write attention output tensor (default: ./attn.tensor)",
+             &attn_dump},
         };
 
         options.int_options = {
@@ -70,6 +178,42 @@ struct SDCliParams {
              "--output-begin-idx",
              "starting index for output image sequence, must be non-negative (default 0 if specified %d in output path, 1 otherwise)",
              &output_begin_idx},
+            {"",
+             "--llm-embed-id",
+             "token id to lookup for embed-only",
+             &llm_embed_id},
+            {"",
+             "--llm-embed-n",
+             "number of tokens to repeat for embed-only (default: 1)",
+             &llm_embed_n},
+            {"",
+             "--llm-max-new-tokens",
+             "max new tokens for llm-generate-only (default: 32)",
+             &llm_max_new_tokens},
+            {"",
+             "--q4-n-token",
+             "q4 matmul input token count (default: 1)",
+             &q4_n_token},
+            {"",
+             "--q4-layer",
+             "q4 matmul layer index (default: 0)",
+             &q4_layer},
+            {"",
+             "--attn-n-head",
+             "attention num heads (default: 32)",
+             &attn_n_head},
+            {"",
+             "--flux-bench-runs",
+             "number of timed runs for flux forward bench (default: 1)",
+             &flux_bench_runs},
+            {"",
+             "--flux-bench-warmup",
+             "number of warmup runs for flux forward bench (default: 0)",
+             &flux_bench_warmup},
+            {"",
+             "--flux-bench-ctx",
+             "context length for flux forward bench (default: 256)",
+             &flux_bench_ctx},
         };
 
         options.bool_options = {
@@ -97,6 +241,34 @@ struct SDCliParams {
              "--preview-noisy",
              "enables previewing noisy inputs of the models rather than the denoised outputs",
              true, &preview_noisy},
+            {"",
+             "--llm-embed-only",
+             "run llm embedding-only test and exit",
+             true, &llm_embed_only},
+            {"",
+             "--llm-forward-only",
+             "run llm forward-only (prompt to hidden_states) and exit",
+             true, &llm_forward_only},
+            {"",
+             "--llm-generate-only",
+             "run llm greedy generation test and exit",
+             true, &llm_generate_only},
+            {"",
+             "--q4-matmul-bench",
+             "run q4 matmul microbench and exit",
+             true, &q4_matmul_bench},
+            {"",
+             "--rmsnorm-bench",
+             "run rmsnorm microbench and exit",
+             true, &rmsnorm_bench},
+            {"",
+             "--attn-bench",
+             "run attention microbench and exit",
+             true, &attn_bench},
+            {"",
+             "--flux-fwd-bench",
+             "run flux forward microbench and exit",
+             true, &flux_fwd_bench},
 
         };
 
@@ -169,6 +341,18 @@ struct SDCliParams {
             LOG_ERROR("error: the following arguments are required: output_path");
             return false;
         }
+        if (flux_bench_runs <= 0) {
+            LOG_ERROR("error: --flux-bench-runs must be > 0");
+            return false;
+        }
+        if (flux_bench_warmup < 0) {
+            LOG_ERROR("error: --flux-bench-warmup must be >= 0");
+            return false;
+        }
+        if (flux_bench_ctx <= 0) {
+            LOG_ERROR("error: --flux-bench-ctx must be > 0");
+            return false;
+        }
 
         if (mode == CONVERT) {
             if (output_path == "output.png") {
@@ -183,6 +367,7 @@ struct SDCliParams {
         oss << "SDCliParams {\n"
             << "  mode: " << modes_str[mode] << ",\n"
             << "  output_path: \"" << output_path << "\",\n"
+            << "  load_latent_path: \"" << load_latent_path << "\",\n"
             << "  verbose: " << (verbose ? "true" : "false") << ",\n"
             << "  color: " << (color ? "true" : "false") << ",\n"
             << "  canny_preprocess: " << (canny_preprocess ? "true" : "false") << ",\n"
@@ -192,11 +377,1297 @@ struct SDCliParams {
             << "  preview_path: \"" << preview_path << "\",\n"
             << "  preview_fps: " << preview_fps << ",\n"
             << "  taesd_preview: " << (taesd_preview ? "true" : "false") << ",\n"
-            << "  preview_noisy: " << (preview_noisy ? "true" : "false") << "\n"
+            << "  preview_noisy: " << (preview_noisy ? "true" : "false") << ",\n"
+            << "  llm_embed_only: " << (llm_embed_only ? "true" : "false") << ",\n"
+            << "  llm_embed_id: " << llm_embed_id << ",\n"
+            << "  llm_embed_n: " << llm_embed_n << ",\n"
+            << "  llm_embed_dump: \"" << llm_embed_dump << "\",\n"
+            << "  llm_embed_arch: \"" << llm_embed_arch << "\",\n"
+            << "  llm_forward_only: " << (llm_forward_only ? "true" : "false") << ",\n"
+            << "  llm_generate_only: " << (llm_generate_only ? "true" : "false") << ",\n"
+            << "  llm_max_new_tokens: " << llm_max_new_tokens << ",\n"
+            << "  llm_forward_dump: \"" << llm_forward_dump << "\",\n"
+            << "  llm_generate_dump: \"" << llm_generate_dump << "\",\n"
+            << "  llm_version: \"" << llm_version << "\",\n"
+            << "  q4_matmul_bench: " << (q4_matmul_bench ? "true" : "false") << ",\n"
+            << "  q4_weight: \"" << q4_weight << "\",\n"
+            << "  q4_n_token: " << q4_n_token << ",\n"
+            << "  q4_input: \"" << q4_input << "\",\n"
+            << "  q4_dump: \"" << q4_dump << "\",\n"
+            << "  rmsnorm_bench: " << (rmsnorm_bench ? "true" : "false") << ",\n"
+            << "  rmsnorm_weight: \"" << rmsnorm_weight << "\",\n"
+            << "  rmsnorm_input: \"" << rmsnorm_input << "\",\n"
+            << "  rmsnorm_dump: \"" << rmsnorm_dump << "\",\n"
+            << "  rmsnorm_eps: " << rmsnorm_eps << ",\n"
+            << "  attn_bench: " << (attn_bench ? "true" : "false") << ",\n"
+            << "  attn_q_input: \"" << attn_q_input << "\",\n"
+            << "  attn_k_input: \"" << attn_k_input << "\",\n"
+            << "  attn_v_input: \"" << attn_v_input << "\",\n"
+            << "  attn_n_head: " << attn_n_head << ",\n"
+            << "  attn_dump: \"" << attn_dump << "\",\n"
+            << "  flux_fwd_bench: " << (flux_fwd_bench ? "true" : "false") << ",\n"
+            << "  flux_bench_runs: " << flux_bench_runs << ",\n"
+            << "  flux_bench_warmup: " << flux_bench_warmup << ",\n"
+            << "  flux_bench_ctx: " << flux_bench_ctx << "\n"
             << "}";
         return oss.str();
     }
 };
+
+static ggml_backend_t init_llm_embed_backend() {
+    ggml_backend_t backend = nullptr;
+#ifdef SD_USE_CUDA
+    LOG_DEBUG("Using CUDA backend");
+    backend = ggml_backend_cuda_init(0);
+#endif
+#ifdef SD_USE_METAL
+    LOG_DEBUG("Using Metal backend");
+    backend = ggml_backend_metal_init();
+#endif
+#ifdef SD_USE_VULKAN
+    LOG_DEBUG("Using Vulkan backend");
+    size_t device          = 0;
+    const int device_count = ggml_backend_vk_get_device_count();
+    if (device_count) {
+        const char* SD_VK_DEVICE = getenv("SD_VK_DEVICE");
+        if (SD_VK_DEVICE != nullptr) {
+            std::string sd_vk_device_str = SD_VK_DEVICE;
+            try {
+                device = std::stoull(sd_vk_device_str);
+            } catch (...) {
+                device = 0;
+            }
+            if (device >= static_cast<size_t>(device_count)) {
+                device = 0;
+            }
+        }
+        backend = ggml_backend_vk_init(device);
+    }
+#endif
+#ifdef SD_USE_OPENCL
+    LOG_DEBUG("Using OpenCL backend");
+    backend = ggml_backend_opencl_init();
+#endif
+#ifdef SD_USE_SYCL
+    LOG_DEBUG("Using SYCL backend");
+    backend = ggml_backend_sycl_init(0);
+#endif
+#ifdef SD_USE_HEXAGON
+    LOG_DEBUG("Using Hexagon backend");
+    backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_ACCEL, nullptr);
+#endif
+    if (!backend) {
+        LOG_DEBUG("Using CPU backend");
+        backend = ggml_backend_cpu_init();
+    }
+    return backend;
+}
+
+static bool parse_llm_embed_arch(const std::string& arch_str, LLM::LLMArch* arch_out) {
+    if (arch_out == nullptr) {
+        return false;
+    }
+    std::string lower = arch_str;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    if (lower == "mistral-small3.2" || lower == "mistral_small_3_2" || lower == "mistral") {
+        *arch_out = LLM::LLMArch::MISTRAL_SMALL_3_2;
+        return true;
+    }
+    if (lower == "qwen3" || lower == "qwen") {
+        *arch_out = LLM::LLMArch::QWEN3;
+        return true;
+    }
+    return false;
+}
+
+static bool parse_llm_version(const std::string& version_str, SDVersion* version_out) {
+    if (version_out == nullptr) {
+        return false;
+    }
+    std::string lower = version_str;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    if (lower == "flux2_klein" || lower == "flux2-klein") {
+        *version_out = VERSION_FLUX2_KLEIN;
+        return true;
+    }
+    if (lower == "flux2") {
+        *version_out = VERSION_FLUX2;
+        return true;
+    }
+    if (lower == "z_image" || lower == "z-image") {
+        *version_out = VERSION_Z_IMAGE;
+        return true;
+    }
+    if (lower == "ovis_image" || lower == "ovis-image") {
+        *version_out = VERSION_OVIS_IMAGE;
+        return true;
+    }
+    if (lower == "qwen_image" || lower == "qwen-image") {
+        *version_out = VERSION_QWEN_IMAGE;
+        return true;
+    }
+    return false;
+}
+
+static int run_llm_embed_only(const SDCliParams& cli_params, const SDContextParams& ctx_params) {
+    if (ctx_params.llm_path.empty()) {
+        LOG_ERROR("llm embed-only requires --llm path");
+        return 1;
+    }
+    if (cli_params.llm_embed_id < 0) {
+        LOG_ERROR("llm embed-only requires --llm-embed-id >= 0");
+        return 1;
+    }
+    if (cli_params.llm_embed_n <= 0) {
+        LOG_ERROR("llm embed-only requires --llm-embed-n > 0");
+        return 1;
+    }
+
+    LLM::LLMArch arch = LLM::LLMArch::QWEN3;
+    if (!parse_llm_embed_arch(cli_params.llm_embed_arch, &arch)) {
+        LOG_ERROR("unknown --llm-embed-arch '%s'", cli_params.llm_embed_arch.c_str());
+        return 1;
+    }
+
+    ModelLoader model_loader;
+    if (!model_loader.init_from_file_and_convert_name(ctx_params.llm_path, "text_encoders.llm.")) {
+        LOG_ERROR("init model loader from file failed: '%s'", ctx_params.llm_path.c_str());
+        return 1;
+    }
+
+    auto& tensor_storage_map = model_loader.get_tensor_storage_map();
+
+    ggml_backend_t backend = init_llm_embed_backend();
+    if (!backend) {
+        LOG_ERROR("failed to init backend");
+        return 1;
+    }
+
+    int n_threads = ctx_params.n_threads > 0 ? ctx_params.n_threads : std::max(1u, std::thread::hardware_concurrency());
+
+    LLM::LLMRunner llm(arch,
+                       backend,
+                       ctx_params.offload_params_to_cpu,
+                       tensor_storage_map,
+                       "text_encoders.llm",
+                       false);
+
+    if (!llm.alloc_params_buffer()) {
+        LOG_ERROR("llm alloc params buffer failed");
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    std::map<std::string, ggml_tensor*> tensors;
+    llm.get_param_tensors(tensors, "text_encoders.llm");
+    if (!model_loader.load_tensors(tensors, {}, n_threads, ctx_params.enable_mmap)) {
+        LOG_ERROR("load tensors from model loader failed");
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    ggml_init_params params;
+    params.mem_size   = static_cast<size_t>(256) * 1024 * 1024;
+    params.mem_buffer = nullptr;
+    params.no_alloc   = false;
+    ggml_context* work_ctx = ggml_init(params);
+    if (!work_ctx) {
+        LOG_ERROR("ggml_init failed");
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    std::vector<int> ids(static_cast<size_t>(cli_params.llm_embed_n), cli_params.llm_embed_id);
+    ggml_tensor* input_ids = vector_to_ggml_tensor_i32(work_ctx, ids);
+    input_ids              = ggml_reshape_2d(work_ctx, input_ids, input_ids->ne[0], 1);
+
+    ggml_tensor* output = nullptr;
+    if (!llm.compute_embed(n_threads, input_ids, &output, work_ctx)) {
+        LOG_ERROR("llm embed-only compute failed");
+        ggml_free(work_ctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    LOG_INFO("llm embed-only output: type=%s ne=[%" PRId64 ", %" PRId64 ", %" PRId64 "]",
+             ggml_type_name(output->type),
+             output->ne[0], output->ne[1], output->ne[2]);
+
+    if (!LLM::LLMRunner::dump_tensor_to_file(cli_params.llm_embed_dump, "llm_embed_only", output)) {
+        LOG_WARN("failed to dump embedding tensor to '%s'", cli_params.llm_embed_dump.c_str());
+    } else {
+        LOG_INFO("saved embedding tensor to '%s'", cli_params.llm_embed_dump.c_str());
+    }
+
+    ggml_free(work_ctx);
+    ggml_backend_free(backend);
+    return 0;
+}
+
+static int run_llm_forward_only(const SDCliParams& cli_params,
+                                const SDContextParams& ctx_params,
+                                const SDGenerationParams& gen_params) {
+    if (ctx_params.llm_path.empty()) {
+        LOG_ERROR("llm forward-only requires --llm path");
+        return 1;
+    }
+    if (gen_params.prompt.empty()) {
+        LOG_ERROR("llm forward-only requires --prompt");
+        return 1;
+    }
+
+    SDVersion version = VERSION_FLUX2_KLEIN;
+    if (!parse_llm_version(cli_params.llm_version, &version)) {
+        LOG_ERROR("unknown --llm-version '%s'", cli_params.llm_version.c_str());
+        return 1;
+    }
+
+    ModelLoader model_loader;
+    if (!model_loader.init_from_file_and_convert_name(ctx_params.llm_path, "text_encoders.llm.")) {
+        LOG_ERROR("init model loader from file failed: '%s'", ctx_params.llm_path.c_str());
+        return 1;
+    }
+
+    auto& tensor_storage_map = model_loader.get_tensor_storage_map();
+
+    ggml_backend_t backend = init_llm_embed_backend();
+    if (!backend) {
+        LOG_ERROR("failed to init backend");
+        return 1;
+    }
+
+    int n_threads = ctx_params.n_threads > 0 ? ctx_params.n_threads : std::max(1u, std::thread::hardware_concurrency());
+
+    std::shared_ptr<LLMEmbedder> llm = std::make_shared<LLMEmbedder>(backend,
+                                                                     ctx_params.offload_params_to_cpu,
+                                                                     tensor_storage_map,
+                                                                     version,
+                                                                     "text_encoders.llm",
+                                                                     false);
+
+    llm->alloc_params_buffer();
+
+    std::map<std::string, ggml_tensor*> tensors;
+    llm->get_param_tensors(tensors);
+    if (!model_loader.load_tensors(tensors, {}, n_threads, ctx_params.enable_mmap)) {
+        LOG_ERROR("load tensors from model loader failed");
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    ggml_init_params params;
+    params.mem_size   = static_cast<size_t>(512) * 1024 * 1024;
+    params.mem_buffer = nullptr;
+    params.no_alloc   = false;
+    ggml_context* work_ctx = ggml_init(params);
+    if (!work_ctx) {
+        LOG_ERROR("ggml_init failed");
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    ConditionerParams cond_params;
+    cond_params.text      = gen_params.prompt;
+    cond_params.clip_skip = gen_params.clip_skip;
+
+    SDCondition cond = llm->get_learned_condition(work_ctx, n_threads, cond_params);
+
+    if (!cli_params.llm_forward_dump.empty()) {
+        if (!LLM::LLMRunner::dump_tensor_to_file(cli_params.llm_forward_dump.c_str(), "llm_c_crossattn", cond.c_crossattn)) {
+            LOG_WARN("failed to dump llm hidden_states to '%s'", cli_params.llm_forward_dump.c_str());
+        } else {
+            LOG_INFO("saved llm hidden_states to '%s'", cli_params.llm_forward_dump.c_str());
+        }
+    }
+
+    ggml_free(work_ctx);
+    ggml_backend_free(backend);
+    return 0;
+}
+
+static std::string build_llm_prompt_for_version(SDVersion version, const std::string& user_text) {
+    if (version == VERSION_FLUX2) {
+        std::string prompt = "[SYSTEM_PROMPT]You are an AI that reasons about image descriptions. You give structured responses focusing on object relationships, object\nattribution and actions without speculation.[/SYSTEM_PROMPT][INST]";
+        prompt += user_text;
+        prompt += "[/INST]";
+        return prompt;
+    }
+    if (version == VERSION_FLUX2_KLEIN) {
+        std::string prompt = "<|im_start|>user\n";
+        prompt += user_text;
+        prompt += "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        return prompt;
+    }
+    if (sd_version_is_z_image(version)) {
+        std::string prompt = "<|im_start|>user\n";
+        prompt += user_text;
+        prompt += "<|im_end|>\n<|im_start|>assistant\n";
+        return prompt;
+    }
+    if (version == VERSION_OVIS_IMAGE) {
+        std::string prompt = "<|im_start|>user\nDescribe the image by detailing the color, quantity, text, shape, size, texture, spatial relationships of the objects and background: ";
+        prompt += user_text;
+        prompt += "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        return prompt;
+    }
+
+    std::string prompt = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n";
+    prompt += user_text;
+    prompt += "<|im_end|>\n<|im_start|>assistant\n";
+    return prompt;
+}
+
+static std::string escape_for_log(std::string s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        if (c == '\n') {
+            out += "\\n";
+        } else if (c == '\r') {
+            out += "\\r";
+        } else if (c == '\t') {
+            out += "\\t";
+        } else {
+            out.push_back(c);
+        }
+    }
+    return out;
+}
+
+static int run_llm_generate_only(const SDCliParams& cli_params,
+                                 const SDContextParams& ctx_params,
+                                 const SDGenerationParams& gen_params) {
+    if (ctx_params.llm_path.empty()) {
+        LOG_ERROR("llm generate-only requires --llm path");
+        return 1;
+    }
+    if (gen_params.prompt.empty()) {
+        LOG_ERROR("llm generate-only requires --prompt");
+        return 1;
+    }
+    if (cli_params.llm_max_new_tokens <= 0) {
+        LOG_ERROR("llm generate-only requires --llm-max-new-tokens > 0");
+        return 1;
+    }
+
+    SDVersion version = VERSION_FLUX2_KLEIN;
+    if (!parse_llm_version(cli_params.llm_version, &version)) {
+        LOG_ERROR("unknown --llm-version '%s'", cli_params.llm_version.c_str());
+        return 1;
+    }
+
+    ModelLoader model_loader;
+    if (!model_loader.init_from_file_and_convert_name(ctx_params.llm_path, "text_encoders.llm.")) {
+        LOG_ERROR("init model loader from file failed: '%s'", ctx_params.llm_path.c_str());
+        return 1;
+    }
+
+    auto& tensor_storage_map = model_loader.get_tensor_storage_map();
+
+    ggml_backend_t backend = init_llm_embed_backend();
+    if (!backend) {
+        LOG_ERROR("failed to init backend");
+        return 1;
+    }
+
+    int n_threads = ctx_params.n_threads > 0 ? ctx_params.n_threads : std::max(1u, std::thread::hardware_concurrency());
+
+    std::shared_ptr<LLMEmbedder> llm = std::make_shared<LLMEmbedder>(backend,
+                                                                     ctx_params.offload_params_to_cpu,
+                                                                     tensor_storage_map,
+                                                                     version,
+                                                                     "text_encoders.llm",
+                                                                     false);
+
+    llm->alloc_params_buffer();
+
+    std::map<std::string, ggml_tensor*> tensors;
+    llm->get_param_tensors(tensors);
+    if (!model_loader.load_tensors(tensors, {}, n_threads, ctx_params.enable_mmap)) {
+        LOG_ERROR("load tensors from model loader failed");
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    std::string prompt = build_llm_prompt_for_version(version, gen_params.prompt);
+    std::vector<int> all_tokens = llm->tokenizer->tokenize(prompt, nullptr);
+    std::vector<int> generated_tokens;
+    generated_tokens.reserve(cli_params.llm_max_new_tokens);
+
+    LOG_INFO("llm generate-only initial tokens: %zu", all_tokens.size());
+
+    for (int step = 0; step < cli_params.llm_max_new_tokens; ++step) {
+        ggml_init_params params;
+        params.mem_size   = static_cast<size_t>(512) * 1024 * 1024;
+        params.mem_buffer = nullptr;
+        params.no_alloc   = false;
+        ggml_context* work_ctx = ggml_init(params);
+        if (!work_ctx) {
+            LOG_ERROR("ggml_init failed at llm generation step %d", step + 1);
+            ggml_backend_free(backend);
+            return 1;
+        }
+
+        ggml_tensor* input_ids = vector_to_ggml_tensor_i32(work_ctx, all_tokens);
+        ggml_tensor* logits    = nullptr;
+
+        const int64_t t0 = ggml_time_ms();
+        const bool ok    = llm->llm->compute_last_logits(n_threads,
+                                                      input_ids,
+                                                      nullptr,
+                                                      {},
+                                                      &logits,
+                                                      work_ctx);
+        const int64_t t1 = ggml_time_ms();
+        if (!ok || logits == nullptr || logits->data == nullptr) {
+            LOG_ERROR("llm generate-only failed at step %d", step + 1);
+            ggml_free(work_ctx);
+            ggml_backend_free(backend);
+            return 1;
+        }
+
+        const float* logits_data = static_cast<const float*>(logits->data);
+        const int64_t vocab_size = logits->ne[0] * logits->ne[1];
+        if (vocab_size <= 0) {
+            LOG_ERROR("invalid logits shape at step %d", step + 1);
+            ggml_free(work_ctx);
+            ggml_backend_free(backend);
+            return 1;
+        }
+
+        int best_id      = 0;
+        float best_logit = logits_data[0];
+        for (int64_t i = 1; i < vocab_size; ++i) {
+            if (logits_data[i] > best_logit) {
+                best_logit = logits_data[i];
+                best_id    = static_cast<int>(i);
+            }
+        }
+
+        generated_tokens.push_back(best_id);
+        all_tokens.push_back(best_id);
+
+        const std::string token_text = llm->tokenizer->decode(std::vector<int>{best_id}, false);
+        LOG_INFO("llm step %d: token=%d logit=%.6f time=%" PRId64 "ms piece='%s'",
+                 step + 1,
+                 best_id,
+                 best_logit,
+                 (t1 - t0),
+                 escape_for_log(token_text).c_str());
+
+        ggml_free(work_ctx);
+
+        if (best_id == llm->tokenizer->eos_token_id()) {
+            LOG_INFO("llm generation hit eos at step %d", step + 1);
+            break;
+        }
+    }
+
+    const std::string generated_text = llm->tokenizer->decode(generated_tokens, false);
+    LOG_INFO("llm generated text: %s", generated_text.c_str());
+
+    if (!cli_params.llm_generate_dump.empty()) {
+        std::ofstream out(cli_params.llm_generate_dump);
+        if (!out.is_open()) {
+            LOG_WARN("failed to open llm generate dump file '%s'", cli_params.llm_generate_dump.c_str());
+        } else {
+            out << generated_text << "\n";
+            out << "token_ids:";
+            for (int id : generated_tokens) {
+                out << " " << id;
+            }
+            out << "\n";
+            out.flush();
+            LOG_INFO("saved llm generated text to '%s'", cli_params.llm_generate_dump.c_str());
+        }
+    }
+
+    ggml_backend_free(backend);
+    return 0;
+}
+
+static bool parse_q4_weight_name(const std::string& weight, std::string* weight_out) {
+    if (weight_out == nullptr) {
+        return false;
+    }
+    std::string lower = weight;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+    auto strip_prefix = [](std::string& s, const std::string& prefix) {
+        if (s.rfind(prefix, 0) == 0) {
+            s = s.substr(prefix.size());
+        }
+    };
+    strip_prefix(lower, "text_encoders.llm.layers.0.");
+    strip_prefix(lower, "layers.0.");
+    strip_prefix(lower, "llm.layers.0.");
+
+    if (lower == "q_proj" || lower == "qproj" || lower == "self_attn.q_proj" || lower == "self_attn.q_proj.weight") {
+        *weight_out = "self_attn.q_proj.weight";
+        return true;
+    }
+    if (lower == "k_proj" || lower == "kproj" || lower == "self_attn.k_proj" || lower == "self_attn.k_proj.weight") {
+        *weight_out = "self_attn.k_proj.weight";
+        return true;
+    }
+    if (lower == "v_proj" || lower == "vproj" || lower == "self_attn.v_proj" || lower == "self_attn.v_proj.weight") {
+        *weight_out = "self_attn.v_proj.weight";
+        return true;
+    }
+    if (lower == "gate_proj" || lower == "mlp_gate" || lower == "mlp.gate_proj" || lower == "mlp.gate_proj.weight") {
+        *weight_out = "mlp.gate_proj.weight";
+        return true;
+    }
+    if (lower == "up_proj" || lower == "mlp_up" || lower == "mlp.up_proj" || lower == "mlp.up_proj.weight") {
+        *weight_out = "mlp.up_proj.weight";
+        return true;
+    }
+    if (lower == "down_proj" || lower == "mlp_down" || lower == "mlp.down_proj" || lower == "mlp.down_proj.weight") {
+        *weight_out = "mlp.down_proj.weight";
+        return true;
+    }
+    if (lower == "embed_tokens" || lower == "embed_tokens.weight" || lower == "lm_head" || lower == "lm_head.weight") {
+        *weight_out = "embed_tokens.weight";
+        return true;
+    }
+    return false;
+}
+
+static bool parse_rmsnorm_weight_name(const std::string& weight, std::string* weight_out) {
+    if (weight_out == nullptr) {
+        return false;
+    }
+    std::string lower = weight;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    if (lower == "q_norm" || lower == "qnorm") {
+        *weight_out = "q_norm";
+        return true;
+    }
+    if (lower == "k_norm" || lower == "knorm") {
+        *weight_out = "k_norm";
+        return true;
+    }
+    if (lower == "input_layernorm" || lower == "input_layer_norm" || lower == "ln1") {
+        *weight_out = "input_layernorm";
+        return true;
+    }
+    if (lower == "post_attention_layernorm" || lower == "post_attention_layer_norm" || lower == "ln2") {
+        *weight_out = "post_attention_layernorm";
+        return true;
+    }
+    return false;
+}
+
+static int run_q4_matmul_bench(const SDCliParams& cli_params,
+                               const SDContextParams& ctx_params) {
+    if (ctx_params.llm_path.empty()) {
+        LOG_ERROR("q4 matmul bench requires --llm path");
+        return 1;
+    }
+    if (cli_params.q4_n_token <= 0) {
+        LOG_ERROR("q4 matmul bench requires --q4-n-token > 0");
+        return 1;
+    }
+    if (cli_params.q4_layer < 0) {
+        LOG_ERROR("q4 matmul bench requires --q4-layer >= 0");
+        return 1;
+    }
+    std::string weight_key;
+    if (!parse_q4_weight_name(cli_params.q4_weight, &weight_key)) {
+        LOG_ERROR("unknown --q4-weight '%s'", cli_params.q4_weight.c_str());
+        return 1;
+    }
+
+    ModelLoader model_loader;
+    if (!model_loader.init_from_file_and_convert_name(ctx_params.llm_path, "text_encoders.llm.")) {
+        LOG_ERROR("init model loader from file failed: '%s'", ctx_params.llm_path.c_str());
+        return 1;
+    }
+
+    auto& tensor_storage_map = model_loader.get_tensor_storage_map();
+    std::string weight_name;
+    auto find_name = [&](const std::string& candidate) -> bool {
+        auto iter = tensor_storage_map.find(candidate);
+        if (iter == tensor_storage_map.end()) {
+            return false;
+        }
+        weight_name = candidate;
+        return true;
+    };
+    const std::string layer_str = std::to_string(cli_params.q4_layer);
+    if (weight_key == "embed_tokens.weight") {
+        if (!find_name("text_encoders.llm.embed_tokens.weight") &&
+            !find_name("text_encoders.llm.model.embed_tokens.weight") &&
+            !find_name("model.embed_tokens.weight") &&
+            !find_name("embed_tokens.weight")) {
+            for (auto iter = tensor_storage_map.begin(); iter != tensor_storage_map.end(); ++iter) {
+                const std::string& name = iter->first;
+                if (name.size() >= std::strlen("embed_tokens.weight") &&
+                    name.compare(name.size() - std::strlen("embed_tokens.weight"),
+                                 std::strlen("embed_tokens.weight"),
+                                 "embed_tokens.weight") == 0) {
+                    weight_name = name;
+                    break;
+                }
+            }
+        }
+    } else if (!find_name("text_encoders.llm.layers." + layer_str + "." + weight_key) &&
+               !find_name("text_encoders.llm.model.layers." + layer_str + "." + weight_key) &&
+               !find_name("model.layers." + layer_str + "." + weight_key) &&
+               !find_name("layers." + layer_str + "." + weight_key)) {
+        const std::string suffix0 = ".layers." + layer_str + "." + weight_key;
+        const std::string suffix1 = ".model.layers." + layer_str + "." + weight_key;
+        for (auto iter = tensor_storage_map.begin(); iter != tensor_storage_map.end(); ++iter) {
+            const std::string& name = iter->first;
+            if ((name.size() >= suffix0.size() && name.compare(name.size() - suffix0.size(), suffix0.size(), suffix0) == 0) ||
+                (name.size() >= suffix1.size() && name.compare(name.size() - suffix1.size(), suffix1.size(), suffix1) == 0)) {
+                weight_name = name;
+                break;
+            }
+        }
+    }
+    auto it = weight_name.empty() ? tensor_storage_map.end() : tensor_storage_map.find(weight_name);
+    if (it == tensor_storage_map.end()) {
+        LOG_ERROR("weight '%s' not found in model", weight_name.c_str());
+        return 1;
+    }
+    const TensorStorage& ts = it->second;
+    const ggml_type wtype   = ts.expected_type != GGML_TYPE_COUNT ? ts.expected_type : ts.type;
+    if (wtype != GGML_TYPE_Q4_0) {
+        LOG_ERROR("weight '%s' type is %s, expected q4_0", weight_name.c_str(), ggml_type_name(wtype));
+        return 1;
+    }
+
+    ggml_backend_t backend = init_llm_embed_backend();
+    if (!backend) {
+        LOG_ERROR("failed to init backend");
+        return 1;
+    }
+
+    ggml_init_params wparams;
+    wparams.mem_size   = static_cast<size_t>(256) * 1024 * 1024;
+    wparams.mem_buffer = nullptr;
+    wparams.no_alloc   = true;
+    ggml_context* wctx = ggml_init(wparams);
+    if (!wctx) {
+        LOG_ERROR("ggml_init failed for weights");
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    ggml_tensor* w = ggml_new_tensor_2d(wctx, wtype, ts.ne[0], ts.ne[1]);
+    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(wctx, backend);
+    if (!wbuf) {
+        LOG_ERROR("alloc weight buffer failed");
+        ggml_free(wctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    std::map<std::string, ggml_tensor*> tmap;
+    tmap[weight_name] = w;
+    if (!model_loader.load_tensors(tmap)) {
+        LOG_ERROR("load tensors from model loader failed");
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(wctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    ggml_init_params cparams;
+    cparams.mem_size   = static_cast<size_t>(256) * 1024 * 1024;
+    cparams.mem_buffer = nullptr;
+    cparams.no_alloc   = true;
+    ggml_context* cctx = ggml_init(cparams);
+    if (!cctx) {
+        LOG_ERROR("ggml_init failed for compute");
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(wctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    const int64_t k = ts.ne[0];
+    ggml_tensor* x  = nullptr;
+    std::vector<float> x_host;
+    if (!cli_params.q4_input.empty()) {
+        std::ifstream fin(cli_params.q4_input, std::ios::binary);
+        if (!fin.is_open()) {
+            LOG_ERROR("failed to open q4 input '%s'", cli_params.q4_input.c_str());
+            ggml_backend_buffer_free(wbuf);
+            ggml_free(wctx);
+            ggml_backend_free(backend);
+            return 1;
+        }
+        int32_t n_dims = 0;
+        int32_t name_len = 0;
+        int32_t ttype = 0;
+        fin.read(reinterpret_cast<char*>(&n_dims), sizeof(n_dims));
+        fin.read(reinterpret_cast<char*>(&name_len), sizeof(name_len));
+        fin.read(reinterpret_cast<char*>(&ttype), sizeof(ttype));
+        if (!fin || n_dims <= 0 || n_dims > 4) {
+            LOG_ERROR("invalid q4 input header");
+            ggml_backend_buffer_free(wbuf);
+            ggml_free(wctx);
+            ggml_backend_free(backend);
+            return 1;
+        }
+        std::vector<int32_t> ne(static_cast<size_t>(n_dims));
+        fin.read(reinterpret_cast<char*>(ne.data()), sizeof(int32_t) * ne.size());
+        if (name_len > 0) {
+            fin.ignore(name_len);
+        }
+        if (ttype != GGML_TYPE_F32) {
+            LOG_ERROR("q4 input type is %s, expected f32", ggml_type_name((ggml_type)ttype));
+            ggml_backend_buffer_free(wbuf);
+            ggml_free(wctx);
+            ggml_backend_free(backend);
+            return 1;
+        }
+        if (ne[0] != k) {
+            LOG_ERROR("q4 input ne0=%d does not match K=%lld", ne[0], (long long)k);
+            ggml_backend_buffer_free(wbuf);
+            ggml_free(wctx);
+            ggml_backend_free(backend);
+            return 1;
+        }
+        int64_t n = ne.size() > 1 ? ne[1] : 1;
+        x = ggml_new_tensor_2d(cctx, GGML_TYPE_F32, k, n);
+        x_host.resize(ggml_nelements(x));
+        fin.read(reinterpret_cast<char*>(x_host.data()), sizeof(float) * x_host.size());
+        if (!fin) {
+            LOG_ERROR("failed to read q4 input payload");
+            ggml_backend_buffer_free(wbuf);
+            ggml_free(wctx);
+            ggml_backend_free(backend);
+            return 1;
+        }
+    } else {
+        const int64_t n = cli_params.q4_n_token;
+        x  = ggml_new_tensor_3d(cctx, GGML_TYPE_F32, k, n, 1);
+        x_host.resize(ggml_nelements(x));
+        for (size_t i = 0; i < x_host.size(); ++i) {
+            uint32_t v = static_cast<uint32_t>(i * 1664525u + 1013904223u);
+            float f    = (float)(v % 1024) / 512.0f - 1.0f;
+            x_host[i]  = f;
+        }
+    }
+
+    ggml_tensor* y = ggml_mul_mat(cctx, w, x);
+    ggml_cgraph* gf = ggml_new_graph(cctx);
+    ggml_build_forward_expand(gf, y);
+
+    ggml_backend_buffer_t cbuf = ggml_backend_alloc_ctx_tensors(cctx, backend);
+    if (!cbuf) {
+        LOG_ERROR("alloc compute buffer failed");
+        ggml_free(cctx);
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(wctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    ggml_backend_tensor_set(x, x_host.data(), 0, ggml_nbytes(x));
+    ggml_status status = ggml_backend_graph_compute(backend, gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        LOG_ERROR("q4 matmul compute failed: %s", ggml_status_to_string(status));
+        ggml_backend_buffer_free(cbuf);
+        ggml_free(cctx);
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(wctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    if (!LLM::LLMRunner::dump_tensor_to_file(cli_params.q4_dump.c_str(), "q4_matmul", y)) {
+        LOG_WARN("failed to dump q4 matmul output to '%s'", cli_params.q4_dump.c_str());
+    } else {
+        LOG_INFO("saved q4 matmul output to '%s'", cli_params.q4_dump.c_str());
+    }
+
+    ggml_backend_buffer_free(cbuf);
+    ggml_free(cctx);
+    ggml_backend_buffer_free(wbuf);
+    ggml_free(wctx);
+    ggml_backend_free(backend);
+    return 0;
+}
+
+static int run_rmsnorm_bench(const SDCliParams& cli_params,
+                             const SDContextParams& ctx_params) {
+    if (ctx_params.llm_path.empty()) {
+        LOG_ERROR("rmsnorm bench requires --llm path");
+        return 1;
+    }
+    if (cli_params.rmsnorm_input.empty()) {
+        LOG_ERROR("rmsnorm bench requires --rmsnorm-input");
+        return 1;
+    }
+
+    std::string weight_key;
+    if (!parse_rmsnorm_weight_name(cli_params.rmsnorm_weight, &weight_key)) {
+        LOG_ERROR("unknown --rmsnorm-weight '%s'", cli_params.rmsnorm_weight.c_str());
+        return 1;
+    }
+
+    ModelLoader model_loader;
+    if (!model_loader.init_from_file_and_convert_name(ctx_params.llm_path, "text_encoders.llm.")) {
+        LOG_ERROR("init model loader from file failed: '%s'", ctx_params.llm_path.c_str());
+        return 1;
+    }
+
+    auto& tensor_storage_map = model_loader.get_tensor_storage_map();
+    std::string weight_name;
+    if (weight_key == "q_norm" || weight_key == "k_norm") {
+        weight_name = "text_encoders.llm.layers.0.self_attn." + weight_key + ".weight";
+    } else {
+        weight_name = "text_encoders.llm.layers.0." + weight_key + ".weight";
+    }
+    auto it = tensor_storage_map.find(weight_name);
+    if (it == tensor_storage_map.end()) {
+        std::string suffix;
+        if (weight_key == "q_norm" || weight_key == "k_norm") {
+            suffix = ".layers.0.self_attn." + weight_key + ".weight";
+        } else {
+            suffix = ".layers.0." + weight_key + ".weight";
+        }
+        for (auto iter = tensor_storage_map.begin(); iter != tensor_storage_map.end(); ++iter) {
+            const std::string& name = iter->first;
+            if (name.size() >= suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                weight_name = name;
+                it          = iter;
+                break;
+            }
+        }
+    }
+    if (it == tensor_storage_map.end()) {
+        LOG_ERROR("weight '%s' not found in model", weight_name.c_str());
+        return 1;
+    }
+    const TensorStorage& ts = it->second;
+
+    ggml_backend_t backend = init_llm_embed_backend();
+    if (!backend) {
+        LOG_ERROR("failed to init backend");
+        return 1;
+    }
+
+    ggml_init_params wparams;
+    wparams.mem_size   = static_cast<size_t>(64) * 1024 * 1024;
+    wparams.mem_buffer = nullptr;
+    wparams.no_alloc   = true;
+    ggml_context* wctx = ggml_init(wparams);
+    if (!wctx) {
+        LOG_ERROR("ggml_init failed for weights");
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    ggml_tensor* w = ggml_new_tensor_1d(wctx, GGML_TYPE_F32, ts.ne[0]);
+    ggml_backend_buffer_t wbuf = ggml_backend_alloc_ctx_tensors(wctx, backend);
+    if (!wbuf) {
+        LOG_ERROR("alloc weight buffer failed");
+        ggml_free(wctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    std::map<std::string, ggml_tensor*> tmap;
+    tmap[weight_name] = w;
+    if (!model_loader.load_tensors(tmap)) {
+        LOG_ERROR("load tensors from model loader failed");
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(wctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    // load input tensor
+    std::ifstream fin(cli_params.rmsnorm_input, std::ios::binary);
+    if (!fin.is_open()) {
+        LOG_ERROR("failed to open rmsnorm input '%s'", cli_params.rmsnorm_input.c_str());
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(wctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+    int32_t n_dims = 0;
+    int32_t name_len = 0;
+    int32_t ttype = 0;
+    fin.read(reinterpret_cast<char*>(&n_dims), sizeof(n_dims));
+    fin.read(reinterpret_cast<char*>(&name_len), sizeof(name_len));
+    fin.read(reinterpret_cast<char*>(&ttype), sizeof(ttype));
+    if (!fin || n_dims <= 0 || n_dims > 4) {
+        LOG_ERROR("invalid rmsnorm input header");
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(wctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+    std::vector<int32_t> ne(static_cast<size_t>(n_dims));
+    fin.read(reinterpret_cast<char*>(ne.data()), sizeof(int32_t) * ne.size());
+    if (name_len > 0) {
+        fin.ignore(name_len);
+    }
+    if (ttype != GGML_TYPE_F32) {
+        LOG_ERROR("rmsnorm input type is %s, expected f32", ggml_type_name((ggml_type)ttype));
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(wctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+    if (ne[0] != ts.ne[0]) {
+        LOG_ERROR("rmsnorm input ne0=%d does not match weight=%lld", ne[0], (long long)ts.ne[0]);
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(wctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    ggml_init_params cparams;
+    cparams.mem_size   = static_cast<size_t>(256) * 1024 * 1024;
+    cparams.mem_buffer = nullptr;
+    cparams.no_alloc   = true;
+    ggml_context* cctx = ggml_init(cparams);
+    if (!cctx) {
+        LOG_ERROR("ggml_init failed for compute");
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(wctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    std::vector<int64_t> ne64(ne.begin(), ne.end());
+    ggml_tensor* x = ggml_new_tensor(cctx, GGML_TYPE_F32, n_dims, ne64.data());
+    std::vector<float> x_host(ggml_nelements(x));
+    fin.read(reinterpret_cast<char*>(x_host.data()), sizeof(float) * x_host.size());
+    if (!fin) {
+        LOG_ERROR("failed to read rmsnorm input payload");
+        ggml_free(cctx);
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(wctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    ggml_tensor* y = ggml_rms_norm(cctx, x, cli_params.rmsnorm_eps);
+    y = ggml_mul(cctx, y, w);
+
+    ggml_cgraph* gf = ggml_new_graph(cctx);
+    ggml_build_forward_expand(gf, y);
+
+    ggml_backend_buffer_t cbuf = ggml_backend_alloc_ctx_tensors(cctx, backend);
+    if (!cbuf) {
+        LOG_ERROR("alloc compute buffer failed");
+        ggml_free(cctx);
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(wctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    ggml_backend_tensor_set(x, x_host.data(), 0, ggml_nbytes(x));
+    ggml_status status = ggml_backend_graph_compute(backend, gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        LOG_ERROR("rmsnorm compute failed: %s", ggml_status_to_string(status));
+        ggml_backend_buffer_free(cbuf);
+        ggml_free(cctx);
+        ggml_backend_buffer_free(wbuf);
+        ggml_free(wctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    if (!LLM::LLMRunner::dump_tensor_to_file(cli_params.rmsnorm_dump.c_str(), "rmsnorm", y)) {
+        LOG_WARN("failed to dump rmsnorm output to '%s'", cli_params.rmsnorm_dump.c_str());
+    } else {
+        LOG_INFO("saved rmsnorm output to '%s'", cli_params.rmsnorm_dump.c_str());
+    }
+
+    ggml_backend_buffer_free(cbuf);
+    ggml_free(cctx);
+    ggml_backend_buffer_free(wbuf);
+    ggml_free(wctx);
+    ggml_backend_free(backend);
+    return 0;
+}
+
+struct DumpTensorData {
+    int32_t n_dims = 0;
+    std::vector<int64_t> ne;
+    std::vector<float> data;
+};
+
+static bool load_f32_tensor_dump(const std::string& path, DumpTensorData* out) {
+    if (out == nullptr) {
+        return false;
+    }
+    std::ifstream fin(path, std::ios::binary);
+    if (!fin.is_open()) {
+        return false;
+    }
+    int32_t n_dims = 0;
+    int32_t name_len = 0;
+    int32_t ttype = 0;
+    fin.read(reinterpret_cast<char*>(&n_dims), sizeof(n_dims));
+    fin.read(reinterpret_cast<char*>(&name_len), sizeof(name_len));
+    fin.read(reinterpret_cast<char*>(&ttype), sizeof(ttype));
+    if (!fin || n_dims <= 0 || n_dims > 4) {
+        return false;
+    }
+    std::vector<int32_t> ne_i32(static_cast<size_t>(n_dims));
+    fin.read(reinterpret_cast<char*>(ne_i32.data()), sizeof(int32_t) * ne_i32.size());
+    if (name_len > 0) {
+        fin.ignore(name_len);
+    }
+    if (ttype != GGML_TYPE_F32) {
+        return false;
+    }
+    out->n_dims = n_dims;
+    out->ne.assign(ne_i32.begin(), ne_i32.end());
+    size_t n_elem = 1;
+    for (int32_t v : ne_i32) {
+        n_elem *= static_cast<size_t>(v);
+    }
+    out->data.resize(n_elem);
+    fin.read(reinterpret_cast<char*>(out->data.data()), sizeof(float) * out->data.size());
+    if (!fin) {
+        return false;
+    }
+    return true;
+}
+
+static int run_attn_bench(const SDCliParams& cli_params,
+                          const SDContextParams& ctx_params) {
+    if (ctx_params.llm_path.empty()) {
+        LOG_ERROR("attention bench requires --llm path");
+        return 1;
+    }
+    if (cli_params.attn_q_input.empty() || cli_params.attn_k_input.empty() || cli_params.attn_v_input.empty()) {
+        LOG_ERROR("attention bench requires --attn-q/--attn-k/--attn-v");
+        return 1;
+    }
+    if (cli_params.attn_n_head <= 0) {
+        LOG_ERROR("attention bench requires --attn-n-head > 0");
+        return 1;
+    }
+
+    DumpTensorData qd, kd, vd;
+    if (!load_f32_tensor_dump(cli_params.attn_q_input, &qd)) {
+        LOG_ERROR("failed to load attn q dump '%s'", cli_params.attn_q_input.c_str());
+        return 1;
+    }
+    if (!load_f32_tensor_dump(cli_params.attn_k_input, &kd)) {
+        LOG_ERROR("failed to load attn k dump '%s'", cli_params.attn_k_input.c_str());
+        return 1;
+    }
+    if (!load_f32_tensor_dump(cli_params.attn_v_input, &vd)) {
+        LOG_ERROR("failed to load attn v dump '%s'", cli_params.attn_v_input.c_str());
+        return 1;
+    }
+
+    ggml_backend_t backend = init_llm_embed_backend();
+    if (!backend) {
+        LOG_ERROR("failed to init backend");
+        return 1;
+    }
+
+    ggml_init_params cparams;
+    cparams.mem_size   = static_cast<size_t>(512) * 1024 * 1024;
+    cparams.mem_buffer = nullptr;
+    cparams.no_alloc   = true;
+    ggml_context* cctx = ggml_init(cparams);
+    if (!cctx) {
+        LOG_ERROR("ggml_init failed for compute");
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    ggml_tensor* q = ggml_new_tensor(cctx, GGML_TYPE_F32, qd.n_dims, qd.ne.data());
+    ggml_tensor* k = ggml_new_tensor(cctx, GGML_TYPE_F32, kd.n_dims, kd.ne.data());
+    ggml_tensor* v = ggml_new_tensor(cctx, GGML_TYPE_F32, vd.n_dims, vd.ne.data());
+
+    ggml_tensor* y = ggml_ext_attention_ext(cctx, backend, q, k, v, cli_params.attn_n_head, nullptr, true, false);
+
+    ggml_cgraph* gf = ggml_new_graph(cctx);
+    ggml_build_forward_expand(gf, y);
+
+    ggml_backend_buffer_t cbuf = ggml_backend_alloc_ctx_tensors(cctx, backend);
+    if (!cbuf) {
+        LOG_ERROR("alloc compute buffer failed");
+        ggml_free(cctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    ggml_backend_tensor_set(q, qd.data.data(), 0, ggml_nbytes(q));
+    ggml_backend_tensor_set(k, kd.data.data(), 0, ggml_nbytes(k));
+    ggml_backend_tensor_set(v, vd.data.data(), 0, ggml_nbytes(v));
+
+    ggml_status status = ggml_backend_graph_compute(backend, gf);
+    if (status != GGML_STATUS_SUCCESS) {
+        LOG_ERROR("attention compute failed: %s", ggml_status_to_string(status));
+        ggml_backend_buffer_free(cbuf);
+        ggml_free(cctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    if (!LLM::LLMRunner::dump_tensor_to_file(cli_params.attn_dump.c_str(), "attn", y)) {
+        LOG_WARN("failed to dump attention output to '%s'", cli_params.attn_dump.c_str());
+    } else {
+        LOG_INFO("saved attention output to '%s'", cli_params.attn_dump.c_str());
+    }
+
+    ggml_backend_buffer_free(cbuf);
+    ggml_free(cctx);
+    ggml_backend_free(backend);
+    return 0;
+}
+
+static int run_flux_fwd_bench(const SDCliParams& cli_params,
+                              const SDContextParams& ctx_params,
+                              const SDGenerationParams& gen_params) {
+    const std::string diffusion_model_path =
+        !ctx_params.diffusion_model_path.empty() ? ctx_params.diffusion_model_path : ctx_params.model_path;
+    if (diffusion_model_path.empty()) {
+        LOG_ERROR("flux forward bench requires --diffusion-model (or --model)");
+        return 1;
+    }
+    if (gen_params.width % 16 != 0 || gen_params.height % 16 != 0) {
+        LOG_ERROR("flux forward bench requires width/height divisible by 16, got %dx%d", gen_params.width, gen_params.height);
+        return 1;
+    }
+
+    ModelLoader model_loader;
+    if (!model_loader.init_from_file_and_convert_name(diffusion_model_path, "model.diffusion_model.")) {
+        LOG_ERROR("init model loader from file failed: '%s'", diffusion_model_path.c_str());
+        return 1;
+    }
+
+    const SDVersion model_version = model_loader.get_sd_version();
+    if (!sd_version_is_flux(model_version) && !sd_version_is_flux2(model_version)) {
+        LOG_ERROR("flux forward bench only supports Flux/Flux2 diffusion models, got version=%d", model_version);
+        return 1;
+    }
+
+    ggml_backend_t backend = init_llm_embed_backend();
+    if (!backend) {
+        LOG_ERROR("failed to init backend");
+        return 1;
+    }
+
+    const bool circular_x = ctx_params.circular || ctx_params.circular_x;
+    const bool circular_y = ctx_params.circular || ctx_params.circular_y;
+
+    auto flux = std::make_shared<Flux::FluxRunner>(backend,
+                                                   ctx_params.offload_params_to_cpu,
+                                                   model_loader.get_tensor_storage_map(),
+                                                   "model.diffusion_model",
+                                                   model_version,
+                                                   false);
+    flux->set_flash_attention_enabled(ctx_params.flash_attn || ctx_params.diffusion_flash_attn);
+    flux->set_conv2d_direct_enabled(ctx_params.diffusion_conv_direct);
+    flux->set_circular_axes(circular_x, circular_y);
+
+    if (!flux->alloc_params_buffer()) {
+        LOG_ERROR("alloc flux params buffer failed");
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    std::map<std::string, ggml_tensor*> tensors;
+    flux->get_param_tensors(tensors, "model.diffusion_model");
+    if (!model_loader.load_tensors(tensors)) {
+        LOG_ERROR("load diffusion tensors failed");
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    ggml_init_params work_params;
+    work_params.mem_size   = static_cast<size_t>(64) * 1024 * 1024;
+    work_params.mem_buffer = nullptr;
+    work_params.no_alloc   = false;
+    ggml_context* work_ctx = ggml_init(work_params);
+    if (!work_ctx) {
+        LOG_ERROR("ggml_init failed for flux bench work context");
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    const int64_t latent_w  = gen_params.width / 16;
+    const int64_t latent_h  = gen_params.height / 16;
+    const int64_t channels  = flux->flux_params.in_channels;
+    const int64_t ctx_len   = cli_params.flux_bench_ctx;
+    const int64_t ctx_width = flux->flux_params.context_in_dim;
+    if (channels <= 0 || ctx_width <= 0) {
+        LOG_ERROR("invalid flux bench shape, channels=%lld, context_width=%lld", (long long)channels, (long long)ctx_width);
+        ggml_free(work_ctx);
+        ggml_backend_free(backend);
+        return 1;
+    }
+
+    ggml_tensor* x         = ggml_new_tensor_4d(work_ctx, GGML_TYPE_F32, latent_w, latent_h, channels, 1);
+    ggml_tensor* timesteps = ggml_new_tensor_1d(work_ctx, GGML_TYPE_F32, 1);
+    ggml_tensor* context   = ggml_new_tensor_3d(work_ctx, GGML_TYPE_F32, ctx_width, ctx_len, 1);
+    ggml_tensor* guidance  = ggml_new_tensor_1d(work_ctx, GGML_TYPE_F32, 1);
+    ggml_tensor* y         = nullptr;
+    if (flux->flux_params.vec_in_dim > 0) {
+        y = ggml_new_tensor_2d(work_ctx, GGML_TYPE_F32, flux->flux_params.vec_in_dim, 1);
+    }
+
+    auto fill_tensor = [](ggml_tensor* t, uint32_t seed) {
+        std::vector<float> host(ggml_nelements(t));
+        uint32_t state = seed;
+        for (size_t i = 0; i < host.size(); ++i) {
+            state       = state * 1664525u + 1013904223u;
+            host[i]     = (float)(state & 0xFFFF) / 32768.0f - 1.0f;
+        }
+        memcpy(t->data, host.data(), host.size() * sizeof(float));
+    };
+    fill_tensor(x, 0x1234u);
+    fill_tensor(context, 0x5678u);
+    if (y != nullptr) {
+        memset(y->data, 0, ggml_nbytes(y));
+    }
+    ggml_set_f32(timesteps, 1000.0f);
+    ggml_set_f32(guidance, 3.5f);
+
+    const int n_threads = ctx_params.n_threads > 0 ? ctx_params.n_threads : sd_get_num_physical_cores();
+    for (int i = 0; i < cli_params.flux_bench_warmup; ++i) {
+        if (!flux->compute(n_threads, x, timesteps, context, nullptr, y, guidance, {}, false, nullptr, nullptr, {})) {
+            LOG_ERROR("flux warmup run %d failed", i);
+            ggml_free(work_ctx);
+            ggml_backend_free(backend);
+            return 1;
+        }
+    }
+
+    int64_t t_start = ggml_time_ms();
+    for (int i = 0; i < cli_params.flux_bench_runs; ++i) {
+        if (!flux->compute(n_threads, x, timesteps, context, nullptr, y, guidance, {}, false, nullptr, nullptr, {})) {
+            LOG_ERROR("flux timed run %d failed", i);
+            ggml_free(work_ctx);
+            ggml_backend_free(backend);
+            return 1;
+        }
+    }
+    int64_t t_end = ggml_time_ms();
+    const double avg_ms = static_cast<double>(t_end - t_start) / static_cast<double>(cli_params.flux_bench_runs);
+
+    LOG_INFO("flux step: avg %.3f ms (runs=%d warmup=%d) latent=%lldx%lld ctx=%lld flash_attn=%s",
+             avg_ms,
+             cli_params.flux_bench_runs,
+             cli_params.flux_bench_warmup,
+             (long long)latent_w,
+             (long long)latent_h,
+             (long long)ctx_len,
+             (ctx_params.flash_attn || ctx_params.diffusion_flash_attn) ? "on" : "off");
+
+    ggml_free(work_ctx);
+    ggml_backend_free(backend);
+    return 0;
+}
 
 void print_usage(int argc, const char* argv[], const std::vector<ArgOptions>& options_list) {
     std::cout << version_string() << "\n";
@@ -218,8 +1689,8 @@ void parse_args(int argc, const char** argv, SDCliParams& cli_params, SDContextP
     }
 
     if (!cli_params.process_and_check() ||
-        !ctx_params.process_and_check(cli_params.mode) ||
-        !gen_params.process_and_check(cli_params.mode, ctx_params.lora_model_dir)) {
+        (!cli_params.llm_embed_only && !cli_params.llm_forward_only && !cli_params.llm_generate_only && !cli_params.q4_matmul_bench && !cli_params.rmsnorm_bench && !cli_params.attn_bench && !cli_params.flux_fwd_bench && !ctx_params.process_and_check(cli_params.mode)) ||
+        (!cli_params.llm_embed_only && !cli_params.llm_forward_only && !cli_params.llm_generate_only && !cli_params.q4_matmul_bench && !cli_params.rmsnorm_bench && !cli_params.attn_bench && !cli_params.flux_fwd_bench && !gen_params.process_and_check(cli_params.mode, ctx_params.lora_model_dir))) {
         print_usage(argc, argv, options_vec);
         exit(1);
     }
@@ -503,6 +1974,28 @@ int main(int argc, const char* argv[]) {
     LOG_DEBUG("%s", ctx_params.to_string().c_str());
     LOG_DEBUG("%s", gen_params.to_string().c_str());
 
+    if (cli_params.llm_embed_only) {
+        return run_llm_embed_only(cli_params, ctx_params);
+    }
+    if (cli_params.llm_forward_only) {
+        return run_llm_forward_only(cli_params, ctx_params, gen_params);
+    }
+    if (cli_params.llm_generate_only) {
+        return run_llm_generate_only(cli_params, ctx_params, gen_params);
+    }
+    if (cli_params.q4_matmul_bench) {
+        return run_q4_matmul_bench(cli_params, ctx_params);
+    }
+    if (cli_params.rmsnorm_bench) {
+        return run_rmsnorm_bench(cli_params, ctx_params);
+    }
+    if (cli_params.attn_bench) {
+        return run_attn_bench(cli_params, ctx_params);
+    }
+    if (cli_params.flux_fwd_bench) {
+        return run_flux_fwd_bench(cli_params, ctx_params, gen_params);
+    }
+
     if (cli_params.mode == CONVERT) {
         bool success = convert(ctx_params.model_path.c_str(),
                                ctx_params.vae_path.c_str(),
@@ -670,6 +2163,9 @@ int main(int argc, const char* argv[]) {
     if (cli_params.mode == VID_GEN) {
         vae_decode_only = false;
     }
+    if (!cli_params.load_latent_path.empty()) {
+        vae_decode_only = true;
+    }
 
     sd_ctx_params_t sd_ctx_params = ctx_params.to_sd_ctx_params_t(vae_decode_only, true, cli_params.taesd_preview);
 
@@ -696,85 +2192,97 @@ int main(int argc, const char* argv[]) {
             return 1;
         }
 
-        if (gen_params.sample_params.sample_method == SAMPLE_METHOD_COUNT) {
-            gen_params.sample_params.sample_method = sd_get_default_sample_method(sd_ctx);
-        }
-
-        if (gen_params.high_noise_sample_params.sample_method == SAMPLE_METHOD_COUNT) {
-            gen_params.high_noise_sample_params.sample_method = sd_get_default_sample_method(sd_ctx);
-        }
-
-        if (gen_params.sample_params.scheduler == SCHEDULER_COUNT) {
-            gen_params.sample_params.scheduler = sd_get_default_scheduler(sd_ctx, gen_params.sample_params.sample_method);
-        }
-
-        if (cli_params.mode == IMG_GEN) {
-            sd_img_gen_params_t img_gen_params = {
-                gen_params.lora_vec.data(),
-                static_cast<uint32_t>(gen_params.lora_vec.size()),
-                gen_params.prompt.c_str(),
-                gen_params.negative_prompt.c_str(),
-                gen_params.clip_skip,
-                init_image,
-                ref_images.data(),
-                (int)ref_images.size(),
-                gen_params.auto_resize_ref_image,
-                gen_params.increase_ref_index,
-                mask_image,
-                gen_params.get_resolved_width(),
-                gen_params.get_resolved_height(),
-                gen_params.sample_params,
-                gen_params.strength,
-                gen_params.seed,
-                gen_params.batch_count,
-                control_image,
-                gen_params.control_strength,
-                {
-                    pmid_images.data(),
-                    (int)pmid_images.size(),
-                    gen_params.pm_id_embed_path.c_str(),
-                    gen_params.pm_style_strength,
-                },  // pm_params
-                ctx_params.vae_tiling_params,
-                gen_params.cache_params,
-            };
-
-            results     = generate_image(sd_ctx, &img_gen_params);
-            num_results = gen_params.batch_count;
-        } else if (cli_params.mode == VID_GEN) {
-            sd_vid_gen_params_t vid_gen_params = {
-                gen_params.lora_vec.data(),
-                static_cast<uint32_t>(gen_params.lora_vec.size()),
-                gen_params.prompt.c_str(),
-                gen_params.negative_prompt.c_str(),
-                gen_params.clip_skip,
-                init_image,
-                end_image,
-                control_frames.data(),
-                (int)control_frames.size(),
-                gen_params.get_resolved_width(),
-                gen_params.get_resolved_height(),
-                gen_params.sample_params,
-                gen_params.high_noise_sample_params,
-                gen_params.moe_boundary,
-                gen_params.strength,
-                gen_params.seed,
-                gen_params.video_frames,
-                gen_params.vace_strength,
-                ctx_params.vae_tiling_params,
-                gen_params.cache_params,
-            };
-
-            results = generate_video(sd_ctx, &vid_gen_params, &num_results);
-        }
-
-        if (results == nullptr) {
-            LOG_ERROR("generate failed");
+        if (!cli_params.load_latent_path.empty()) {
+            results = decode_latent_file(sd_ctx, cli_params.load_latent_path.c_str());
+            if (results == nullptr) {
+                LOG_ERROR("decode_latent_file failed");
+                free_sd_ctx(sd_ctx);
+                release_all_resources();
+                return 1;
+            }
+            num_results = 1;
             free_sd_ctx(sd_ctx);
-            return 1;
-        }
+        } else {
+            if (gen_params.sample_params.sample_method == SAMPLE_METHOD_COUNT) {
+                gen_params.sample_params.sample_method = sd_get_default_sample_method(sd_ctx);
+            }
 
-        free_sd_ctx(sd_ctx);
+            if (gen_params.high_noise_sample_params.sample_method == SAMPLE_METHOD_COUNT) {
+                gen_params.high_noise_sample_params.sample_method = sd_get_default_sample_method(sd_ctx);
+            }
+
+            if (gen_params.sample_params.scheduler == SCHEDULER_COUNT) {
+                gen_params.sample_params.scheduler = sd_get_default_scheduler(sd_ctx, gen_params.sample_params.sample_method);
+            }
+
+            if (cli_params.mode == IMG_GEN) {
+                sd_img_gen_params_t img_gen_params = {
+                    gen_params.lora_vec.data(),
+                    static_cast<uint32_t>(gen_params.lora_vec.size()),
+                    gen_params.prompt.c_str(),
+                    gen_params.negative_prompt.c_str(),
+                    gen_params.clip_skip,
+                    init_image,
+                    ref_images.data(),
+                    (int)ref_images.size(),
+                    gen_params.auto_resize_ref_image,
+                    gen_params.increase_ref_index,
+                    mask_image,
+                    gen_params.get_resolved_width(),
+                    gen_params.get_resolved_height(),
+                    gen_params.sample_params,
+                    gen_params.strength,
+                    gen_params.seed,
+                    gen_params.batch_count,
+                    control_image,
+                    gen_params.control_strength,
+                    {
+                        pmid_images.data(),
+                        (int)pmid_images.size(),
+                        gen_params.pm_id_embed_path.c_str(),
+                        gen_params.pm_style_strength,
+                    },  // pm_params
+                    ctx_params.vae_tiling_params,
+                    gen_params.cache_params,
+                };
+
+                results     = generate_image(sd_ctx, &img_gen_params);
+                num_results = gen_params.batch_count;
+            } else if (cli_params.mode == VID_GEN) {
+                sd_vid_gen_params_t vid_gen_params = {
+                    gen_params.lora_vec.data(),
+                    static_cast<uint32_t>(gen_params.lora_vec.size()),
+                    gen_params.prompt.c_str(),
+                    gen_params.negative_prompt.c_str(),
+                    gen_params.clip_skip,
+                    init_image,
+                    end_image,
+                    control_frames.data(),
+                    (int)control_frames.size(),
+                    gen_params.get_resolved_width(),
+                    gen_params.get_resolved_height(),
+                    gen_params.sample_params,
+                    gen_params.high_noise_sample_params,
+                    gen_params.moe_boundary,
+                    gen_params.strength,
+                    gen_params.seed,
+                    gen_params.video_frames,
+                    gen_params.vace_strength,
+                    ctx_params.vae_tiling_params,
+                    gen_params.cache_params,
+                };
+
+                results = generate_video(sd_ctx, &vid_gen_params, &num_results);
+            }
+
+            if (results == nullptr) {
+                LOG_ERROR("generate failed");
+                free_sd_ctx(sd_ctx);
+                return 1;
+            }
+
+            free_sd_ctx(sd_ctx);
+        }
     }
 
     int upscale_factor = 4;  // unused for RealESRGAN_x4plus_anime_6B.pth

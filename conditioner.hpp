@@ -1827,6 +1827,21 @@ struct LLMEmbedder : public Conditioner {
         } else if (sd_version_is_z_image(version)) {
             prompt_template_encode_start_idx = 0;
             out_layers                       = {35};  // -2
+            if (const char* env_max_len = std::getenv("SD_Z_IMAGE_MAX_LENGTH")) {
+                char* end_ptr = nullptr;
+                long parsed   = std::strtol(env_max_len, &end_ptr, 10);
+                if (end_ptr != env_max_len && parsed >= 32 && parsed <= 4096) {
+                    max_length = static_cast<int>(parsed);
+                    LOG_INFO("Z-Image max token length overridden by env: %d", max_length);
+                }
+            } else if (const char* env_max_len = std::getenv("SD_ZIMAGE_MAX_LENGTH")) {
+                char* end_ptr = nullptr;
+                long parsed   = std::strtol(env_max_len, &end_ptr, 10);
+                if (end_ptr != env_max_len && parsed >= 32 && parsed <= 4096) {
+                    max_length = static_cast<int>(parsed);
+                    LOG_INFO("Z-Image max token length overridden by env: %d", max_length);
+                }
+            }
 
             prompt = "<|im_start|>user\n";
 
@@ -1839,6 +1854,15 @@ struct LLMEmbedder : public Conditioner {
             prompt_template_encode_start_idx = 0;
             max_length                       = 512;
             out_layers                       = {9, 18, 27};
+
+            if (const char* env_max_len = std::getenv("SD_FLUX2_KLEIN_MAX_LENGTH")) {
+                char* end_ptr = nullptr;
+                long parsed   = std::strtol(env_max_len, &end_ptr, 10);
+                if (end_ptr != env_max_len && parsed >= 64 && parsed <= 4096) {
+                    max_length = static_cast<int>(parsed);
+                    LOG_INFO("Flux2-Klein max token length overridden by env: %d", max_length);
+                }
+            }
 
             prompt = "<|im_start|>user\n";
 
