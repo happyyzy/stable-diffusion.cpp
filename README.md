@@ -13,6 +13,16 @@ Diffusion model(SD,Flux,Wan,...) inference in pure C/C++
 ***Note that this project is under active development. \
 API and command-line option may change frequently.***
 
+## Adreno Optimization Fork
+
+This fork focuses on Adreno-specific OpenCL optimization and debugging for Q4_0 pipelines (FLUX.2-klein, Z-Image, Qwen3-4B).
+
+- Optimization logbook (step-by-step, with before/after metrics): [`docs/adreno/README.md`](./docs/adreno/README.md)
+- Key result snapshot:
+  - FLUX.2-klein 1024 (flash-on): `209.81 s/step -> 31.256 s/step`
+  - Z-Image 1024 step1 (true-native flash vs optimized mldrift path): `341.70 s -> 56.93 s`
+  - This fork targets sustained 10x-class speedups on critical Adreno attention paths while keeping numerical correctness trackable per step.
+
 ## 🔥Important News
 
 * **2026/01/18** 🚀 stable-diffusion.cpp now supports **FLUX.2-klein**  
