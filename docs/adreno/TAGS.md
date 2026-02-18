@@ -66,7 +66,6 @@ This fork uses two tag classes:
 ## WIP source tags
 
 - `adreno-step24-wip`
-  - commit: `8c8beac`
   - branch: `milestone/step24-wip-source`
   - scope: Step24 diagnostic checkpoint (`<=2s` host-attn path verified; native no-host still blocked)
   - expected artifacts:
