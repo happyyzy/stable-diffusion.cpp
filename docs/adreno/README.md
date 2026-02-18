@@ -13,13 +13,14 @@ This fork is focused on Adreno OpenCL optimization and numerical debugging for Q
 | FLUX.2-klein 1024 flash-on (step forward bench) | 209.81 s/step | 31.256 s/step | 6.71x |
 | Z-Image 1024 step1 (true-native flash vs optimized mldrift path) | 341.70 s | 56.93 s | 6.00x |
 | Z-Image 1024 step1 (Step19 accepted finite path: iofirst_chunk64) | 341.70 s | 50.90 s | 6.71x |
+| Z-Image 1024 full 8-step (Step21 rerun gate) | 493.39 s total | 458.41 s total | 1.08x |
 | FLUX.2-klein 512 full phone flow (ctx=256) | 98.16 s total | 59.39 s total | 1.65x |
 
 Notes:
 - Critical attention hot path has reached 10x-class improvement in some internal baselines during the debug process.
 - End-to-end gains vary by model, resolution, sequence length, and VAE path.
 
-## Step Records (GOAL 1-20)
+## Step Records (GOAL 1-21)
 
 Each step records the debug method and a before/after outcome (image quality or speed).
 
@@ -134,31 +135,38 @@ Each step records the debug method and a before/after outcome (image quality or 
   - all finite `<52s` routes are in the same quality tier in current visual checks;
   - runtime variance is strongly thermal/clock-state dependent, so 4-step average can be slower than cold single-step.
 
-### Step 20 - Z-Image 1024 VAE Decode Optimization (WIP)
-- Objective (not yet passed): reduce z-image 1024 VAE decode on Adreno OpenCL to `<10s` with numeric/image correctness.
-- Current baseline (decode-only, same latent, `--vae-conv-direct`):
-  - `33.29s` (`run_step20_vae_decode_ocl_convdirect_prof.log`)
-  - latest recheck `33.17s` (`run_step20opt7_vae_decode_ocl_convdirect_default.log`)
-  - op-timing run `34.36s`, top op is `CONV_2D ~29.75s`.
-- Current bottleneck:
-  - Conv2D dominates; major output shapes include:
-    - `512x512x256` (7x)
-    - `1024x1024x128` (7x)
-    - `256x256x512` (7x)
-    - plus two very heavy singles: `512x512x512`, `1024x1024x256`.
-  - dtype resolved: hot Conv2D is consistently `src0=f16, src1=f32` (39 calls, total ~37.64s).
-- Negative controls:
-  - no `conv_direct` path OOM (`~8.5GB` compute buffer request).
-  - `--force-sdxl-vae-conv-scale`, `threads=8`, and f16 VAE weights alone did not materially reduce decode time.
-  - experimental tuned 3x3 tiles (`GGML_OPENCL_CONV2D_TUNED=1`) did not show material gain.
-  - `GGML_OPENCL_CONV2D_QCOM_ACCEL16=1` regressed decode to `41.24s`.
-- Artifacts:
-  - `exp_20260216_zimage_q40/step20_vae_1024_opt/report_step20_baseline_20260218.md`
-  - `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_conv_shape_summary.csv`
-  - `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_conv_node_top20.csv`
-  - `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_conv_dtype_spec_summary.md`
-  - `exp_20260216_zimage_q40/step20_vae_1024_opt/report_step20_tuned_conv_20260218.md`
-  - `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_image_diff_vs_host.md`
+### Step 20 - Z-Image 1024 VAE Decode Optimization (Passed)
+- Method:
+  - keep qcom_ml VAE route, replace host-attn CPU fallback with OpenCL backend (`SD_QCOM_ML_VAE_HOST_ATTN_BACKEND=ggml`).
+  - run tile scan on same latent with same ggml decode reference image.
+- Before:
+  - host-attn CPU fallback path ~`179.18s` (tile32), numeric recovered but speed unusable.
+- After:
+  - best accepted config: `tile=40`, `overlap=0.0` (runtime optimal overlap=0.2667)
+  - decode-only time: `9.25s` (`<10s` target met)
+  - image diff vs ggml ref: `MAE=1.9617, RMSE=2.6471, p99=8, max=50`
+  - output image: `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_hostattn_backendggml_t40_o0.png`
+  - log: `exp_20260216_zimage_q40/step20_vae_1024_opt/run_step20_qcomml_1024_hostattn_backendggml_t40_o0.log`
+- Round summary:
+  - `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_hostattn_backendggml_grid_20260218d.md`
+- Full step log:
+  - `docs/adreno/steps/step20.md`
+
+### Step 21 - Z-Image 1024 8-Step Final Gate (Passed)
+- Method:
+  - run full phone chain on the accepted Step19+Step20 path:
+    - trunk: `GGML_OPENCL_MLDRIFT=1`, `GGML_OPENCL_MLDRIFT_H30_IO_FIRST=1`, `GGML_OPENCL_MLDRIFT_KV_KEEP_HEAD=4096`
+    - q4 fix: `SD_OCL_Q4_GEMM_FP16_CHUNK_ACC_SUBSTR=context_refiner.0.attention.out.weight,noise_refiner.0.attention.out.weight`
+      + `SD_OCL_Q4_GEMM_FP16_CHUNK_ITERS=64`
+    - vae: `--vae-backend qcom_ml --vae-conv-direct`, `SD_QCOM_ML_VAE_HOST_ATTN_BACKEND=ggml`, tile `40/o0`
+- Attempt 1:
+  - total `493.39s` (not pass), log `exp_20260216_zimage_q40/step21_final_8step/run_step21_zimg_1024_s8_qcomml.log`
+- Thermal-check rerun:
+  - total `458.41s` (pass), sampling `448.23s`, vae `9.73s`
+  - log `exp_20260216_zimage_q40/step21_final_8step/run_step21_zimg_1024_s8_qcomml_rerun.log`
+  - image `exp_20260216_zimage_q40/step21_final_8step/step21_zimg_1024_s8_qcomml_rerun.png`
+- Full step log:
+  - `docs/adreno/steps/step21.md`
 
 ## Tag Map
 
@@ -166,7 +174,7 @@ Tag policy:
 - Legacy index tags: `adreno-step01` ... `adreno-step18` (doc index only)
 - Canonical source tags (engineering): `adreno-stepXX-src`
   - first canonical source tag: `adreno-step18-src` (`b07d269`)
-  - current: `adreno-step19-src` (Step19 accepted source snapshot)
+  - current: `adreno-step21-src` (Step21 accepted source snapshot)
 
 Each tag is an annotated tag whose message includes:
 - debug method summary
@@ -192,3 +200,8 @@ Step18 example images:
 - `work/main`: integration branch for ongoing Adreno work
 - `debug/*`: experiment branches
 - `pr/main`: clean PR-oriented branch
+
+## Flag Catalog
+
+- Consolidated runtime/build flags:
+  - `docs/adreno/flags.md`

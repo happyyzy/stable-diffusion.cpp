@@ -463,6 +463,7 @@ struct SDContextParams {
     bool diffusion_flash_attn   = false;
     bool diffusion_conv_direct  = false;
     bool vae_conv_direct        = false;
+    std::string vae_backend     = "ggml";
 
     bool circular   = false;
     bool circular_x = false;
@@ -539,6 +540,10 @@ struct SDContextParams {
              "--vae",
              "path to standalone vae model",
              &vae_path},
+            {"",
+             "--vae-backend",
+             "vae runtime backend: ggml | qcom_ml (default: ggml)",
+             &vae_backend},
             {"",
              "--taesd",
              "path to taesd. Using Tiny AutoEncoder for fast decoding (low quality)",
@@ -871,6 +876,11 @@ struct SDContextParams {
             n_threads = sd_get_num_physical_cores();
         }
 
+        if (str_to_sd_vae_backend(vae_backend.c_str()) == SD_VAE_BACKEND_COUNT) {
+            LOG_ERROR("error: invalid --vae-backend '%s' (expected: ggml|qcom_ml)\n", vae_backend.c_str());
+            return false;
+        }
+
         build_embedding_map();
 
         if (!cond_c_crossattn_path.empty() && !fs::exists(cond_c_crossattn_path)) {
@@ -934,6 +944,7 @@ struct SDContextParams {
             << "  diffusion_flash_attn: " << (diffusion_flash_attn ? "true" : "false") << ",\n"
             << "  diffusion_conv_direct: " << (diffusion_conv_direct ? "true" : "false") << ",\n"
             << "  vae_conv_direct: " << (vae_conv_direct ? "true" : "false") << ",\n"
+            << "  vae_backend: \"" << vae_backend << "\",\n"
             << "  circular: " << (circular ? "true" : "false") << ",\n"
             << "  circular_x: " << (circular_x ? "true" : "false") << ",\n"
             << "  circular_y: " << (circular_y ? "true" : "false") << ",\n"
@@ -956,6 +967,11 @@ struct SDContextParams {
     }
 
     sd_ctx_params_t to_sd_ctx_params_t(bool vae_decode_only, bool free_params_immediately, bool taesd_preview) {
+        sd_vae_backend_t parsed_vae_backend = str_to_sd_vae_backend(vae_backend.c_str());
+        if (parsed_vae_backend == SD_VAE_BACKEND_COUNT) {
+            parsed_vae_backend = SD_VAE_BACKEND_GGML;
+        }
+
         embedding_vec.clear();
         embedding_vec.reserve(embedding_map.size());
         for (const auto& kv : embedding_map) {
@@ -1000,6 +1016,7 @@ struct SDContextParams {
             taesd_preview,
             diffusion_conv_direct,
             vae_conv_direct,
+            parsed_vae_backend,
             circular || circular_x,
             circular || circular_y,
             force_sdxl_vae_conv_scale,

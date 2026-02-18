@@ -26,6 +26,7 @@
 #include "esrgan.hpp"
 #include "lora.hpp"
 #include "pmid.hpp"
+#include "qcom_ml_vae_bridge.hpp"
 #include "tae.hpp"
 #include "ucache.hpp"
 #include "vae.hpp"
@@ -384,6 +385,78 @@ void suppress_pp(int step, int steps, float time, void* data) {
     return;
 }
 
+static bool sd_tensor_to_f32_vector(const ggml_tensor* tensor, std::vector<float>& out) {
+    if (tensor == nullptr) {
+        return false;
+    }
+    const int64_t ne0 = tensor->ne[0];
+    const int64_t ne1 = tensor->ne[1];
+    const int64_t ne2 = tensor->ne[2];
+    const int64_t ne3 = tensor->ne[3];
+    if (ne0 <= 0 || ne1 <= 0 || ne2 <= 0 || ne3 <= 0) {
+        return false;
+    }
+    const size_t elem_count = static_cast<size_t>(ne0) * ne1 * ne2 * ne3;
+    out.resize(elem_count);
+
+    size_t idx = 0;
+    for (int64_t i3 = 0; i3 < ne3; ++i3) {
+        for (int64_t i2 = 0; i2 < ne2; ++i2) {
+            for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                    out[idx++] = ggml_ext_tensor_get_f32(const_cast<ggml_tensor*>(tensor), i0, i1, i2, i3);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static bool sd_f32_vector_to_tensor(const std::vector<float>& in, ggml_tensor* tensor) {
+    if (tensor == nullptr) {
+        return false;
+    }
+    const int64_t ne0 = tensor->ne[0];
+    const int64_t ne1 = tensor->ne[1];
+    const int64_t ne2 = tensor->ne[2];
+    const int64_t ne3 = tensor->ne[3];
+    const size_t elem_count = static_cast<size_t>(ne0) * ne1 * ne2 * ne3;
+    if (in.size() != elem_count) {
+        return false;
+    }
+    size_t idx = 0;
+    for (int64_t i3 = 0; i3 < ne3; ++i3) {
+        for (int64_t i2 = 0; i2 < ne2; ++i2) {
+            for (int64_t i1 = 0; i1 < ne1; ++i1) {
+                for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                    ggml_ext_tensor_set_f32(tensor, in[idx++], i0, i1, i2, i3);
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static bool sd_copy_tensor_values(const ggml_tensor* src, ggml_tensor* dst) {
+    if (src == nullptr || dst == nullptr) {
+        return false;
+    }
+    if (src->ne[0] != dst->ne[0] || src->ne[1] != dst->ne[1] || src->ne[2] != dst->ne[2] || src->ne[3] != dst->ne[3]) {
+        return false;
+    }
+    for (int64_t i3 = 0; i3 < src->ne[3]; ++i3) {
+        for (int64_t i2 = 0; i2 < src->ne[2]; ++i2) {
+            for (int64_t i1 = 0; i1 < src->ne[1]; ++i1) {
+                for (int64_t i0 = 0; i0 < src->ne[0]; ++i0) {
+                    const float v = ggml_ext_tensor_get_f32(const_cast<ggml_tensor*>(src), i0, i1, i2, i3);
+                    ggml_ext_tensor_set_f32(dst, v, i0, i1, i2, i3);
+                }
+            }
+        }
+    }
+    return true;
+}
+
 /*=============================================== StableDiffusionGGML ================================================*/
 
 class StableDiffusionGGML {
@@ -421,6 +494,11 @@ public:
     std::string taesd_path;
     bool use_tiny_autoencoder            = false;
     sd_tiling_params_t vae_tiling_params = {false, 0, 0, 0.5f, 0, 0};
+    sd_vae_backend_t vae_backend_type    = SD_VAE_BACKEND_GGML;
+    bool qcom_ml_vae_init_attempted      = false;
+    QcomMlVaeBridge qcom_ml_vae_bridge;
+    std::string qcom_ml_vae_lib_path;
+    std::string qcom_ml_vae_model_dir;
     bool offload_params_to_cpu           = false;
     bool use_pmid                        = false;
     std::string cond_c_crossattn_path;
@@ -522,6 +600,47 @@ public:
         }
     }
 
+    bool init_qcom_ml_vae_bridge(const sd_ctx_params_t* sd_ctx_params) {
+        if (qcom_ml_vae_init_attempted) {
+            return qcom_ml_vae_bridge.ready();
+        }
+        qcom_ml_vae_init_attempted = true;
+
+#ifndef SD_USE_QCOM_ML_VAE
+        SD_UNUSED(sd_ctx_params);
+        return false;
+#else
+        const char* lib_env   = std::getenv("SD_QCOM_ML_VAE_LIB");
+        const char* model_env = std::getenv("SD_QCOM_ML_VAE_DIR");
+        if (lib_env != nullptr && lib_env[0] != '\0') {
+            qcom_ml_vae_lib_path = lib_env;
+        } else {
+            qcom_ml_vae_lib_path = "libsd_qcom_ml_vae.so";
+        }
+        if (model_env != nullptr && model_env[0] != '\0') {
+            qcom_ml_vae_model_dir = model_env;
+        } else {
+            qcom_ml_vae_model_dir = SAFE_STR(sd_ctx_params->vae_path);
+        }
+
+        QcomMlVaeConfig cfg;
+        cfg.model_dir               = qcom_ml_vae_model_dir;
+        cfg.disable_mnn_attention   = true;
+        cfg.fallback_attn_len_16384 = true;
+
+        std::string err_msg;
+        if (!qcom_ml_vae_bridge.init(qcom_ml_vae_lib_path, cfg, &err_msg)) {
+            LOG_WARN("QCOM ML VAE bridge init failed: %s", err_msg.c_str());
+            return false;
+        }
+
+        LOG_INFO("QCOM ML VAE bridge ready (lib=%s, model_dir=%s, disable_mnn_attn=1, fallback_attn_16384=1)",
+                 qcom_ml_vae_lib_path.c_str(),
+                 qcom_ml_vae_model_dir.c_str());
+        return true;
+#endif
+    }
+
     bool init(const sd_ctx_params_t* sd_ctx_params) {
         n_threads               = sd_ctx_params->n_threads;
         int load_n_threads      = n_threads;
@@ -539,6 +658,17 @@ public:
         offload_params_to_cpu   = sd_ctx_params->offload_params_to_cpu;
         cond_c_crossattn_path   = SAFE_STR(sd_ctx_params->cond_c_crossattn_path);
         uncond_c_crossattn_path = SAFE_STR(sd_ctx_params->uncond_c_crossattn_path);
+        vae_backend_type        = sd_ctx_params->vae_backend;
+
+#ifndef SD_USE_QCOM_ML_VAE
+        if (vae_backend_type == SD_VAE_BACKEND_QCOM_ML) {
+            LOG_WARN("VAE backend 'qcom_ml' requested but SD_USE_QCOM_ML_VAE is OFF. Falling back to ggml.");
+            vae_backend_type = SD_VAE_BACKEND_GGML;
+        }
+#endif
+        if (vae_backend_type == SD_VAE_BACKEND_QCOM_ML) {
+            (void)init_qcom_ml_vae_bridge(sd_ctx_params);
+        }
 
         rng = get_rng(sd_ctx_params->rng_type);
         if (sd_ctx_params->sampler_rng_type != RNG_TYPE_COUNT && sd_ctx_params->sampler_rng_type != sd_ctx_params->rng_type) {
@@ -896,6 +1026,7 @@ public:
             } else {
                 vae_backend = backend;
             }
+            LOG_INFO("VAE runtime backend: %s", sd_vae_backend_name(vae_backend_type));
 
             if (!(use_tiny_autoencoder || version == VERSION_SDXS) || tae_preview_only) {
                 if (sd_version_is_wan(version) || sd_version_is_qwen_image(version)) {
@@ -2995,6 +3126,235 @@ public:
         return get_first_stage_encoding(work_ctx, vae_output);
     }
 
+    bool decode_first_stage_qcom_ml_single(ggml_tensor* latent,
+                                           ggml_tensor* result,
+                                           std::string* err_msg_out = nullptr,
+                                           bool* used_fallback_16384_out = nullptr) {
+#ifndef SD_USE_QCOM_ML_VAE
+        SD_UNUSED(latent);
+        SD_UNUSED(result);
+        SD_UNUSED(err_msg_out);
+        SD_UNUSED(used_fallback_16384_out);
+        return false;
+#else
+        std::vector<float> latent_f32;
+        if (!sd_tensor_to_f32_vector(latent, latent_f32)) {
+            if (err_msg_out != nullptr) {
+                *err_msg_out = "failed to export latent tensor";
+            }
+            return false;
+        }
+
+        std::vector<float> out_f32;
+        std::string err_msg;
+        bool used_fallback_16384 = false;
+        if (!qcom_ml_vae_bridge.decode(latent_f32,
+                                       static_cast<int>(latent->ne[0]),
+                                       static_cast<int>(latent->ne[1]),
+                                       static_cast<int>(latent->ne[2]),
+                                       static_cast<int>(latent->ne[3]),
+                                       &out_f32,
+                                       static_cast<int>(result->ne[0]),
+                                       static_cast<int>(result->ne[1]),
+                                       static_cast<int>(result->ne[2]),
+                                       &err_msg,
+                                       &used_fallback_16384)) {
+            if (err_msg_out != nullptr) {
+                *err_msg_out = err_msg;
+            }
+            return false;
+        }
+
+        for (float v : out_f32) {
+            if (!std::isfinite(v)) {
+                if (err_msg_out != nullptr) {
+                    *err_msg_out = "non-finite output from qcom_ml decode";
+                }
+                return false;
+            }
+        }
+
+        if (std::getenv("SD_QCOM_ML_VAE_DUMP_STATS") != nullptr) {
+            auto calc_stats = [](const std::vector<float>& v, float& mn, float& mx, double& mean) {
+                mn   = std::numeric_limits<float>::infinity();
+                mx   = -std::numeric_limits<float>::infinity();
+                mean = 0.0;
+                if (v.empty()) {
+                    mn = mx = 0.0f;
+                    return;
+                }
+                for (float x : v) {
+                    mn = std::min(mn, x);
+                    mx = std::max(mx, x);
+                    mean += x;
+                }
+                mean /= static_cast<double>(v.size());
+            };
+            static int stats_count = 0;
+            if (stats_count < 4) {
+                ++stats_count;
+                float in_min, in_max, out_min, out_max;
+                double in_mean, out_mean;
+                calc_stats(latent_f32, in_min, in_max, in_mean);
+                calc_stats(out_f32, out_min, out_max, out_mean);
+                LOG_INFO("QCOM ML VAE decode stats #%d: in[min=%.6f max=%.6f mean=%.6f] out[min=%.6f max=%.6f mean=%.6f]",
+                         stats_count, in_min, in_max, in_mean, out_min, out_max, out_mean);
+            }
+        }
+
+        if (!sd_f32_vector_to_tensor(out_f32, result)) {
+            if (err_msg_out != nullptr) {
+                *err_msg_out = "output tensor shape mismatch";
+            }
+            return false;
+        }
+
+        if (used_fallback_16384_out != nullptr) {
+            *used_fallback_16384_out = used_fallback_16384;
+        }
+        return true;
+#endif
+    }
+
+    bool decode_first_stage_qcom_ml(ggml_context* work_ctx, ggml_tensor* x, ggml_tensor* result) {
+#ifndef SD_USE_QCOM_ML_VAE
+        SD_UNUSED(work_ctx);
+        SD_UNUSED(x);
+        SD_UNUSED(result);
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LOG_WARN("VAE backend 'qcom_ml' is not compiled in this binary. Falling back to ggml VAE.");
+        }
+        return false;
+#else
+        if (!qcom_ml_vae_bridge.ready()) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                LOG_WARN("QCOM ML VAE bridge is not ready. Falling back to ggml VAE.");
+            }
+            return false;
+        }
+
+        ggml_tensor* latent = ggml_new_tensor_4d(work_ctx,
+                                                 x->type,
+                                                 x->ne[0],
+                                                 x->ne[1],
+                                                 x->ne[2],
+                                                 x->ne[3]);
+        if (!sd_copy_tensor_values(x, latent)) {
+            LOG_WARN("QCOM ML VAE path: failed to copy latent tensor.");
+            return false;
+        }
+        if (sd_version_is_qwen_image(version)) {
+            latent = ggml_reshape_4d(work_ctx, latent, latent->ne[0], latent->ne[1], 1, latent->ne[2] * latent->ne[3]);
+        }
+        if (std::getenv("SD_QCOM_ML_VAE_SKIP_LATENT_OUT") == nullptr) {
+            process_latent_out(latent);
+        }
+
+        const int64_t seq_len = latent->ne[0] * latent->ne[1];
+        bool use_tiled_decode = false;
+        if (seq_len >= 16384) {
+            const char* env_try_tiled = std::getenv("SD_QCOM_ML_VAE_TRY_TILED");
+            use_tiled_decode          = (env_try_tiled != nullptr && std::atoi(env_try_tiled) != 0);
+            if (!use_tiled_decode) {
+                LOG_WARN("QCOM ML VAE decode: seq_len=%lld is not supported by default path. Falling back to ggml.",
+                         (long long)seq_len);
+                return false;
+            }
+        }
+
+        bool used_fallback_16384 = false;
+        if (use_tiled_decode) {
+            int tile_size_x  = 32;
+            int tile_size_y  = 32;
+            float overlap    = 0.5f;
+            const char* env_tile_size = std::getenv("SD_QCOM_ML_VAE_TILE_SIZE");
+            if (env_tile_size != nullptr && env_tile_size[0] != '\0') {
+                int v = std::atoi(env_tile_size);
+                if (v >= 4) {
+                    tile_size_x = v;
+                    tile_size_y = v;
+                }
+            }
+            const char* env_overlap = std::getenv("SD_QCOM_ML_VAE_TILE_OVERLAP");
+            if (env_overlap != nullptr && env_overlap[0] != '\0') {
+                float v = std::atof(env_overlap);
+                if (v >= 0.0f && v <= 0.5f) {
+                    overlap = v;
+                }
+            }
+            tile_size_x = std::min(tile_size_x, static_cast<int>(latent->ne[0]));
+            tile_size_y = std::min(tile_size_y, static_cast<int>(latent->ne[1]));
+
+            LOG_INFO("QCOM ML VAE decode: tiled mode for seq_len=%lld, tile=%dx%d overlap=%.2f",
+                     (long long)seq_len, tile_size_x, tile_size_y, overlap);
+
+            bool tile_ok = true;
+            std::string tile_err_msg;
+            const bool tile_debug = std::getenv("SD_QCOM_ML_VAE_TILE_DEBUG") != nullptr;
+            int tile_idx          = 0;
+            ggml_tensor* tiled_result = ggml_new_tensor_4d(work_ctx,
+                                                           result->type,
+                                                           result->ne[0],
+                                                           result->ne[1],
+                                                           result->ne[2],
+                                                           result->ne[3]);
+            auto on_tiling = [&](ggml_tensor* in, ggml_tensor* out, bool init) {
+                SD_UNUSED(init);
+                if (!tile_ok) {
+                    return;
+                }
+                ++tile_idx;
+                if (tile_debug) {
+                    LOG_INFO("QCOM ML VAE tile %d start: in=%lldx%lldx%lldx%lld out=%lldx%lldx%lldx%lld",
+                             tile_idx,
+                             (long long)in->ne[0], (long long)in->ne[1], (long long)in->ne[2], (long long)in->ne[3],
+                             (long long)out->ne[0], (long long)out->ne[1], (long long)out->ne[2], (long long)out->ne[3]);
+                }
+                bool tile_used_fallback = false;
+                std::string err_msg;
+                if (!decode_first_stage_qcom_ml_single(in, out, &err_msg, &tile_used_fallback)) {
+                    tile_ok      = false;
+                    tile_err_msg = err_msg;
+                    if (tile_debug) {
+                        LOG_WARN("QCOM ML VAE tile %d failed: %s", tile_idx, err_msg.c_str());
+                    }
+                    return;
+                }
+                used_fallback_16384 = used_fallback_16384 || tile_used_fallback;
+                if (tile_debug) {
+                    LOG_INFO("QCOM ML VAE tile %d done", tile_idx);
+                }
+            };
+
+            sd_tiling_non_square(latent, tiled_result, get_vae_scale_factor(), tile_size_x, tile_size_y, overlap, on_tiling);
+            if (!tile_ok) {
+                LOG_WARN("QCOM ML VAE tiled decode failed: %s. Falling back to ggml.", tile_err_msg.c_str());
+                return false;
+            }
+            if (!sd_copy_tensor_values(tiled_result, result)) {
+                LOG_WARN("QCOM ML VAE tiled decode failed: copy tiled result failed. Falling back to ggml.");
+                return false;
+            }
+        } else {
+            std::string err_msg;
+            if (!decode_first_stage_qcom_ml_single(latent, result, &err_msg, &used_fallback_16384)) {
+                LOG_WARN("QCOM ML VAE decode failed: %s. Falling back to ggml.", err_msg.c_str());
+                return false;
+            }
+        }
+
+        if (used_fallback_16384) {
+            LOG_INFO("QCOM ML VAE decode used fallback for attention L=16384.");
+        }
+        process_vae_output_tensor(result);
+        return true;
+#endif
+    }
+
     ggml_tensor* decode_first_stage(ggml_context* work_ctx, ggml_tensor* x, bool decode_video = false) {
         const int vae_scale_factor = get_vae_scale_factor();
         int64_t W                  = x->ne[0] * vae_scale_factor;
@@ -3021,7 +3381,13 @@ public:
                                         x->ne[3]);
         }
         int64_t t0 = ggml_time_ms();
-        if (!use_tiny_autoencoder) {
+        bool decoded_with_qcom_ml = false;
+        if (!use_tiny_autoencoder && vae_backend_type == SD_VAE_BACKEND_QCOM_ML) {
+            decoded_with_qcom_ml = decode_first_stage_qcom_ml(work_ctx, x, result);
+        }
+        if (decoded_with_qcom_ml) {
+            // already decoded by qcom_ml path
+        } else if (!use_tiny_autoencoder) {
             if (sd_version_is_qwen_image(version)) {
                 x = ggml_reshape_4d(work_ctx, x, x->ne[0], x->ne[1], 1, x->ne[2] * x->ne[3]);
             }
@@ -3240,6 +3606,27 @@ enum lora_apply_mode_t str_to_lora_apply_mode(const char* str) {
     return LORA_APPLY_MODE_COUNT;
 }
 
+const char* vae_backend_to_str[] = {
+    "ggml",
+    "qcom_ml",
+};
+
+const char* sd_vae_backend_name(enum sd_vae_backend_t backend) {
+    if (backend < SD_VAE_BACKEND_COUNT) {
+        return vae_backend_to_str[backend];
+    }
+    return NONE_STR;
+}
+
+enum sd_vae_backend_t str_to_sd_vae_backend(const char* str) {
+    for (int i = 0; i < SD_VAE_BACKEND_COUNT; ++i) {
+        if (!strcmp(str, vae_backend_to_str[i])) {
+            return (enum sd_vae_backend_t)i;
+        }
+    }
+    return SD_VAE_BACKEND_COUNT;
+}
+
 void sd_cache_params_init(sd_cache_params_t* cache_params) {
     *cache_params                             = {};
     cache_params->mode                        = SD_CACHE_DISABLED;
@@ -3277,6 +3664,7 @@ void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_params->keep_control_net_on_cpu = false;
     sd_ctx_params->keep_vae_on_cpu         = false;
     sd_ctx_params->diffusion_flash_attn    = false;
+    sd_ctx_params->vae_backend             = SD_VAE_BACKEND_GGML;
     sd_ctx_params->circular_x              = false;
     sd_ctx_params->circular_y              = false;
     sd_ctx_params->chroma_use_dit_mask     = true;
@@ -3321,6 +3709,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "keep_vae_on_cpu: %s\n"
              "flash_attn: %s\n"
              "diffusion_flash_attn: %s\n"
+             "vae_backend: %s\n"
              "circular_x: %s\n"
              "circular_y: %s\n"
              "chroma_use_dit_mask: %s\n"
@@ -3355,6 +3744,7 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              BOOL_STR(sd_ctx_params->keep_vae_on_cpu),
              BOOL_STR(sd_ctx_params->flash_attn),
              BOOL_STR(sd_ctx_params->diffusion_flash_attn),
+             sd_vae_backend_name(sd_ctx_params->vae_backend),
              BOOL_STR(sd_ctx_params->circular_x),
              BOOL_STR(sd_ctx_params->circular_y),
              BOOL_STR(sd_ctx_params->chroma_use_dit_mask),

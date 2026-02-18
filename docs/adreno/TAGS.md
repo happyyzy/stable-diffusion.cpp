@@ -27,14 +27,30 @@ This fork uses two tag classes:
     - step1: `exp_20260216_zimage_q40/step19_1024_opt/qmul_scan_20260218c/run_iofirst_chunk64.log`
     - 4-step host decode: `exp_20260216_zimage_q40/step19_1024_opt/step19_sub52_s4_hostdecode_20260218/`
 
+- `adreno-step20-src`
+  - commit: tag target (Step20 accepted source snapshot on `work/main`)
+  - scope: qcom_ml VAE host-attn OpenCL backend path, z-image 1024 decode `<10s`
+  - artifacts:
+    - decode log: `exp_20260216_zimage_q40/step20_vae_1024_opt/run_step20_qcomml_1024_hostattn_backendggml_t40_o0.log`
+    - decode image: `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_hostattn_backendggml_t40_o0.png`
+
+- `adreno-step21-src`
+  - commit: tag target (Step21 accepted source snapshot on `work/main`)
+  - scope: z-image 1024 8-step final gate (`<480s`) on Step19+Step20 combined path
+  - artifacts:
+    - attempt-1: `exp_20260216_zimage_q40/step21_final_8step/run_step21_zimg_1024_s8_qcomml.log`
+    - pass rerun: `exp_20260216_zimage_q40/step21_final_8step/run_step21_zimg_1024_s8_qcomml_rerun.log`
+    - pass image: `exp_20260216_zimage_q40/step21_final_8step/step21_zimg_1024_s8_qcomml_rerun.png`
+
 ## Index tags (legacy)
 
 - `adreno-step01` ... `adreno-step18`
 - `adreno-step19-wip`
 
-## Step20 status
+## Step20/21 status
 
-- Step20 is in progress (no acceptance tag yet).
-- Next canonical source tag will be `adreno-step20-src` only after `<10s` VAE decode + numeric/image gate is passed.
+- Step20 passed (`<10s` VAE decode gate met).
+- Step21 passed in rerun (`458.41s < 480s`).
+- canonical source tags should be maintained as `adreno-step20-src`, `adreno-step21-src`.
 
 See full detail: `docs/adreno/README.md`.

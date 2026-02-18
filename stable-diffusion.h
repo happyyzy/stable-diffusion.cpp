@@ -145,6 +145,12 @@ enum lora_apply_mode_t {
     LORA_APPLY_MODE_COUNT,
 };
 
+enum sd_vae_backend_t {
+    SD_VAE_BACKEND_GGML = 0,
+    SD_VAE_BACKEND_QCOM_ML,
+    SD_VAE_BACKEND_COUNT,
+};
+
 typedef struct {
     bool enabled;
     int tile_size_x;
@@ -194,6 +200,7 @@ typedef struct {
     bool tae_preview_only;
     bool diffusion_conv_direct;
     bool vae_conv_direct;
+    enum sd_vae_backend_t vae_backend;
     bool circular_x;
     bool circular_y;
     bool force_sdxl_vae_conv_scale;
@@ -355,6 +362,8 @@ SD_API const char* sd_preview_name(enum preview_t preview);
 SD_API enum preview_t str_to_preview(const char* str);
 SD_API const char* sd_lora_apply_mode_name(enum lora_apply_mode_t mode);
 SD_API enum lora_apply_mode_t str_to_lora_apply_mode(const char* str);
+SD_API const char* sd_vae_backend_name(enum sd_vae_backend_t backend);
+SD_API enum sd_vae_backend_t str_to_sd_vae_backend(const char* str);
 
 SD_API void sd_cache_params_init(sd_cache_params_t* cache_params);
 
