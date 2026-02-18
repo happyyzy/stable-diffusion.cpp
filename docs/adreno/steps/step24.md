@@ -60,11 +60,19 @@
   - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_scan_nohattn_fullgrid/summary.md`
 - Force-head scan (`heads=1/2/4/8/16/32/64`):
   - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_force_heads_scan/summary.md`
+- Descriptor scan v2 (`optimize_mem x recordable_queue x gmem`, with fixed model_dir):
+  - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_desc_scan_v2/summary.md`
+  - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_desc_scan_v2/summary_note.md`
+  - disconnect repro:
+    - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_desc_scan_v2/repro_nohost_opt0_disconnect_status.txt`
 - Observed patterns:
   - Most configs: non-finite output + fallback
   - `MHA_WT=0` family: CLML MHA creation assert/abort (`clCreateMLOpMultiHeadAttentionForwardQCOM` failure, code -1102)
   - Full-grid statistics: `0/48` usable (`36/48` create-fail, `12/48` runtime non-finite)
   - Force-head statistics: `0/7` usable (all runtime non-finite)
+  - Descriptor v2 statistics:
+    - `optimize_mem=0`: no-host run reaches `running in FLOW mode` then device disconnect (`adb_rc=255`, device missing)
+    - `optimize_mem=1`: no-host run reproducibly returns all-NaN decode output (`786432/786432`) and falls back
   - FP32 model attempt: fails earlier in CLML op creation (GroupNorm path), not a valid workaround
   - No tested no-host config reached stable finite output in this round
 
@@ -72,4 +80,7 @@
 
 - `<=2s` decode target: **met** (with host-attn backend path)
 - image correctness gate: **met**
-- strict “all ops fully native `qcom_ml` (no host-attn/fallback)” gate: **not met yet** (current blocker in SDK/native MHA stability)
+- strict “all ops fully native `qcom_ml` (no host-attn/fallback)” gate: **not met yet**
+  - current blocker split:
+    - `optimize_mem=0`: runtime disconnect/hang
+    - `optimize_mem=1`: runtime all-NaN decode output

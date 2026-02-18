@@ -73,6 +73,9 @@ This fork uses two tag classes:
     - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_scan_nohattn_wt0/summary.md`
     - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_scan_nohattn_fullgrid/summary.md`
     - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_force_heads_scan/summary.md`
+    - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_desc_scan_v2/summary.md`
+    - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_desc_scan_v2/summary_note.md`
+    - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_desc_scan_v2/repro_nohost_opt0_disconnect_status.txt`
 
 ## Step20/21/22/23 status
 

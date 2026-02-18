@@ -211,6 +211,9 @@ Each step records the debug method and a before/after outcome (image quality or 
     - `MHA_WT=0` family: MHA op creation fails (`code -1102`).
     - full-grid scan (`arith x softmax x bias`, 48 configs): `0/48` usable (`36` create-fail + `12` non-finite).
     - force-head scan (`1/2/4/8/16/32/64`): `0/7` usable (all non-finite).
+    - descriptor scan v2 (`optimize_mem x recordable_queue x gmem`, fixed model dir):
+      - `optimize_mem=0`: run hangs/disconnects right after `running in FLOW mode`
+      - `optimize_mem=1`: run is stable but still `786432/786432` non-finite + fallback
   - details: `docs/adreno/steps/step24.md`
 
 ## Tag Map
