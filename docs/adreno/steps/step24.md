@@ -34,6 +34,7 @@
 - Numeric/image check vs host decode reference:
   - ref: `exp_20260216_zimage_q40/zimage_step17auto_s4_hostdecode.png`
   - MAE `0.8134`, RMSE `1.6086`, p99 `6`, max `72`
+  - metrics file: `exp_20260216_zimage_q40/step24_vae_512_opt/metrics_vs_hostdecode.md`
 
 ### 2) Native `qcom_ml` attention (host-attn disabled) validation
 
