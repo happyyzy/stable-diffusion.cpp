@@ -192,7 +192,7 @@ Tag policy:
 - Legacy index tags: `adreno-step01` ... `adreno-step18` (doc index only)
 - Canonical source tags (engineering): `adreno-stepXX-src`
   - first canonical source tag: `adreno-step18-src` (`b07d269`)
-  - current: `adreno-step21-src` (Step21 accepted source snapshot)
+  - current: `adreno-step22-src` (`64545f6`, Step22 accepted source snapshot)
 
 Each tag is an annotated tag whose message includes:
 - debug method summary

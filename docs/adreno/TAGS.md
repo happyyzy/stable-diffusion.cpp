@@ -43,7 +43,7 @@ This fork uses two tag classes:
     - pass image: `exp_20260216_zimage_q40/step21_final_8step/step21_zimg_1024_s8_qcomml_rerun.png`
 
 - `adreno-step22-src`
-  - commit: tag target (Step22 accepted source snapshot on `work/main`)
+  - commit: `64545f6`
   - scope: klein 1024 qcom_ml VAE decode gate (`<10s`) with host-attn ggml backend + prepare path
   - artifacts:
     - decode baseline: `exp_20260218_klein_q40/step22_vae_1024_opt/run_step22_flux2_1024_qcomml_t32_o0_v30_optmem.log`
