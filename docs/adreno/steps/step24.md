@@ -16,6 +16,8 @@
   - Add no-host diagnostics for qcom_ml decode non-finite output:
     - report `nonfinite_count/total`, first bad index/value in error message
     - optional debug-only env `SD_QCOM_ML_VAE_SANITIZE_NONFINITE=1` to clamp bad values to zero for visualization
+- `stable-diffusion.cpp/thirdparty/qcom_ml_vae_sdk_bridge/clml_decoder.cpp`
+  - add debug-only env `SD_QCOM_ML_VAE_MHA_FORCE_HEADS` (no-host diagnostics)
 
 ## Result Summary
 
@@ -56,10 +58,13 @@
   - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_scan_nohattn_wt0/summary.md`
 - Full grid scan (`arith x softmax x bias`, 48 configs):
   - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_scan_nohattn_fullgrid/summary.md`
+- Force-head scan (`heads=1/2/4/8/16/32/64`):
+  - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_force_heads_scan/summary.md`
 - Observed patterns:
   - Most configs: non-finite output + fallback
   - `MHA_WT=0` family: CLML MHA creation assert/abort (`clCreateMLOpMultiHeadAttentionForwardQCOM` failure, code -1102)
   - Full-grid statistics: `0/48` usable (`36/48` create-fail, `12/48` runtime non-finite)
+  - Force-head statistics: `0/7` usable (all runtime non-finite)
   - FP32 model attempt: fails earlier in CLML op creation (GroupNorm path), not a valid workaround
   - No tested no-host config reached stable finite output in this round
 

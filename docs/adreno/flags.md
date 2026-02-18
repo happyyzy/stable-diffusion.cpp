@@ -41,6 +41,7 @@ Rule:
 | `SD_QCOM_ML_VAE_MHA_WT` | unset | Override native qcom_ml MHA weight transform (`0:none,1:transpose`) | Step24 (diagnostic) |
 | `SD_QCOM_ML_VAE_MHA_NO_ATTN_BIAS` | `0` | Disable q/k/v projection bias in native MHA path for scan | Step24 (diagnostic) |
 | `SD_QCOM_ML_VAE_MHA_NO_OUT_BIAS` | `0` | Disable out projection bias in native MHA path for scan | Step24 (diagnostic) |
+| `SD_QCOM_ML_VAE_MHA_FORCE_HEADS` | unset | Debug-only: force native MHA head count when divisible by channel size | Step24 (diagnostic) |
 
 ## CLI switches (used in Step20/21)
 

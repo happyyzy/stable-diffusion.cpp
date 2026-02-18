@@ -1484,6 +1484,13 @@ MLTensor Decoder::createAttentionBlockOps(
             param_filename_prefix + "_proj_out_weight",
             param_filename_prefix + "_proj_out_bias");
     } else {
+        cl_uint mha_num_heads = num_attn_heads;
+        int forced_heads = 0;
+        if (env_parse_int("SD_QCOM_ML_VAE_MHA_FORCE_HEADS", &forced_heads) && forced_heads > 0 &&
+            channels % static_cast<cl_uint>(forced_heads) == 0) {
+            mha_num_heads = static_cast<cl_uint>(forced_heads);
+        }
+
         cl_arithmetic_mode_qcom mha_arith_mode = resolve_mha_arithmetic_mode(getModelArithmeticMode(m_desc.model_dtype));
         cl_softmax_mode_qcom mha_softmax_mode = resolve_mha_softmax_mode(CL_SOFTMAX_MODE_WIDTH_QCOM);
         cl_multi_head_attn_weights_transform_qcom mha_weight_transform =
@@ -1496,9 +1503,9 @@ MLTensor Decoder::createAttentionBlockOps(
             layer_input,
             layer_input,
             {
-                num_attn_heads,
-                channels / num_attn_heads,
-                channels / num_attn_heads,
+                mha_num_heads,
+                channels / mha_num_heads,
+                channels / mha_num_heads,
                 mha_softmax_mode,
                 mha_weight_transform,
                 false, // is_causal
