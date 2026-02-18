@@ -3262,14 +3262,21 @@ public:
             qcom_ml_seq_len = (latent->ne[0] * 2) * (latent->ne[1] * 2);
         }
         bool use_tiled_decode = false;
+        const char* env_host_attn = std::getenv("SD_QCOM_ML_VAE_HOST_ATTN");
+        const bool host_attn_enabled = (env_host_attn != nullptr && std::atoi(env_host_attn) != 0);
         if (qcom_ml_seq_len >= 16384) {
             const char* env_try_tiled = std::getenv("SD_QCOM_ML_VAE_TRY_TILED");
             use_tiled_decode          = (env_try_tiled != nullptr && std::atoi(env_try_tiled) != 0);
-            if (!use_tiled_decode) {
+            if (!use_tiled_decode && !host_attn_enabled) {
                 LOG_WARN("QCOM ML VAE decode: seq_len=%lld (effective=%lld) is not supported by default path. Falling back to ggml.",
                          (long long)seq_len,
                          (long long)qcom_ml_seq_len);
                 return false;
+            }
+            if (!use_tiled_decode && host_attn_enabled) {
+                LOG_INFO("QCOM ML VAE decode: seq_len=%lld (effective=%lld), using full decode with host attention fallback.",
+                         (long long)seq_len,
+                         (long long)qcom_ml_seq_len);
             }
         }
 

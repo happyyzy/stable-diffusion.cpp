@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cctype>
 #include <cmath>
+#include <dlfcn.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -101,7 +102,9 @@ struct CpuAttentionHostOpData {
     float scale = 1.0f;
     bool debug = false;
     bool use_opencl_backend = false;
+    bool use_mldrift_backend = false;
     bool profile_opencl_backend = false;
+    std::string mldrift_lib_dir;
 };
 
 struct OpenCLAttentionEngine {
@@ -500,6 +503,223 @@ static bool run_opencl_attention_backend(
     return true;
 }
 
+struct MldriftDispatchEngine {
+    using CreateFn = void* (*)(int, int, int, int, const char*);
+    using DestroyFn = void (*)(void*);
+    using InputBytesFn = size_t (*)(void*);
+    using OutputBytesFn = size_t (*)(void*);
+    using RunFn = int (*)(void*, const float*, const float*, const float*, float*);
+
+    struct ShapeContext {
+        int h = 0;
+        int m = 0;
+        int n = 0;
+        int k = 0;
+        void* ctx = nullptr;
+    };
+
+    bool initialized = false;
+    bool ready = false;
+    std::string lib_dir;
+    void* handle = nullptr;
+    CreateFn create_fn = nullptr;
+    DestroyFn destroy_fn = nullptr;
+    InputBytesFn input_bytes_fn = nullptr;
+    OutputBytesFn output_bytes_fn = nullptr;
+    RunFn run_fn = nullptr;
+    std::vector<ShapeContext> shape_ctx;
+};
+
+static MldriftDispatchEngine& get_mldrift_dispatch_engine() {
+    static MldriftDispatchEngine engine;
+    return engine;
+}
+
+static void release_mldrift_dispatch_engine(MldriftDispatchEngine* engine) {
+    if (engine == nullptr) {
+        return;
+    }
+    if (engine->destroy_fn != nullptr) {
+        for (auto& sc : engine->shape_ctx) {
+            if (sc.ctx != nullptr) {
+                engine->destroy_fn(sc.ctx);
+                sc.ctx = nullptr;
+            }
+        }
+    }
+    engine->shape_ctx.clear();
+    if (engine->handle != nullptr) {
+        dlclose(engine->handle);
+        engine->handle = nullptr;
+    }
+    engine->create_fn = nullptr;
+    engine->destroy_fn = nullptr;
+    engine->input_bytes_fn = nullptr;
+    engine->output_bytes_fn = nullptr;
+    engine->run_fn = nullptr;
+    engine->ready = false;
+    engine->initialized = false;
+}
+
+static bool init_mldrift_dispatch_engine(MldriftDispatchEngine* engine, const std::string& lib_dir) {
+    if (engine == nullptr) {
+        return false;
+    }
+    if (engine->initialized && engine->lib_dir == lib_dir) {
+        return engine->ready;
+    }
+
+    release_mldrift_dispatch_engine(engine);
+    engine->initialized = true;
+    engine->lib_dir = lib_dir;
+
+    const std::string so_path = lib_dir + "/libreplay_attention_dispatch.so";
+    engine->handle = dlopen(so_path.c_str(), RTLD_LAZY | RTLD_LOCAL);
+    if (engine->handle == nullptr) {
+        if (const char* err = dlerror()) {
+            std::fprintf(stderr, "[QCOM_ML_VAE][MLDRIFT_ATTN] dlopen failed: %s (%s)\n", so_path.c_str(), err);
+        }
+        return false;
+    }
+
+    engine->create_fn = reinterpret_cast<MldriftDispatchEngine::CreateFn>(
+        dlsym(engine->handle, "replay_attention_dispatch_create"));
+    engine->destroy_fn = reinterpret_cast<MldriftDispatchEngine::DestroyFn>(
+        dlsym(engine->handle, "replay_attention_dispatch_destroy"));
+    engine->input_bytes_fn = reinterpret_cast<MldriftDispatchEngine::InputBytesFn>(
+        dlsym(engine->handle, "replay_attention_dispatch_input_bytes"));
+    engine->output_bytes_fn = reinterpret_cast<MldriftDispatchEngine::OutputBytesFn>(
+        dlsym(engine->handle, "replay_attention_dispatch_output_bytes"));
+    engine->run_fn = reinterpret_cast<MldriftDispatchEngine::RunFn>(
+        dlsym(engine->handle, "replay_attention_dispatch_run"));
+
+    if (engine->create_fn == nullptr || engine->destroy_fn == nullptr ||
+        engine->input_bytes_fn == nullptr || engine->output_bytes_fn == nullptr ||
+        engine->run_fn == nullptr) {
+        std::fprintf(stderr, "[QCOM_ML_VAE][MLDRIFT_ATTN] missing replay dispatch symbols in %s\n", so_path.c_str());
+        release_mldrift_dispatch_engine(engine);
+        return false;
+    }
+
+    engine->ready = true;
+    return true;
+}
+
+static void* get_mldrift_shape_context(
+    MldriftDispatchEngine* engine,
+    int h,
+    int m,
+    int n,
+    int k) {
+    if (engine == nullptr || !engine->ready) {
+        return nullptr;
+    }
+    for (auto& sc : engine->shape_ctx) {
+        if (sc.h == h && sc.m == m && sc.n == n && sc.k == k) {
+            return sc.ctx;
+        }
+    }
+
+    void* ctx = engine->create_fn(h, m, n, k, engine->lib_dir.c_str());
+    if (ctx == nullptr) {
+        return nullptr;
+    }
+    MldriftDispatchEngine::ShapeContext sc;
+    sc.h = h;
+    sc.m = m;
+    sc.n = n;
+    sc.k = k;
+    sc.ctx = ctx;
+    engine->shape_ctx.push_back(sc);
+    return ctx;
+}
+
+static bool run_mldrift_attention_backend(
+    CpuAttentionHostOpData* data,
+    const std::vector<float>& q,
+    const std::vector<float>& k,
+    const std::vector<float>& v,
+    std::vector<float>* out) {
+    if (data == nullptr || out == nullptr || data->seq == 0 || data->channels == 0) {
+        return false;
+    }
+
+    static std::mutex mtx;
+    std::lock_guard<std::mutex> lock(mtx);
+    auto t0 = std::chrono::steady_clock::now();
+
+    MldriftDispatchEngine& engine = get_mldrift_dispatch_engine();
+    if (!init_mldrift_dispatch_engine(&engine, data->mldrift_lib_dir)) {
+        return false;
+    }
+
+    void* shape_ctx = get_mldrift_shape_context(
+        &engine,
+        static_cast<int>(data->num_heads),
+        static_cast<int>(data->seq),
+        static_cast<int>(data->seq),
+        static_cast<int>(data->head_dim));
+    if (shape_ctx == nullptr) {
+        return false;
+    }
+
+    const size_t elem_qkv = static_cast<size_t>(data->seq) * data->channels;
+    const size_t elem_batch = static_cast<size_t>(data->batch) * elem_qkv;
+    if (q.size() != elem_batch || k.size() != elem_batch || v.size() != elem_batch) {
+        return false;
+    }
+
+    const size_t expected_io_bytes = elem_qkv * sizeof(float);
+    if (engine.input_bytes_fn(shape_ctx) != expected_io_bytes ||
+        engine.output_bytes_fn(shape_ctx) != expected_io_bytes) {
+        return false;
+    }
+
+    float q_scale = data->scale;
+    if (const char* q_mul_env = std::getenv("SD_QCOM_ML_VAE_MLDRIFT_Q_SCALE_MUL")) {
+        if (q_mul_env[0] != '\0') {
+            q_scale *= static_cast<float>(std::atof(q_mul_env));
+        }
+    }
+    if (!std::isfinite(q_scale)) {
+        q_scale = data->scale;
+    }
+
+    out->assign(elem_batch, 0.0f);
+    std::vector<float> q_scaled(elem_qkv, 0.0f);
+    for (cl_uint b = 0; b < data->batch; ++b) {
+        const size_t b_off = static_cast<size_t>(b) * elem_qkv;
+        const float* q_ptr = q.data() + b_off;
+        if (q_scale != 1.0f) {
+            for (size_t i = 0; i < elem_qkv; ++i) {
+                q_scaled[i] = q_ptr[i] * q_scale;
+            }
+            q_ptr = q_scaled.data();
+        }
+        const int rc = engine.run_fn(
+            shape_ctx,
+            q_ptr,
+            k.data() + b_off,
+            v.data() + b_off,
+            out->data() + b_off);
+        if (rc != 0) {
+            return false;
+        }
+    }
+
+    if (data->profile_opencl_backend) {
+        auto t1 = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr,
+                     "[QCOM_ML_VAE][MLDRIFT_ATTN] seq=%u dim=%u heads=%u time=%.3fms\n",
+                     data->seq,
+                     data->channels,
+                     data->num_heads,
+                     ms);
+    }
+    return true;
+}
+
 static void upload_fp32_to_tensor(const MLTensor& tensor, const std::vector<float>& data) {
     const cl_ml_tensor_desc_qcom desc = tensor.getDesc();
     if (desc.data_type == CL_FLOAT) {
@@ -554,8 +774,11 @@ static std::unique_ptr<CpuAttentionHostOpData> create_cpu_attention_host_op_data
     data->debug = env_enabled("SD_QCOM_ML_VAE_HOST_ATTN_DEBUG");
     std::string backend;
     if (parse_backend_env("SD_QCOM_ML_VAE_HOST_ATTN_BACKEND", &backend)) {
+        data->use_mldrift_backend = (backend == "mldrift" || backend == "replay" || backend == "dispatch");
         data->use_opencl_backend = (backend == "ggml" || backend == "opencl" || backend == "ocl");
     }
+    const char* mldrift_dir = std::getenv("SD_QCOM_ML_VAE_MLDRIFT_LIB_DIR");
+    data->mldrift_lib_dir = (mldrift_dir != nullptr && mldrift_dir[0] != '\0') ? mldrift_dir : "/data/local/tmp/litert_bench";
     data->profile_opencl_backend = env_enabled("SD_QCOM_ML_VAE_HOST_ATTN_BACKEND_PROFILE");
     return data;
 }
@@ -573,6 +796,25 @@ static void run_cpu_attention_host_op(void* user_data) {
         std::vector<float> out_zeros(data->element_count, 0.0f);
         upload_fp32_to_tensor(data->out, out_zeros);
         return;
+    }
+
+    if (data->use_mldrift_backend) {
+        std::vector<float> out_mldrift;
+        if (run_mldrift_attention_backend(data, q, k, v, &out_mldrift)) {
+            if (data->debug) {
+                std::fprintf(stderr,
+                             "[QCOM_ML_VAE][HOST_ATTN] backend=mldrift batch=%u seq=%u channels=%u heads=%u\n",
+                             data->batch,
+                             data->seq,
+                             data->channels,
+                             data->num_heads);
+            }
+            upload_fp32_to_tensor(data->out, out_mldrift);
+            return;
+        }
+        if (data->debug) {
+            std::fprintf(stderr, "[QCOM_ML_VAE][HOST_ATTN] backend=mldrift failed, fallback=opencl/cpu\n");
+        }
     }
 
     if (data->use_opencl_backend) {
