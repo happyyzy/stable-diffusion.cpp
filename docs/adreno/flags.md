@@ -35,6 +35,12 @@ Rule:
 | `SD_QCOM_ML_VAE_HOST_ATTN_BACKEND_PROFILE` | `0` | Print backend attention timing breakdown for profiling | Step20 |
 | `SD_QCOM_ML_VAE_OPTIMIZE_MEM` | `0` | Enable optimize-device-memory model descriptor for qcom_ml bridge | Step22 |
 | `SD_QCOM_ML_VAE_PREPARE` | `1` | Pre-build qcom_ml graph before timed decode (set `0` to disable) | Step22 |
+| `SD_QCOM_ML_VAE_SANITIZE_NONFINITE` | `0` | Debug-only: clamp qcom_ml decode non-finite outputs to 0 instead of hard fail | Step24 (diagnostic) |
+| `SD_QCOM_ML_VAE_MHA_ARITH` | unset | Override native qcom_ml MHA arithmetic mode for no-host scans (`0/1/2`) | Step24 (diagnostic) |
+| `SD_QCOM_ML_VAE_MHA_SOFTMAX` | unset | Override native qcom_ml MHA softmax mode for no-host scans | Step24 (diagnostic) |
+| `SD_QCOM_ML_VAE_MHA_WT` | unset | Override native qcom_ml MHA weight transform (`0:none,1:transpose`) | Step24 (diagnostic) |
+| `SD_QCOM_ML_VAE_MHA_NO_ATTN_BIAS` | `0` | Disable q/k/v projection bias in native MHA path for scan | Step24 (diagnostic) |
+| `SD_QCOM_ML_VAE_MHA_NO_OUT_BIAS` | `0` | Disable out projection bias in native MHA path for scan | Step24 (diagnostic) |
 
 ## CLI switches (used in Step20/21)
 

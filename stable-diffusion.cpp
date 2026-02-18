@@ -3215,10 +3215,32 @@ public:
             return false;
         }
 
-        for (float v : out_f32) {
+        const bool sanitize_nonfinite = std::getenv("SD_QCOM_ML_VAE_SANITIZE_NONFINITE") != nullptr;
+        size_t nonfinite_count         = 0;
+        size_t first_nonfinite_idx     = 0;
+        float first_nonfinite_value    = 0.0f;
+        for (size_t i = 0; i < out_f32.size(); ++i) {
+            const float v = out_f32[i];
             if (!std::isfinite(v)) {
+                if (nonfinite_count == 0) {
+                    first_nonfinite_idx   = i;
+                    first_nonfinite_value = v;
+                }
+                ++nonfinite_count;
+                if (sanitize_nonfinite) {
+                    out_f32[i] = 0.0f;
+                }
+            }
+        }
+        if (nonfinite_count > 0) {
+            if (sanitize_nonfinite) {
+                LOG_WARN("QCOM ML VAE decode sanitized %zu non-finite values.", nonfinite_count);
+            } else {
                 if (err_msg_out != nullptr) {
-                    *err_msg_out = "non-finite output from qcom_ml decode";
+                    *err_msg_out = "non-finite output from qcom_ml decode (" +
+                                   std::to_string(nonfinite_count) + "/" + std::to_string(out_f32.size()) +
+                                   ", first_idx=" + std::to_string(first_nonfinite_idx) +
+                                   ", first_value=" + std::to_string(first_nonfinite_value) + ")";
                 }
                 return false;
             }

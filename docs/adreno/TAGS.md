@@ -63,6 +63,14 @@ This fork uses two tag classes:
 - `adreno-step01` ... `adreno-step18`
 - `adreno-step19-wip`
 
+## WIP source tags
+
+- `adreno-step24-wip`
+  - scope: Step24 diagnostic checkpoint (`<=2s` host-attn path verified; native no-host still blocked)
+  - expected artifacts:
+    - `exp_20260216_zimage_q40/step24_vae_512_opt/nohost_recheck_20260219.md`
+    - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_scan_nohattn_wt0/summary.md`
+
 ## Step20/21/22/23 status
 
 - Step20 passed (`<10s` VAE decode gate met).

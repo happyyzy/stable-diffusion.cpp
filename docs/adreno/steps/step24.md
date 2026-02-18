@@ -13,7 +13,9 @@
 - `stable-diffusion.cpp/stable-diffusion.cpp`
   - Optimize tensor copy/export/import in `sd_tensor_to_f32_vector()`, `sd_f32_vector_to_tensor()`, `sd_copy_tensor_values()`
   - Add contiguous fast-paths using bulk transfer (`ggml_backend_tensor_get/set/copy` or `memcpy`) to reduce per-element host overhead in `qcom_ml` VAE bridge path
-  - No behavior change to model math path
+  - Add no-host diagnostics for qcom_ml decode non-finite output:
+    - report `nonfinite_count/total`, first bad index/value in error message
+    - optional debug-only env `SD_QCOM_ML_VAE_SANITIZE_NONFINITE=1` to clamp bad values to zero for visualization
 
 ## Result Summary
 
@@ -41,12 +43,21 @@
 - Base no-host run:
   - `exp_20260216_zimage_q40/step24_vae_512_opt/run_step24opt_zimg_decodeonly_qcomml_nohattn.log`
   - still hits `non-finite output from qcom_ml decode` and falls back
+- Recheck with count-enabled binary:
+  - `exp_20260216_zimage_q40/step24_vae_512_opt/run_step24opt_zimg_decodeonly_qcomml_nohattn_count.log`
+  - explicit failure: `non-finite output from qcom_ml decode (786432/786432, first_idx=0, first_value=nan)`
+- Diagnostic sanitize run (not for acceptance):
+  - `exp_20260216_zimage_q40/step24_vae_512_opt/run_step24opt_zimg_decodeonly_qcomml_nohattn_sanitize2.log`
+  - image: `exp_20260216_zimage_q40/step24_vae_512_opt/step24opt_zimg_decodeonly_qcomml_nohattn_sanitize2.png`
+  - result: all outputs sanitized from non-finite; image unusable (near-black)
 - MHA knob scans:
   - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_scan_nohattn/summary.md`
   - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_scan_nohattn_ext/summary.md`
+  - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_scan_nohattn_wt0/summary.md`
 - Observed patterns:
   - Most configs: non-finite output + fallback
-  - Some configs: CLML MHA creation assert/abort (`clCreateMLOpMultiHeadAttentionForwardQCOM` failure)
+  - `MHA_WT=0` family: CLML MHA creation assert/abort (`clCreateMLOpMultiHeadAttentionForwardQCOM` failure, code -1102)
+  - FP32 model attempt: fails earlier in CLML op creation (GroupNorm path), not a valid workaround
   - No tested no-host config reached stable finite output in this round
 
 ## Status

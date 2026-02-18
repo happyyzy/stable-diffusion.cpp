@@ -199,13 +199,16 @@ Each step records the debug method and a before/after outcome (image quality or 
 
 ### Step 24 - Z-Image 512 qcom_ml VAE (`<=2s`) (In Progress)
 - Method (current round):
-  - optimize qcom_ml bridge host copies with contiguous bulk transfer fast-paths.
+  - optimize qcom_ml bridge host copies with contiguous bulk transfer fast-paths;
+  - add explicit no-host non-finite diagnostics for qcom_ml decode output.
 - Current best:
-  - decode-only log: `exp_20260216_zimage_q40/step24_vae_512_opt/run_step24opt_zimg_decodeonly_qcomml_hattn_final.log`
-  - `computing vae decode graph completed, taking 1.79s`
-  - image: `exp_20260216_zimage_q40/step24_vae_512_opt/step24opt_zimg_decodeonly_qcomml_hattn_final.png`
+  - decode-only log: `exp_20260216_zimage_q40/step24_vae_512_opt/run_step24opt_zimg_decodeonly_qcomml_hattn_recheck.log`
+  - `computing vae decode graph completed, taking 1.72s`
+  - image: `exp_20260216_zimage_q40/step24_vae_512_opt/step24opt_zimg_decodeonly_qcomml_hattn_recheck.png`
 - Blocker:
-  - strict no-host native qcom_ml attention remains unstable (non-finite fallback or MHA create failure).
+  - strict no-host native qcom_ml attention remains unstable:
+    - default no-host path: `786432/786432` outputs are non-finite (`nan`);
+    - `MHA_WT=0` family: MHA op creation fails (`code -1102`).
   - details: `docs/adreno/steps/step24.md`
 
 ## Tag Map
