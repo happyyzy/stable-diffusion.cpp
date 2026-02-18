@@ -138,6 +138,7 @@ Each step records the debug method and a before/after outcome (image quality or 
 - Objective (not yet passed): reduce z-image 1024 VAE decode on Adreno OpenCL to `<10s` with numeric/image correctness.
 - Current baseline (decode-only, same latent, `--vae-conv-direct`):
   - `33.29s` (`run_step20_vae_decode_ocl_convdirect_prof.log`)
+  - latest recheck `33.17s` (`run_step20opt7_vae_decode_ocl_convdirect_default.log`)
   - op-timing run `34.36s`, top op is `CONV_2D ~29.75s`.
 - Current bottleneck:
   - Conv2D dominates; major output shapes include:
@@ -145,13 +146,18 @@ Each step records the debug method and a before/after outcome (image quality or 
     - `1024x1024x128` (7x)
     - `256x256x512` (7x)
     - plus two very heavy singles: `512x512x512`, `1024x1024x256`.
+  - dtype resolved: hot Conv2D is consistently `src0=f16, src1=f32` (39 calls, total ~37.64s).
 - Negative controls:
   - no `conv_direct` path OOM (`~8.5GB` compute buffer request).
   - `--force-sdxl-vae-conv-scale`, `threads=8`, and f16 VAE weights alone did not materially reduce decode time.
+  - experimental tuned 3x3 tiles (`GGML_OPENCL_CONV2D_TUNED=1`) did not show material gain.
+  - `GGML_OPENCL_CONV2D_QCOM_ACCEL16=1` regressed decode to `41.24s`.
 - Artifacts:
   - `exp_20260216_zimage_q40/step20_vae_1024_opt/report_step20_baseline_20260218.md`
   - `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_conv_shape_summary.csv`
   - `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_conv_node_top20.csv`
+  - `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_conv_dtype_spec_summary.md`
+  - `exp_20260216_zimage_q40/step20_vae_1024_opt/report_step20_tuned_conv_20260218.md`
   - `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_image_diff_vs_host.md`
 
 ## Tag Map
