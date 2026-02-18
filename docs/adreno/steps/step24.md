@@ -65,6 +65,7 @@
   - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_desc_scan_v2/summary_note.md`
   - disconnect repro:
     - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_desc_scan_v2/repro_nohost_opt0_disconnect_status.txt`
+    - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_desc_scan_v2/repro_nohost_opt0_dbg.log`
 - Observed patterns:
   - Most configs: non-finite output + fallback
   - `MHA_WT=0` family: CLML MHA creation assert/abort (`clCreateMLOpMultiHeadAttentionForwardQCOM` failure, code -1102)
@@ -72,6 +73,7 @@
   - Force-head statistics: `0/7` usable (all runtime non-finite)
   - Descriptor v2 statistics:
     - `optimize_mem=0`: no-host run reaches `running in FLOW mode` then device disconnect (`adb_rc=255`, device missing)
+      - with bridge debug enabled, disconnect point is decoder graph build at `setModelOutputs begin`
     - `optimize_mem=1`: no-host run reproducibly returns all-NaN decode output (`786432/786432`) and falls back
   - FP32 model attempt: fails earlier in CLML op creation (GroupNorm path), not a valid workaround
   - No tested no-host config reached stable finite output in this round

@@ -213,6 +213,7 @@ Each step records the debug method and a before/after outcome (image quality or 
     - force-head scan (`1/2/4/8/16/32/64`): `0/7` usable (all non-finite).
     - descriptor scan v2 (`optimize_mem x recordable_queue x gmem`, fixed model dir):
       - `optimize_mem=0`: run hangs/disconnects right after `running in FLOW mode`
+        - bridge debug trace stops at decoder graph create `setModelOutputs begin`
       - `optimize_mem=1`: run is stable but still `786432/786432` non-finite + fallback
   - details: `docs/adreno/steps/step24.md`
 
