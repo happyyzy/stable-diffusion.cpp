@@ -71,6 +71,7 @@ This fork uses two tag classes:
   - expected artifacts:
     - `exp_20260216_zimage_q40/step24_vae_512_opt/nohost_recheck_20260219.md`
     - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_scan_nohattn_wt0/summary.md`
+    - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_scan_nohattn_fullgrid/summary.md`
 
 ## Step20/21/22/23 status
 

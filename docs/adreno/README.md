@@ -209,6 +209,7 @@ Each step records the debug method and a before/after outcome (image quality or 
   - strict no-host native qcom_ml attention remains unstable:
     - default no-host path: `786432/786432` outputs are non-finite (`nan`);
     - `MHA_WT=0` family: MHA op creation fails (`code -1102`).
+    - full-grid scan (`arith x softmax x bias`, 48 configs): `0/48` usable (`36` create-fail + `12` non-finite).
   - details: `docs/adreno/steps/step24.md`
 
 ## Tag Map
