@@ -19,6 +19,14 @@ This fork uses two tag classes:
   - submodule: ggml commit `788031c1` on `happyyzy/ggml` branch `adreno-step18-src`
   - artifacts: `exp_20260216_zimage_q40/step18_1024_flashon_mldrift/`
 
+- `adreno-step19-src`
+  - commit: tag target (Step19 accepted source snapshot on `work/main`)
+  - scope: z-image 1024 Step19 acceptance (`single-step <52s + finite`) with default `iofirst_chunk64` route
+  - submodule: ggml commit `4cbc58d2` on `happyyzy/ggml` branch `adreno-step19-src`
+  - artifacts:
+    - step1: `exp_20260216_zimage_q40/step19_1024_opt/qmul_scan_20260218c/run_iofirst_chunk64.log`
+    - 4-step host decode: `exp_20260216_zimage_q40/step19_1024_opt/step19_sub52_s4_hostdecode_20260218/`
+
 ## Index tags (legacy)
 
 - `adreno-step01` ... `adreno-step18`

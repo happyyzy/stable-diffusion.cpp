@@ -12,13 +12,14 @@ This fork is focused on Adreno OpenCL optimization and numerical debugging for Q
 |---|---:|---:|---:|
 | FLUX.2-klein 1024 flash-on (step forward bench) | 209.81 s/step | 31.256 s/step | 6.71x |
 | Z-Image 1024 step1 (true-native flash vs optimized mldrift path) | 341.70 s | 56.93 s | 6.00x |
+| Z-Image 1024 step1 (Step19 accepted finite path: iofirst_chunk64) | 341.70 s | 50.90 s | 6.71x |
 | FLUX.2-klein 512 full phone flow (ctx=256) | 98.16 s total | 59.39 s total | 1.65x |
 
 Notes:
 - Critical attention hot path has reached 10x-class improvement in some internal baselines during the debug process.
 - End-to-end gains vary by model, resolution, sequence length, and VAE path.
 
-## Step Records (GOAL 1-18)
+## Step Records (GOAL 1-19)
 
 Each step records the debug method and a before/after outcome (image quality or speed).
 
@@ -118,12 +119,28 @@ Each step records the debug method and a before/after outcome (image quality or 
   - step4 total `238.06 s` (`59.5 s/it`), step8 total `488.73 s` (`61.1 s/it`);
   - host-decoded images accepted as normal for current Step18 gate.
 
+### Step 19 - Z-Image 1024 Step1 <52s with Finite Output
+- Method:
+  - lock on `GGML_OPENCL_MLDRIFT_H30_IO_FIRST=1` route;
+  - selective Q4 GEMM stabilizer on refiner attention-out only:
+    `SD_OCL_Q4_GEMM_FP16_CHUNK_ACC_SUBSTR=context_refiner.0.attention.out.weight,noise_refiner.0.attention.out.weight`
+    + `SD_OCL_Q4_GEMM_FP16_CHUNK_ITERS=64`;
+  - compare all finite `<52s` candidates by 4-step latent -> host decode image quality gate.
+- Accepted result:
+  - single-step: `50.90s` (finite, `nan=0`) on `iofirst_chunk64`;
+  - reference log: `exp_20260216_zimage_q40/step19_1024_opt/qmul_scan_20260218c/run_iofirst_chunk64.log`;
+  - 4-step host decode artifact: `exp_20260216_zimage_q40/step19_1024_opt/step19_sub52_s4_hostdecode_20260218/step19_sub52_iofirst_chunk64_s4_host_decode.png`.
+- Notes:
+  - all finite `<52s` routes are in the same quality tier in current visual checks;
+  - runtime variance is strongly thermal/clock-state dependent, so 4-step average can be slower than cold single-step.
+
 ## Tag Map
 
 Tag policy:
 - Legacy index tags: `adreno-step01` ... `adreno-step18` (doc index only)
 - Canonical source tags (engineering): `adreno-stepXX-src`
   - first canonical source tag: `adreno-step18-src` (`b07d269`)
+  - current: `adreno-step19-src` (Step19 accepted source snapshot)
 
 Each tag is an annotated tag whose message includes:
 - debug method summary
