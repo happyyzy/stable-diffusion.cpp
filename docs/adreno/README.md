@@ -218,6 +218,8 @@ Tag policy:
 - Canonical source tags (engineering): `adreno-stepXX-src`
   - first canonical source tag: `adreno-step18-src` (`b07d269`)
   - current: `adreno-step23-src` (`3f57c76`, Step23 accepted source snapshot)
+- WIP checkpoint tag:
+  - `adreno-step24-wip` (Step24 diagnostics checkpoint, not an accepted gate tag)
 
 Each tag is an annotated tag whose message includes:
 - debug method summary
