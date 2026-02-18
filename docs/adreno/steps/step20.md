@@ -44,6 +44,7 @@ Artifacts:
 - `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_conv_shape_summary.csv`
 - `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_conv_node_top20.csv`
 - `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_conv_spec_summary_v2.csv`
+- `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_next_conv_targets.md`
 
 ## Control experiments
 
