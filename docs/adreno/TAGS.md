@@ -32,4 +32,9 @@ This fork uses two tag classes:
 - `adreno-step01` ... `adreno-step18`
 - `adreno-step19-wip`
 
+## Step20 status
+
+- Step20 is in progress (no acceptance tag yet).
+- Next canonical source tag will be `adreno-step20-src` only after `<10s` VAE decode + numeric/image gate is passed.
+
 See full detail: `docs/adreno/README.md`.

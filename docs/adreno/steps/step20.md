@@ -1,0 +1,61 @@
+# Step20 - Z-Image 1024 VAE Decode Optimization (WIP)
+
+Status: in progress (not passed)
+
+## Goal
+
+- z-image turbo, 1024 resolution, Adreno OpenCL VAE decode
+- target `<10s`
+- keep numeric/image correctness vs host decode baseline
+
+## Current baseline
+
+- decode-only, same latent, `--vae-conv-direct`, `threads=1`
+- decode time: `33.29s`
+- log: `exp_20260216_zimage_q40/step20_vae_1024_opt/run_step20_vae_decode_ocl_convdirect_prof.log`
+
+## Optrace / bottleneck
+
+- op timing run: `34.36s`
+- top op: `CONV_2D 29754.848 ms` (dominant bottleneck)
+- log: `exp_20260216_zimage_q40/step20_vae_1024_opt/run_step20_vae_decode_ocl_convdirect_optime.log`
+
+Per-op detail (`GGML_OPENCL_OP_TIMING_DETAIL=1`) shows the heaviest conv output shapes:
+
+- `ne=[512,512,256,1]` (7 calls, total `6588.674 ms`)
+- `ne=[1024,1024,128,1]` (7 calls, total `6571.885 ms`)
+- `ne=[256,256,512,1]` (7 calls, total `6439.028 ms`)
+- plus heavy singles:
+  - `ne=[512,512,512,1]` (`3672.878 ms`)
+  - `ne=[1024,1024,256,1]` (`3640.317 ms`)
+
+Artifacts:
+
+- `exp_20260216_zimage_q40/step20_vae_1024_opt/run_step20_vae_decode_optime_detail.log`
+- `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_conv_shape_summary.csv`
+- `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_conv_node_top20.csv`
+
+## Control experiments
+
+- no conv-direct path: OOM (requested ~8.5GB compute buffer)
+  - `exp_20260216_zimage_q40/step20_vae_1024_opt/run_step20_vae_decode_noconvdirect.log`
+- `--force-sdxl-vae-conv-scale`: `33.23s` (no material gain)
+- `threads=8`: `33.24s` (no material gain)
+- f16 VAE weights only: `34.45s` (no material gain)
+
+## Numeric / image check
+
+- decode images remain normal and close to host decode baseline
+- diff table:
+  - `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_image_diff_vs_host.md`
+
+## Code touch (instrumentation)
+
+- `ggml/src/ggml-opencl/ggml-opencl.cpp`
+  - add optional env gate `GGML_OPENCL_OP_TIMING_DETAIL=1`
+  - when `GGML_OPENCL_OP_TIMING=1` is enabled, print per-op timing detail:
+    - op type
+    - node name
+    - output shape (`ne`)
+
+This instrumentation is default-off and does not change runtime path unless env is enabled.

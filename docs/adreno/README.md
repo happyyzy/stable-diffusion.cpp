@@ -19,7 +19,7 @@ Notes:
 - Critical attention hot path has reached 10x-class improvement in some internal baselines during the debug process.
 - End-to-end gains vary by model, resolution, sequence length, and VAE path.
 
-## Step Records (GOAL 1-19)
+## Step Records (GOAL 1-20)
 
 Each step records the debug method and a before/after outcome (image quality or speed).
 
@@ -133,6 +133,26 @@ Each step records the debug method and a before/after outcome (image quality or 
 - Notes:
   - all finite `<52s` routes are in the same quality tier in current visual checks;
   - runtime variance is strongly thermal/clock-state dependent, so 4-step average can be slower than cold single-step.
+
+### Step 20 - Z-Image 1024 VAE Decode Optimization (WIP)
+- Objective (not yet passed): reduce z-image 1024 VAE decode on Adreno OpenCL to `<10s` with numeric/image correctness.
+- Current baseline (decode-only, same latent, `--vae-conv-direct`):
+  - `33.29s` (`run_step20_vae_decode_ocl_convdirect_prof.log`)
+  - op-timing run `34.36s`, top op is `CONV_2D ~29.75s`.
+- Current bottleneck:
+  - Conv2D dominates; major output shapes include:
+    - `512x512x256` (7x)
+    - `1024x1024x128` (7x)
+    - `256x256x512` (7x)
+    - plus two very heavy singles: `512x512x512`, `1024x1024x256`.
+- Negative controls:
+  - no `conv_direct` path OOM (`~8.5GB` compute buffer request).
+  - `--force-sdxl-vae-conv-scale`, `threads=8`, and f16 VAE weights alone did not materially reduce decode time.
+- Artifacts:
+  - `exp_20260216_zimage_q40/step20_vae_1024_opt/report_step20_baseline_20260218.md`
+  - `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_conv_shape_summary.csv`
+  - `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_conv_node_top20.csv`
+  - `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_image_diff_vs_host.md`
 
 ## Tag Map
 
