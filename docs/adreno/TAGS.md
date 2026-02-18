@@ -50,16 +50,25 @@ This fork uses two tag classes:
     - pass runs: `.../run_step22_flux2_1024_qcomml_t32_o0_v33_optmem_prepare.log`, `...v34...`, `...v35...`
     - image/metrics: `exp_20260218_klein_q40/step22_vae_1024_opt/repeatability_metrics.md`
 
+- `adreno-step23-src`
+  - commit: `3f57c76`
+  - scope: klein 1024 full decode qcom_ml host-attn(mldrift backend route) final gate (`<142s`)
+  - artifacts:
+    - full-chain pass: `exp_20260218_klein_q40/step23_full_decode_mldrift/run_step23_flux2_1024_s4_qcomml_mldfull3.log`
+    - image: `exp_20260218_klein_q40/step23_full_decode_mldrift/images/step23_flux2_klein_1024_s4_qcomml_mldfull3.png`
+    - detail: `exp_20260218_klein_q40/step23_full_decode_mldrift/README.md`
+
 ## Index tags (legacy)
 
 - `adreno-step01` ... `adreno-step18`
 - `adreno-step19-wip`
 
-## Step20/21/22 status
+## Step20/21/22/23 status
 
 - Step20 passed (`<10s` VAE decode gate met).
 - Step21 passed in rerun (`458.41s < 480s`).
 - Step22 passed (`7.98~8.68s < 10s` decode gate met).
-- canonical source tags should be maintained as `adreno-step20-src`, `adreno-step21-src`, `adreno-step22-src`.
+- Step23 passed (`129.73s < 142s`, full decode path).
+- canonical source tags should be maintained as `adreno-step20-src`, `adreno-step21-src`, `adreno-step22-src`, `adreno-step23-src`.
 
 See full detail: `docs/adreno/README.md`.

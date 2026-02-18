@@ -16,6 +16,7 @@ This fork is focused on Adreno OpenCL optimization and numerical debugging for Q
 | Z-Image 1024 full 8-step (Step21 rerun gate) | 493.39 s total | 458.41 s total | 1.08x |
 | FLUX.2-klein 512 full phone flow (ctx=256) | 98.16 s total | 59.39 s total | 1.65x |
 | FLUX.2-klein 1024 VAE decode-only (Step22, qcom_ml) | 32.80 s | 7.98 s | 4.11x |
+| Z-Image 512 VAE decode-only (Step24, qcom_ml host-attn) | 4.07 s | 1.79 s | 2.27x |
 
 Notes:
 - Critical attention hot path has reached 10x-class improvement in some internal baselines during the debug process.
@@ -186,13 +187,34 @@ Each step records the debug method and a before/after outcome (image quality or 
 - Full step log:
   - `docs/adreno/steps/step22.md`
 
+### Step 23 - Klein 1024 4-Step Final Gate (Passed)
+- Method:
+  - keep trunk on Step12 fast path;
+  - switch VAE to qcom_ml full decode route with host-attn mldrift backend integration.
+- Result:
+  - full-chain log: `exp_20260218_klein_q40/step23_full_decode_mldrift/run_step23_flux2_1024_s4_qcomml_mldfull3.log`
+  - `cond 0.784s + sample 118.86s + vae 9.84s = total 129.73s`
+  - gate passed (`129.73s < 142s`)
+  - image: `exp_20260218_klein_q40/step23_full_decode_mldrift/images/step23_flux2_klein_1024_s4_qcomml_mldfull3.png`
+
+### Step 24 - Z-Image 512 qcom_ml VAE (`<=2s`) (In Progress)
+- Method (current round):
+  - optimize qcom_ml bridge host copies with contiguous bulk transfer fast-paths.
+- Current best:
+  - decode-only log: `exp_20260216_zimage_q40/step24_vae_512_opt/run_step24opt_zimg_decodeonly_qcomml_hattn_final.log`
+  - `computing vae decode graph completed, taking 1.79s`
+  - image: `exp_20260216_zimage_q40/step24_vae_512_opt/step24opt_zimg_decodeonly_qcomml_hattn_final.png`
+- Blocker:
+  - strict no-host native qcom_ml attention remains unstable (non-finite fallback or MHA create failure).
+  - details: `docs/adreno/steps/step24.md`
+
 ## Tag Map
 
 Tag policy:
 - Legacy index tags: `adreno-step01` ... `adreno-step18` (doc index only)
 - Canonical source tags (engineering): `adreno-stepXX-src`
   - first canonical source tag: `adreno-step18-src` (`b07d269`)
-  - current: `adreno-step22-src` (`64545f6`, Step22 accepted source snapshot)
+  - current: `adreno-step23-src` (`3f57c76`, Step23 accepted source snapshot)
 
 Each tag is an annotated tag whose message includes:
 - debug method summary

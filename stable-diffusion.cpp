@@ -397,6 +397,34 @@ static bool sd_tensor_to_f32_vector(const ggml_tensor* tensor, std::vector<float
         return false;
     }
     const size_t elem_count = static_cast<size_t>(ne0) * ne1 * ne2 * ne3;
+    if (tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(tensor)) {
+        out.resize(elem_count);
+        const size_t nbytes = elem_count * sizeof(float);
+        if (tensor->buffer != nullptr) {
+            ggml_backend_tensor_get(tensor, out.data(), 0, nbytes);
+        } else if (tensor->data != nullptr) {
+            std::memcpy(out.data(), tensor->data, nbytes);
+        } else {
+            return false;
+        }
+        return true;
+    }
+    if (tensor->type == GGML_TYPE_F16 && ggml_is_contiguous(tensor)) {
+        std::vector<ggml_fp16_t> tmp(elem_count);
+        const size_t nbytes = elem_count * sizeof(ggml_fp16_t);
+        if (tensor->buffer != nullptr) {
+            ggml_backend_tensor_get(tensor, tmp.data(), 0, nbytes);
+        } else if (tensor->data != nullptr) {
+            std::memcpy(tmp.data(), tensor->data, nbytes);
+        } else {
+            return false;
+        }
+        out.resize(elem_count);
+        for (size_t i = 0; i < elem_count; ++i) {
+            out[i] = ggml_fp16_to_fp32(tmp[i]);
+        }
+        return true;
+    }
     out.resize(elem_count);
 
     size_t idx = 0;
@@ -424,6 +452,17 @@ static bool sd_f32_vector_to_tensor(const std::vector<float>& in, ggml_tensor* t
     if (in.size() != elem_count) {
         return false;
     }
+    if (tensor->type == GGML_TYPE_F32 && ggml_is_contiguous(tensor)) {
+        const size_t nbytes = elem_count * sizeof(float);
+        if (tensor->buffer != nullptr) {
+            ggml_backend_tensor_set(tensor, in.data(), 0, nbytes);
+        } else if (tensor->data != nullptr) {
+            std::memcpy(tensor->data, in.data(), nbytes);
+        } else {
+            return false;
+        }
+        return true;
+    }
     size_t idx = 0;
     for (int64_t i3 = 0; i3 < ne3; ++i3) {
         for (int64_t i2 = 0; i2 < ne2; ++i2) {
@@ -443,6 +482,17 @@ static bool sd_copy_tensor_values(const ggml_tensor* src, ggml_tensor* dst) {
     }
     if (src->ne[0] != dst->ne[0] || src->ne[1] != dst->ne[1] || src->ne[2] != dst->ne[2] || src->ne[3] != dst->ne[3]) {
         return false;
+    }
+    if (src->type == dst->type && ggml_is_contiguous(src) && ggml_is_contiguous(dst)) {
+        const size_t nbytes = ggml_nbytes(src);
+        if (src->buffer != nullptr || dst->buffer != nullptr) {
+            ggml_backend_tensor_copy(const_cast<ggml_tensor*>(src), dst);
+        } else if (src->data != nullptr && dst->data != nullptr) {
+            std::memcpy(dst->data, src->data, nbytes);
+        } else {
+            return false;
+        }
+        return true;
     }
     for (int64_t i3 = 0; i3 < src->ne[3]; ++i3) {
         for (int64_t i2 = 0; i2 < src->ne[2]; ++i2) {
