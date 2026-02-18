@@ -27,13 +27,23 @@ Per-op detail (`GGML_OPENCL_OP_TIMING_DETAIL=1`) shows the heaviest conv output 
 - `ne=[256,256,512,1]` (7 calls, total `6439.028 ms`)
 - plus heavy singles:
   - `ne=[512,512,512,1]` (`3672.878 ms`)
-  - `ne=[1024,1024,256,1]` (`3640.317 ms`)
+- `ne=[1024,1024,256,1]` (`3640.317 ms`)
+
+With v2 detail logging (includes src shapes), top conv specs are:
+
+- `w=[3,3,512,512], x=[256,256,512,1] -> y=[256,256,512,1]`
+- `w=[3,3,256,256], x=[512,512,256,1] -> y=[512,512,256,1]`
+- `w=[3,3,128,128], x=[1024,1024,128,1] -> y=[1024,1024,128,1]`
+- `w=[3,3,512,512], x=[512,512,512,1] -> y=[512,512,512,1]`
+- `w=[3,3,256,256], x=[1024,1024,256,1] -> y=[1024,1024,256,1]`
 
 Artifacts:
 
 - `exp_20260216_zimage_q40/step20_vae_1024_opt/run_step20_vae_decode_optime_detail.log`
+- `exp_20260216_zimage_q40/step20_vae_1024_opt/run_step20_vae_decode_optime_detail_v2.log`
 - `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_conv_shape_summary.csv`
 - `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_conv_node_top20.csv`
+- `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_conv_spec_summary_v2.csv`
 
 ## Control experiments
 
@@ -57,5 +67,6 @@ Artifacts:
     - op type
     - node name
     - output shape (`ne`)
+    - input/weight shapes (`src0_ne`, `src1_ne`)
 
 This instrumentation is default-off and does not change runtime path unless env is enabled.
