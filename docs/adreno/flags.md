@@ -30,7 +30,11 @@ Rule:
 | `SD_QCOM_ML_VAE_HOST_ATTN` | `0` | Enable host-attn fallback callback in qcom_ml route | Step20 |
 | `SD_QCOM_ML_VAE_HOST_ATTN_BACKEND` | `cpu` | Host-attn backend: `ggml|opencl|ocl|cpu` | Step20/21 |
 | `SD_QCOM_ML_VAE_TRY_TILED` | `0` | Enable tiled decode for large sequence VAE decode | Step20/21 |
+| `SD_QCOM_ML_VAE_TILE_SIZE` | `0` (auto) | Force tiled decode tile size | Step20/21/22 |
+| `SD_QCOM_ML_VAE_TILE_OVERLAP` | `0.5` (auto) | Force tiled decode overlap | Step20/21/22 |
 | `SD_QCOM_ML_VAE_HOST_ATTN_BACKEND_PROFILE` | `0` | Print backend attention timing breakdown for profiling | Step20 |
+| `SD_QCOM_ML_VAE_OPTIMIZE_MEM` | `0` | Enable optimize-device-memory model descriptor for qcom_ml bridge | Step22 |
+| `SD_QCOM_ML_VAE_PREPARE` | `1` | Pre-build qcom_ml graph before timed decode (set `0` to disable) | Step22 |
 
 ## CLI switches (used in Step20/21)
 
@@ -52,3 +56,13 @@ Use this exact set for Step21 gate replay:
 - `SD_QCOM_ML_VAE_TRY_TILED=1`
 - `SD_QCOM_ML_VAE_HOST_ATTN=1`
 - `SD_QCOM_ML_VAE_HOST_ATTN_BACKEND=ggml`
+
+## Step22 frozen preset (Klein 1024 VAE decode)
+
+- `SD_QCOM_ML_VAE_DIR=/data/local/tmp/sd_bench/qcom_ml_flux2_vae`
+- `SD_QCOM_ML_VAE_TRY_TILED=1`
+- `SD_QCOM_ML_VAE_TILE_SIZE=32`
+- `SD_QCOM_ML_VAE_TILE_OVERLAP=0`
+- `SD_QCOM_ML_VAE_HOST_ATTN=1`
+- `SD_QCOM_ML_VAE_HOST_ATTN_BACKEND=ggml`
+- `SD_QCOM_ML_VAE_OPTIMIZE_MEM=1`

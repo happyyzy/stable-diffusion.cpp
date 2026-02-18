@@ -51,13 +51,15 @@ bool QcomMlVaeBridge::init(const std::string& shared_lib_path, const QcomMlVaeCo
     m_lib_handle = dlopen(shared_lib_path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (m_lib_handle == nullptr) {
         if (err_msg != nullptr) {
-            *err_msg = dlerror() ? dlerror() : "dlopen failed";
+            const char* dl_err = dlerror();
+            *err_msg           = (dl_err != nullptr && dl_err[0] != '\0') ? dl_err : "dlopen failed";
         }
         return false;
     }
 
     m_create_fn  = reinterpret_cast<CreateFn>(dlsym(m_lib_handle, "sd_qcom_ml_vae_create"));
     m_decode_fn  = reinterpret_cast<DecodeFn>(dlsym(m_lib_handle, "sd_qcom_ml_vae_decode"));
+    m_prepare_fn = reinterpret_cast<PrepareFn>(dlsym(m_lib_handle, "sd_qcom_ml_vae_prepare"));
     m_destroy_fn = reinterpret_cast<DestroyFn>(dlsym(m_lib_handle, "sd_qcom_ml_vae_destroy"));
 
     if (m_create_fn == nullptr || m_decode_fn == nullptr || m_destroy_fn == nullptr) {
@@ -68,6 +70,7 @@ bool QcomMlVaeBridge::init(const std::string& shared_lib_path, const QcomMlVaeCo
         m_lib_handle = nullptr;
         m_create_fn  = nullptr;
         m_decode_fn  = nullptr;
+        m_prepare_fn = nullptr;
         m_destroy_fn = nullptr;
         return false;
     }
@@ -163,6 +166,51 @@ bool QcomMlVaeBridge::decode(const std::vector<float>& latent_nchw,
     if (rc != 0) {
         if (err_msg != nullptr) {
             *err_msg = err_buf[0] != '\0' ? err_buf : "sd_qcom_ml_vae_decode failed";
+        }
+        return false;
+    }
+    return true;
+#endif
+}
+
+bool QcomMlVaeBridge::prepare(int latent_w,
+                              int latent_h,
+                              int latent_c,
+                              int batch,
+                              std::string* err_msg) {
+#ifndef SD_USE_QCOM_ML_VAE
+    (void)latent_w;
+    (void)latent_h;
+    (void)latent_c;
+    (void)batch;
+    if (err_msg != nullptr) {
+        *err_msg = "SD_USE_QCOM_ML_VAE is OFF";
+    }
+    return false;
+#else
+    if (m_decode_fn == nullptr || m_ctx_handle == nullptr) {
+        if (err_msg != nullptr) {
+            *err_msg = "bridge is not initialized";
+        }
+        return false;
+    }
+    // Older bridge library may not export prepare symbol; treat as no-op success.
+    if (m_prepare_fn == nullptr) {
+        return true;
+    }
+
+    char err_buf[512];
+    std::memset(err_buf, 0, sizeof(err_buf));
+    const int rc = m_prepare_fn(m_ctx_handle,
+                                latent_w,
+                                latent_h,
+                                latent_c,
+                                batch,
+                                err_buf,
+                                static_cast<int>(sizeof(err_buf)));
+    if (rc != 0) {
+        if (err_msg != nullptr) {
+            *err_msg = err_buf[0] != '\0' ? err_buf : "sd_qcom_ml_vae_prepare failed";
         }
         return false;
     }

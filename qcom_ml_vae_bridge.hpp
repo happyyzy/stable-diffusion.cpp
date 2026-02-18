@@ -29,6 +29,12 @@ public:
                 std::string* err_msg,
                 bool* used_attn_fallback_16384);
 
+    bool prepare(int latent_w,
+                 int latent_h,
+                 int latent_c,
+                 int batch,
+                 std::string* err_msg);
+
     bool ready() const;
 
 private:
@@ -57,10 +63,18 @@ private:
                             int* used_attn_fallback_16384,
                             char* err_buf,
                             int err_buf_cap);
+    typedef int (*PrepareFn)(void* ctx,
+                             int latent_w,
+                             int latent_h,
+                             int latent_c,
+                             int batch,
+                             char* err_buf,
+                             int err_buf_cap);
     typedef void (*DestroyFn)(void* ctx);
 
     CreateFn  m_create_fn  = nullptr;
     DecodeFn  m_decode_fn  = nullptr;
+    PrepareFn m_prepare_fn = nullptr;
     DestroyFn m_destroy_fn = nullptr;
 };
 

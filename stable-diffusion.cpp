@@ -3255,13 +3255,20 @@ public:
         }
 
         const int64_t seq_len = latent->ne[0] * latent->ne[1];
+        // Flux2 decode uses packed latent (64x64x128) that is unpacked in bridge to 128x128x32.
+        // Use effective post-unpack sequence length for qcom_ml tiling decision.
+        int64_t qcom_ml_seq_len = seq_len;
+        if (sd_version_is_flux2(version) && latent->ne[2] == 128) {
+            qcom_ml_seq_len = (latent->ne[0] * 2) * (latent->ne[1] * 2);
+        }
         bool use_tiled_decode = false;
-        if (seq_len >= 16384) {
+        if (qcom_ml_seq_len >= 16384) {
             const char* env_try_tiled = std::getenv("SD_QCOM_ML_VAE_TRY_TILED");
             use_tiled_decode          = (env_try_tiled != nullptr && std::atoi(env_try_tiled) != 0);
             if (!use_tiled_decode) {
-                LOG_WARN("QCOM ML VAE decode: seq_len=%lld is not supported by default path. Falling back to ggml.",
-                         (long long)seq_len);
+                LOG_WARN("QCOM ML VAE decode: seq_len=%lld (effective=%lld) is not supported by default path. Falling back to ggml.",
+                         (long long)seq_len,
+                         (long long)qcom_ml_seq_len);
                 return false;
             }
         }
@@ -3289,8 +3296,8 @@ public:
             tile_size_x = std::min(tile_size_x, static_cast<int>(latent->ne[0]));
             tile_size_y = std::min(tile_size_y, static_cast<int>(latent->ne[1]));
 
-            LOG_INFO("QCOM ML VAE decode: tiled mode for seq_len=%lld, tile=%dx%d overlap=%.2f",
-                     (long long)seq_len, tile_size_x, tile_size_y, overlap);
+            LOG_INFO("QCOM ML VAE decode: tiled mode for seq_len=%lld (effective=%lld), tile=%dx%d overlap=%.2f",
+                     (long long)seq_len, (long long)qcom_ml_seq_len, tile_size_x, tile_size_y, overlap);
 
             bool tile_ok = true;
             std::string tile_err_msg;
@@ -3379,6 +3386,29 @@ public:
                                         H,
                                         C,
                                         x->ne[3]);
+        }
+        if (!use_tiny_autoencoder &&
+            vae_backend_type == SD_VAE_BACKEND_QCOM_ML &&
+            qcom_ml_vae_bridge.ready()) {
+            bool enable_prepare = true;
+            const char* env_prepare = std::getenv("SD_QCOM_ML_VAE_PREPARE");
+            if (env_prepare != nullptr && env_prepare[0] != '\0' && env_prepare[0] == '0') {
+                enable_prepare = false;
+            }
+            if (enable_prepare) {
+                int prep_w = static_cast<int>(x->ne[0]);
+                int prep_h = static_cast<int>(x->ne[1]);
+                int prep_c = static_cast<int>(x->ne[2]);
+                int prep_b = static_cast<int>(x->ne[3]);
+                if (sd_version_is_qwen_image(version)) {
+                    prep_b = prep_c * prep_b;
+                    prep_c = 1;
+                }
+                std::string prep_err;
+                if (!qcom_ml_vae_bridge.prepare(prep_w, prep_h, prep_c, prep_b, &prep_err)) {
+                    LOG_WARN("QCOM ML VAE prepare failed: %s", prep_err.c_str());
+                }
+            }
         }
         int64_t t0 = ggml_time_ms();
         bool decoded_with_qcom_ml = false;

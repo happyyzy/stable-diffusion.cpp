@@ -42,15 +42,24 @@ This fork uses two tag classes:
     - pass rerun: `exp_20260216_zimage_q40/step21_final_8step/run_step21_zimg_1024_s8_qcomml_rerun.log`
     - pass image: `exp_20260216_zimage_q40/step21_final_8step/step21_zimg_1024_s8_qcomml_rerun.png`
 
+- `adreno-step22-src`
+  - commit: tag target (Step22 accepted source snapshot on `work/main`)
+  - scope: klein 1024 qcom_ml VAE decode gate (`<10s`) with host-attn ggml backend + prepare path
+  - artifacts:
+    - decode baseline: `exp_20260218_klein_q40/step22_vae_1024_opt/run_step22_flux2_1024_qcomml_t32_o0_v30_optmem.log`
+    - pass runs: `.../run_step22_flux2_1024_qcomml_t32_o0_v33_optmem_prepare.log`, `...v34...`, `...v35...`
+    - image/metrics: `exp_20260218_klein_q40/step22_vae_1024_opt/repeatability_metrics.md`
+
 ## Index tags (legacy)
 
 - `adreno-step01` ... `adreno-step18`
 - `adreno-step19-wip`
 
-## Step20/21 status
+## Step20/21/22 status
 
 - Step20 passed (`<10s` VAE decode gate met).
 - Step21 passed in rerun (`458.41s < 480s`).
-- canonical source tags should be maintained as `adreno-step20-src`, `adreno-step21-src`.
+- Step22 passed (`7.98~8.68s < 10s` decode gate met).
+- canonical source tags should be maintained as `adreno-step20-src`, `adreno-step21-src`, `adreno-step22-src`.
 
 See full detail: `docs/adreno/README.md`.

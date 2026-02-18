@@ -15,12 +15,13 @@ This fork is focused on Adreno OpenCL optimization and numerical debugging for Q
 | Z-Image 1024 step1 (Step19 accepted finite path: iofirst_chunk64) | 341.70 s | 50.90 s | 6.71x |
 | Z-Image 1024 full 8-step (Step21 rerun gate) | 493.39 s total | 458.41 s total | 1.08x |
 | FLUX.2-klein 512 full phone flow (ctx=256) | 98.16 s total | 59.39 s total | 1.65x |
+| FLUX.2-klein 1024 VAE decode-only (Step22, qcom_ml) | 32.80 s | 7.98 s | 4.11x |
 
 Notes:
 - Critical attention hot path has reached 10x-class improvement in some internal baselines during the debug process.
 - End-to-end gains vary by model, resolution, sequence length, and VAE path.
 
-## Step Records (GOAL 1-21)
+## Step Records (GOAL 1-22)
 
 Each step records the debug method and a before/after outcome (image quality or speed).
 
@@ -167,6 +168,23 @@ Each step records the debug method and a before/after outcome (image quality or 
   - image `exp_20260216_zimage_q40/step21_final_8step/step21_zimg_1024_s8_qcomml_rerun.png`
 - Full step log:
   - `docs/adreno/steps/step21.md`
+
+### Step 22 - Klein 1024 VAE Decode Optimization (Passed)
+- Method:
+  - qcom_ml route keeps host-attn backend (`ggml`) and tiled decode (`tile=32/o0`);
+  - add qcom_ml graph `prepare` path to move first-create overhead out of timed decode;
+  - keep `optimize_device_mem` enabled for stable memory behavior.
+- Before:
+  - ggml decode reference: `32.80s`
+  - qcom_ml (no prepare): `11.22s`
+- After:
+  - qcom_ml + prepare repeat runs: `7.98s / 8.13s / 8.68s`
+  - image outputs stay normal and stable vs ggml reference
+  - logs/images/metrics:
+    - `exp_20260218_klein_q40/step22_vae_1024_opt/README.md`
+    - `exp_20260218_klein_q40/step22_vae_1024_opt/repeatability_metrics.md`
+- Full step log:
+  - `docs/adreno/steps/step22.md`
 
 ## Tag Map
 

@@ -670,6 +670,24 @@ static bool weight_file_exists(const std::string& prefix) {
     return false;
 }
 
+static bool decoder_debug_enabled() {
+    const char* v = std::getenv("SD_QCOM_ML_VAE_DEBUG");
+    return v != nullptr && v[0] != '\0' && v[0] != '0';
+}
+
+static void decoder_log(const char* fmt, ...) {
+    if (!decoder_debug_enabled()) {
+        return;
+    }
+    std::fprintf(stderr, "[QCOM_ML_VAE][DECODER] ");
+    va_list args;
+    va_start(args, fmt);
+    std::vfprintf(stderr, fmt, args);
+    va_end(args);
+    std::fprintf(stderr, "\n");
+    std::fflush(stderr);
+}
+
 /*******************************************************************************************************************************
 *   Decoder::Decoder
 *
@@ -704,19 +722,52 @@ std::vector<MLTensor> Decoder::create(
 {
     (void)(targets);
     assert(inputs.size() == 1 || !"Decoder expects one input tensor");
+    decoder_log("create entry inputs=%zu", inputs.size());
 
     // Set model input tensors
     setModelInputs(inputs);
+    decoder_log("setModelInputs done");
 
-    // Flux.1 AE decoder path:
-    // - latent channels: 16
-    // - no post_quant_conv node
+    // Flux-family AE decoder path:
+    // - legacy path: latent channels = 16 (no post_quant_conv)
+    // - flux2 path: latent channels = 32 (requires post_quant_conv 32->32)
     MLTensor layer_input = inputs[0];
+    const cl_uint input_channels = layer_input.getDims().c;
+    assert((input_channels == 16 || input_channels == 32) && "Decoder expects 16 or 32 latent channels");
+    decoder_log("create begin latent_c=%u w=%u h=%u n=%u",
+                input_channels,
+                layer_input.getDims().w,
+                layer_input.getDims().h,
+                layer_input.getDims().n);
 
-    // Decoder conv in
+    if (input_channels == 32) {
+        decoder_log("create post_quant_conv 32->32");
+        layer_input = createConvOp(
+            layer_input,
+            { 32, 32, 1, 1 }, // filter dims
+            {
+                CL_CONVOLUTION_MODE_CONVOLUTION_QCOM,
+                1, // group count
+                4, // num_dimensions
+                { 0, 0, 0 }, // padding before
+                { 0, 0, 0 }, // padding after
+                { 1, 1, 1 }, // stride
+                { 1, 1, 1 }, // dilation
+                0,  // bit field
+                getModelArithmeticMode(m_desc.model_dtype)
+            },
+            true, // If conv has bias
+            m_desc.pretrained_model_path + "post_quant_conv_weight",
+            m_desc.pretrained_model_path + "post_quant_conv_bias");
+        decoder_log("create post_quant_conv done");
+    }
+
+    // Decoder conv in (Flux: 16 channels, Flux2: 32 channels)
+    const cl_uint decoder_in_channels = layer_input.getDims().c;
+    decoder_log("create decoder_conv_in in_c=%u", decoder_in_channels);
     layer_input = createConvOp(
         layer_input,
-        { 512, 16, 3, 3 }, // filter dims
+        { 512, decoder_in_channels, 3, 3 }, // filter dims
         {
             CL_CONVOLUTION_MODE_CONVOLUTION_QCOM,
             1, // group count
@@ -731,8 +782,10 @@ std::vector<MLTensor> Decoder::create(
         true, // If conv has bias
         m_desc.pretrained_model_path + "decoder_conv_in_weight",
         m_desc.pretrained_model_path + "decoder_conv_in_bias");
+    decoder_log("create decoder_conv_in done");
 
     // Decoder mid block
+    decoder_log("create mid block");
     layer_input = createMidBlockOps(
         layer_input,
         512, // channels
@@ -742,6 +795,7 @@ std::vector<MLTensor> Decoder::create(
         32, // norm_groups,
         1, // num_attn_heads
         m_desc.pretrained_model_path + "decoder_mid");
+    decoder_log("create mid block done");
 
     // Decoder up blocks
     const cl_uint num_up_blocks                             = 4;
@@ -767,9 +821,11 @@ std::vector<MLTensor> Decoder::create(
             32, // norm_groups,
             i == (num_up_blocks - 1) ? false : true, // add_down_sample,
             up_block_prefixes[i]);
+        decoder_log("create up block %u done (out_c=%u)", i, layer_input.getDims().c);
     }
 
     // Output
+    decoder_log("create norm_out");
     layer_input = createGroupNormOp(
         layer_input,
         {
@@ -780,7 +836,9 @@ std::vector<MLTensor> Decoder::create(
         },
         m_desc.pretrained_model_path + "decoder_norm_out_weight",
         m_desc.pretrained_model_path + "decoder_norm_out_bias");
+    decoder_log("create norm_out done");
 
+    decoder_log("create silu");
     layer_input = createActivationOp(
         layer_input,
         {
@@ -790,7 +848,9 @@ std::vector<MLTensor> Decoder::create(
         },
         layer_input.getDims().c, // param_size
         ""); // param filename prefix
+    decoder_log("create silu done");
 
+    decoder_log("create decoder_conv_out");
     layer_input = createConvOp(
         layer_input,
         { 3, 128, 3, 3 }, // filter dims
@@ -808,13 +868,19 @@ std::vector<MLTensor> Decoder::create(
         true, // If conv has bias
         m_desc.pretrained_model_path + "decoder_conv_out_weight",
         m_desc.pretrained_model_path + "decoder_conv_out_bias",
-        true); // defer_output_mem
+        false); // allocate output buffer immediately (avoid late allocation instability on some drivers)
+    decoder_log("create decoder_conv_out done");
 
     // Set the model output
+    decoder_log("setModelOutputs begin");
     setModelOutputs({ layer_input });
+    decoder_log("setModelOutputs done");
 
     // Returns model output
-    return getModelOutputs();
+    decoder_log("getModelOutputs begin");
+    std::vector<MLTensor> outputs = getModelOutputs();
+    decoder_log("getModelOutputs done size=%zu", outputs.size());
+    return outputs;
 }
 
 /*******************************************************************************************************************************
