@@ -28,14 +28,14 @@ This fork uses two tag classes:
     - 4-step host decode: `exp_20260216_zimage_q40/step19_1024_opt/step19_sub52_s4_hostdecode_20260218/`
 
 - `adreno-step20-src`
-  - commit: tag target (Step20 accepted source snapshot on `work/main`)
+  - commit: `4e7167f`
   - scope: qcom_ml VAE host-attn OpenCL backend path, z-image 1024 decode `<10s`
   - artifacts:
     - decode log: `exp_20260216_zimage_q40/step20_vae_1024_opt/run_step20_qcomml_1024_hostattn_backendggml_t40_o0.log`
     - decode image: `exp_20260216_zimage_q40/step20_vae_1024_opt/step20_hostattn_backendggml_t40_o0.png`
 
 - `adreno-step21-src`
-  - commit: tag target (Step21 accepted source snapshot on `work/main`)
+  - commit: `4e7167f`
   - scope: z-image 1024 8-step final gate (`<480s`) on Step19+Step20 combined path
   - artifacts:
     - attempt-1: `exp_20260216_zimage_q40/step21_final_8step/run_step21_zimg_1024_s8_qcomml.log`
