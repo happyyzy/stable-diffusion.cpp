@@ -123,3 +123,22 @@ Use this exact set for Step21 gate replay:
   - `SD_FLUX2_KLEIN_MAX_LENGTH=256` + `--llm-forward-only --llm-forward-dump /data/local/tmp/sd_bench/step28_edit_cond256.tensor`
 - gate run condition input:
   - `--cond-crossattn /data/local/tmp/sd_bench/step28_edit_cond256.tensor`
+
+## Step29 frozen preset (Flux2 Klein 512 edit, 2 refs, <=100s)
+
+- trunk:
+  - `GGML_OPENCL_USE_ADRENO_KERNELS=1`
+  - `GGML_OPENCL_SOA_Q=1`
+  - `GGML_OPENCL_MLDRIFT=1`
+  - `GGML_OPENCL_MLDRIFT_DYNAMIC_4352=1`
+  - `--diffusion-fa`
+- qcom_ml vae:
+  - `SD_QCOM_ML_VAE_DIR=/data/local/tmp/sd_bench/qcom_ml_flux2_vae`
+  - `SD_QCOM_ML_VAE_DISABLE_MNN_ATTN=1`
+  - `SD_QCOM_ML_VAE_FALLBACK_ATTN_16384=1`
+  - `SD_QCOM_ML_VAE_OPTIMIZE_MEM=1`
+  - `SD_QCOM_ML_VAE_PREPARE=1`
+- condition:
+  - `--cond-crossattn /data/local/tmp/sd_bench/step28_edit_cond256.tensor`
+- 2-ref gate-specific option:
+  - `--disable-auto-resize-ref-image`

@@ -25,7 +25,7 @@ Notes:
 - Critical attention hot path has reached 10x-class improvement in some internal baselines during the debug process.
 - End-to-end gains vary by model, resolution, sequence length, and VAE path.
 
-## Step Records (GOAL 1-28)
+## Step Records (GOAL 1-29)
 
 Each step records the debug method and a before/after outcome (image quality or speed).
 
@@ -283,13 +283,29 @@ Each step records the debug method and a before/after outcome (image quality or 
 - Full step log:
   - `docs/adreno/steps/step28.md`
 
+### Step 29 - Flux2 Klein 512 Edit (2 refs) Final Gate (`<=100s`) (Passed)
+- Method:
+  - keep Step15-style mldrift trunk + qcom_ml VAE;
+  - use two reference images with precomputed cond256;
+  - enable `SD_QCOM_ML_VAE_OPTIMIZE_MEM=1` + `SD_QCOM_ML_VAE_PREPARE=1`;
+  - run with `--disable-auto-resize-ref-image` to remove same-size ref resize overhead.
+- Baseline (auto-resize on, not pass):
+  - log: `exp_20260218_klein_q40/step29_edit_512_2ref/run_step29_klein_512_2ref_s4_cond256_fa.log`
+  - `sampling 89.45s`, `total 100.21s`
+- Accepted run:
+  - log: `exp_20260218_klein_q40/step29_edit_512_2ref/run_step29_klein_512_2ref_s4_cond256_fa_noresize512_optmem.log`
+  - `sampling 89.24s`, `decode 2.61s`, `total 98.93s`
+  - image: `exp_20260218_klein_q40/step29_edit_512_2ref/step29_klein_512_2ref_s4_cond256_fa_noresize512_optmem.png`
+- Full step log:
+  - `docs/adreno/steps/step29.md`
+
 ## Tag Map
 
 Tag policy:
 - Legacy index tags: `adreno-step01` ... `adreno-step18` (doc index only)
 - Canonical source tags (engineering): `adreno-stepXX-src`
   - first canonical source tag: `adreno-step18-src` (`b07d269`)
-  - current: `adreno-step28-src` (Step28 accepted source snapshot)
+  - current: `adreno-step29-src` (Step29 accepted source snapshot)
 - WIP checkpoint tag:
   - `adreno-step24-wip` (Step24 diagnostics checkpoint, not an accepted gate tag)
 
