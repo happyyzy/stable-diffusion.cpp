@@ -105,7 +105,7 @@ This fork uses two tag classes:
     - pass image: `exp_20260218_klein_q40/step29_edit_512_2ref/step29_klein_512_2ref_s4_cond256_fa_noresize512_optmem.png`
 
 - `adreno-step30-src`
-  - commit: `2499f2a`
+  - commit: `a0df23b`
   - scope: fork documentation packaging + replay naming migration policy (work/main)
   - artifacts:
     - step report: `docs/adreno/steps/step30.md`
