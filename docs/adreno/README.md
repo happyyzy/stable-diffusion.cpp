@@ -17,12 +17,13 @@ This fork is focused on Adreno OpenCL optimization and numerical debugging for Q
 | FLUX.2-klein 512 full phone flow (ctx=256) | 98.16 s total | 59.39 s total | 1.65x |
 | FLUX.2-klein 1024 VAE decode-only (Step22, qcom_ml) | 32.80 s | 7.98 s | 4.11x |
 | Z-Image 512 VAE decode-only (Step24, qcom_ml host-attn) | 4.07 s | 1.79 s | 2.27x |
+| Z-Image 512 full 8-step final gate (Step25) | 104.90 s total | 95.99 s total | 1.09x |
 
 Notes:
 - Critical attention hot path has reached 10x-class improvement in some internal baselines during the debug process.
 - End-to-end gains vary by model, resolution, sequence length, and VAE path.
 
-## Step Records (GOAL 1-22)
+## Step Records (GOAL 1-25)
 
 Each step records the debug method and a before/after outcome (image quality or speed).
 
@@ -217,13 +218,30 @@ Each step records the debug method and a before/after outcome (image quality or 
       - `optimize_mem=1`: run is stable but still `786432/786432` non-finite + fallback
   - details: `docs/adreno/steps/step24.md`
 
+### Step 25 - Z-Image 512 8-Step Final Gate (`<100s`) (Passed)
+- Method:
+  - keep Step24 stable qcom_ml VAE route with host-attn backend `ggml`;
+  - keep Adreno Q4 trunk and force F32 activation-read only on attention out-proj path:
+    - `SD_OCL_Q4_GEMM_F32_ACT_NO_AUTO=1`
+    - `SD_OCL_Q4_GEMM_F32_ACT_SUBSTR=attention.out.weight`
+- Baseline (same stable host-attn route, no out-proj-only F32_ACT):
+  - log: `exp_20260216_zimage_q40/step25_final_512_8step/run_step25_zimg_512_s8_hostattn_ggml_short.log`
+  - sampling: `100.15s`, total: `104.90s` (not pass)
+- Accepted run:
+  - log: `exp_20260216_zimage_q40/step25_final_512_8step/run_step25_zimg_512_s8_outonly_hostattn_short_step25opt_new.log`
+  - timing: `condition 223ms + sampling 91.22s + vae 4.51s = total 95.99s`
+  - image: `exp_20260216_zimage_q40/step25_final_512_8step/step25_zimg_512_s8_outonly_hostattn_short_step25opt_new.png`
+  - gate passed (`95.99s < 100s`)
+- Full step log:
+  - `docs/adreno/steps/step25.md`
+
 ## Tag Map
 
 Tag policy:
 - Legacy index tags: `adreno-step01` ... `adreno-step18` (doc index only)
 - Canonical source tags (engineering): `adreno-stepXX-src`
   - first canonical source tag: `adreno-step18-src` (`b07d269`)
-  - current: `adreno-step24-src` (Step24 accepted source snapshot)
+  - current: `adreno-step25-src` (Step25 accepted source snapshot)
 - WIP checkpoint tag:
   - `adreno-step24-wip` (Step24 diagnostics checkpoint, not an accepted gate tag)
 

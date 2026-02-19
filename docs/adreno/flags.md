@@ -21,6 +21,8 @@ Rule:
 | `GGML_OPENCL_MLDRIFT_KV_KEEP_HEAD` | unset | Keep head slice of KV when cropping (`4352 -> 4224`) | Step18/21 |
 | `SD_OCL_Q4_GEMM_FP16_CHUNK_ACC_SUBSTR` | unset | Selective fp16 chunk-acc scope for q4 GEMM stability (by tensor name substring) | Step19/21 |
 | `SD_OCL_Q4_GEMM_FP16_CHUNK_ITERS` | unset | Chunk size for the selective q4 GEMM stabilization path | Step19/21 |
+| `SD_OCL_Q4_GEMM_F32_ACT_NO_AUTO` | unset | Disable auto heuristic and rely only on explicit F32 activation-read match list | Step25 |
+| `SD_OCL_Q4_GEMM_F32_ACT_SUBSTR` | unset | Enable selective Q4 GEMM F32 activation-read by tensor-name substring | Step25 |
 
 ## Runtime (qcom_ml VAE)
 
@@ -73,3 +75,13 @@ Use this exact set for Step21 gate replay:
 - `SD_QCOM_ML_VAE_HOST_ATTN=1`
 - `SD_QCOM_ML_VAE_HOST_ATTN_BACKEND=ggml`
 - `SD_QCOM_ML_VAE_OPTIMIZE_MEM=1`
+
+## Step25 frozen preset (Z-Image 512 8-step final gate)
+
+- `GGML_OPENCL_USE_ADRENO_KERNELS=1`
+- `GGML_OPENCL_SOA_Q=1`
+- `SD_QCOM_ML_VAE_DIR=/data/local/tmp/sd_bench/qcom_ml_zimage_ae`
+- `SD_QCOM_ML_VAE_HOST_ATTN=1`
+- `SD_QCOM_ML_VAE_HOST_ATTN_BACKEND=ggml`
+- `SD_OCL_Q4_GEMM_F32_ACT_NO_AUTO=1`
+- `SD_OCL_Q4_GEMM_F32_ACT_SUBSTR=attention.out.weight`
