@@ -85,3 +85,12 @@ Use this exact set for Step21 gate replay:
 - `SD_QCOM_ML_VAE_HOST_ATTN_BACKEND=ggml`
 - `SD_OCL_Q4_GEMM_F32_ACT_NO_AUTO=1`
 - `SD_OCL_Q4_GEMM_F32_ACT_SUBSTR=attention.out.weight`
+
+## Step26 frozen preset (Flux2 Klein 512 VAE decode-only)
+
+- `GGML_OPENCL_USE_ADRENO_KERNELS=1`
+- `GGML_OPENCL_SOA_Q=1`
+- `SD_QCOM_ML_VAE_DIR=/data/local/tmp/sd_bench/qcom_ml_flux2_vae`
+- no-host-attn native route:
+  - do not set `SD_QCOM_ML_VAE_HOST_ATTN`
+  - do not set `SD_QCOM_ML_VAE_HOST_ATTN_BACKEND`

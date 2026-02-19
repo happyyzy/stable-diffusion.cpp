@@ -16,6 +16,7 @@ This fork is focused on Adreno OpenCL optimization and numerical debugging for Q
 | Z-Image 1024 full 8-step (Step21 rerun gate) | 493.39 s total | 458.41 s total | 1.08x |
 | FLUX.2-klein 512 full phone flow (ctx=256) | 98.16 s total | 59.39 s total | 1.65x |
 | FLUX.2-klein 1024 VAE decode-only (Step22, qcom_ml) | 32.80 s | 7.98 s | 4.11x |
+| FLUX.2-klein 512 VAE decode-only (Step26, qcom_ml no-host) | 40.24 s | 0.74 s | 54.38x |
 | Z-Image 512 VAE decode-only (Step24, qcom_ml host-attn) | 4.07 s | 1.79 s | 2.27x |
 | Z-Image 512 full 8-step final gate (Step25) | 104.90 s total | 95.99 s total | 1.09x |
 
@@ -23,7 +24,7 @@ Notes:
 - Critical attention hot path has reached 10x-class improvement in some internal baselines during the debug process.
 - End-to-end gains vary by model, resolution, sequence length, and VAE path.
 
-## Step Records (GOAL 1-25)
+## Step Records (GOAL 1-26)
 
 Each step records the debug method and a before/after outcome (image quality or speed).
 
@@ -235,13 +236,29 @@ Each step records the debug method and a before/after outcome (image quality or 
 - Full step log:
   - `docs/adreno/steps/step25.md`
 
+### Step 26 - Flux2 Klein 512 qcom_ml VAE (`<=2s`) (Passed)
+- Method:
+  - keep qcom_ml VAE route, switch to native no-host-attn decode on Klein 512.
+- Baseline (qcom_ml + host-attn backend=ggml):
+  - log: `exp_20260218_klein_q40/step26_vae_512_opt/run_step26_flux2_512_decode_qcomml_hattn.log`
+  - decode: `40.24s`
+- Accepted run (no-host-attn):
+  - log: `exp_20260218_klein_q40/step26_vae_512_opt/run_step26_flux2_512_decode_qcomml_nohattn.log`
+  - decode: `0.74s` (pass)
+  - image: `exp_20260218_klein_q40/step26_vae_512_opt/step26_flux2_512_decode_qcomml_nohattn.png`
+- Numeric/image check:
+  - `nohost_vs_hattn: mae=0.219920, p99=1`
+  - `nohost_vs_hostcpu: mae=3.761077, p99=10`
+- Full step log:
+  - `docs/adreno/steps/step26.md`
+
 ## Tag Map
 
 Tag policy:
 - Legacy index tags: `adreno-step01` ... `adreno-step18` (doc index only)
 - Canonical source tags (engineering): `adreno-stepXX-src`
   - first canonical source tag: `adreno-step18-src` (`b07d269`)
-  - current: `adreno-step25-src` (Step25 accepted source snapshot)
+  - current: `adreno-step26-src` (Step26 accepted source snapshot)
 - WIP checkpoint tag:
   - `adreno-step24-wip` (Step24 diagnostics checkpoint, not an accepted gate tag)
 
