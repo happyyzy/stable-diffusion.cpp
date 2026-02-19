@@ -94,3 +94,14 @@ Use this exact set for Step21 gate replay:
 - no-host-attn native route:
   - do not set `SD_QCOM_ML_VAE_HOST_ATTN`
   - do not set `SD_QCOM_ML_VAE_HOST_ATTN_BACKEND`
+
+## Step27 frozen preset (Flux2 Klein 512 4-step final gate)
+
+- trunk:
+  - `GGML_OPENCL_USE_ADRENO_KERNELS=1`
+  - `GGML_OPENCL_SOA_Q=1`
+- qcom_ml vae:
+  - `SD_QCOM_ML_VAE_DIR=/data/local/tmp/sd_bench/qcom_ml_flux2_vae`
+  - no-host-attn native route (unset `SD_QCOM_ML_VAE_HOST_ATTN*`)
+- gate run uses precomputed condition tensor:
+  - `--cond-crossattn /data/local/tmp/sd_bench/host_llm_c_crossattn_256.tensor`
