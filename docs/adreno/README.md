@@ -302,7 +302,7 @@ Each step records the debug method and a before/after outcome (image quality or 
 - Full step log:
   - `docs/adreno/steps/step29.md`
 
-### Step 30 - Fork/PR Packaging (Docs + Naming Cleanup) (In Progress)
+### Step 30 - Fork/PR Packaging (Docs + Naming Cleanup) (Passed)
 - Goal:
   - make fork README/records more presentation-ready (performance and image evidence visible at top level);
   - prepare upstream-friendly branch (`pr/main`) with neutral naming and complete switch guidance.
@@ -316,6 +316,8 @@ Each step records the debug method and a before/after outcome (image quality or 
   - branch policy:
     - `work/main`: performance + debug traceability
     - `pr/main`: merge-oriented patch set (clean names, minimal knobs, no debug-only wording)
+  - pr/main clean-naming commit:
+    - `d822d2f` (`pr: switch to replay-only naming for attention and vae knobs`)
 
 ## Tag Map
 

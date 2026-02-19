@@ -1,4 +1,4 @@
-# Step30 - Fork Showcase + PR Packaging
+# Step30 - Fork Showcase + PR Packaging (Passed)
 
 ## Goal
 
@@ -19,7 +19,7 @@
 - Logbook index:
   - `docs/adreno/README.md`
     - GOAL range updated to 1-30.
-    - added Step30 packaging section and naming policy.
+    - Step30 packaging section promoted to passed state.
 - Step30 visual assets:
   - `docs/adreno/assets/step30/step30_case1_before.png`
   - `docs/adreno/assets/step30/step30_case1_after.png`
@@ -51,3 +51,6 @@
 
 - This step is repository packaging/documentation-focused; model kernels and acceptance numbers from Step27/28/29 remain unchanged.
 - Runtime naming migration is documented so scripts can move from `work/main` style to `pr/main` style without ambiguity.
+- Branch outputs:
+  - `work/main` snapshot commit: `2499f2a`
+  - `pr/main` clean naming commit: `d822d2f`

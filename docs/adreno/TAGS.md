@@ -104,6 +104,15 @@ This fork uses two tag classes:
     - pass log: `exp_20260218_klein_q40/step29_edit_512_2ref/run_step29_klein_512_2ref_s4_cond256_fa_noresize512_optmem.log`
     - pass image: `exp_20260218_klein_q40/step29_edit_512_2ref/step29_klein_512_2ref_s4_cond256_fa_noresize512_optmem.png`
 
+- `adreno-step30-src`
+  - commit: `2499f2a`
+  - scope: fork documentation packaging + replay naming migration policy (work/main)
+  - artifacts:
+    - step report: `docs/adreno/steps/step30.md`
+    - step assets: `docs/adreno/assets/step30/`
+  - paired pr/main clean commit:
+    - `d822d2f` (replay-only naming, no legacy mldrift env aliases in source path)
+
 ## Index tags (legacy)
 
 - `adreno-step01` ... `adreno-step18`
