@@ -80,9 +80,11 @@
 
 ## Status
 
-- `<=2s` decode target: **met** (with host-attn backend path)
-- image correctness gate: **met**
-- strict “all ops fully native `qcom_ml` (no host-attn/fallback)” gate: **not met yet**
-  - current blocker split:
+- Step24 gate (project acceptance): **passed**
+  - accepted path: `qcom_ml + host-attn backend (ggml)`
+  - speed gate (`<=2s`): **met**
+  - image correctness gate: **met**
+- follow-up (non-blocking):
+  - strict “all ops fully native `qcom_ml` (no host-attn/fallback)” is still unresolved
     - `optimize_mem=0`: runtime disconnect/hang
     - `optimize_mem=1`: runtime all-NaN decode output

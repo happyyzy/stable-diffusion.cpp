@@ -58,6 +58,17 @@ This fork uses two tag classes:
     - image: `exp_20260218_klein_q40/step23_full_decode_mldrift/images/step23_flux2_klein_1024_s4_qcomml_mldfull3.png`
     - detail: `exp_20260218_klein_q40/step23_full_decode_mldrift/README.md`
 
+- `adreno-step24-src`
+  - commit: `tag target on work/main` (Step24 acceptance snapshot)
+  - scope: z-image 512 qcom_ml VAE decode gate (`<=2s`) accepted on host-attn=ggml path
+  - artifacts:
+    - decode log: `exp_20260216_zimage_q40/step24_vae_512_opt/run_step24opt_zimg_decodeonly_qcomml_hattn_recheck.log`
+    - output image: `exp_20260216_zimage_q40/step24_vae_512_opt/step24opt_zimg_decodeonly_qcomml_hattn_recheck.png`
+    - reference image: `exp_20260216_zimage_q40/zimage_step17auto_s4_hostdecode.png`
+    - no-host blocker summary:
+      - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_desc_scan_v2/summary.md`
+      - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_desc_scan_v2/summary_note.md`
+
 ## Index tags (legacy)
 
 - `adreno-step01` ... `adreno-step18`
@@ -78,12 +89,13 @@ This fork uses two tag classes:
     - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_desc_scan_v2/repro_nohost_opt0_disconnect_status.txt`
     - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_desc_scan_v2/repro_nohost_opt0_dbg.log`
 
-## Step20/21/22/23 status
+## Step20/21/22/23/24 status
 
 - Step20 passed (`<10s` VAE decode gate met).
 - Step21 passed in rerun (`458.41s < 480s`).
 - Step22 passed (`7.98~8.68s < 10s` decode gate met).
 - Step23 passed (`129.73s < 142s`, full decode path).
-- canonical source tags should be maintained as `adreno-step20-src`, `adreno-step21-src`, `adreno-step22-src`, `adreno-step23-src`.
+- Step24 passed on accepted gate (`1.72s < 2s`, host-attn=ggml path; no-host native remains follow-up).
+- canonical source tags should be maintained as `adreno-step20-src`, `adreno-step21-src`, `adreno-step22-src`, `adreno-step23-src`, `adreno-step24-src`.
 
 See full detail: `docs/adreno/README.md`.

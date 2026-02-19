@@ -197,7 +197,7 @@ Each step records the debug method and a before/after outcome (image quality or 
   - gate passed (`129.73s < 142s`)
   - image: `exp_20260218_klein_q40/step23_full_decode_mldrift/images/step23_flux2_klein_1024_s4_qcomml_mldfull3.png`
 
-### Step 24 - Z-Image 512 qcom_ml VAE (`<=2s`) (In Progress)
+### Step 24 - Z-Image 512 qcom_ml VAE (`<=2s`) (Passed)
 - Method (current round):
   - optimize qcom_ml bridge host copies with contiguous bulk transfer fast-paths;
   - add explicit no-host non-finite diagnostics for qcom_ml decode output.
@@ -205,7 +205,7 @@ Each step records the debug method and a before/after outcome (image quality or 
   - decode-only log: `exp_20260216_zimage_q40/step24_vae_512_opt/run_step24opt_zimg_decodeonly_qcomml_hattn_recheck.log`
   - `computing vae decode graph completed, taking 1.72s`
   - image: `exp_20260216_zimage_q40/step24_vae_512_opt/step24opt_zimg_decodeonly_qcomml_hattn_recheck.png`
-- Blocker:
+- Follow-up (non-blocking):
   - strict no-host native qcom_ml attention remains unstable:
     - default no-host path: `786432/786432` outputs are non-finite (`nan`);
     - `MHA_WT=0` family: MHA op creation fails (`code -1102`).
@@ -223,7 +223,7 @@ Tag policy:
 - Legacy index tags: `adreno-step01` ... `adreno-step18` (doc index only)
 - Canonical source tags (engineering): `adreno-stepXX-src`
   - first canonical source tag: `adreno-step18-src` (`b07d269`)
-  - current: `adreno-step23-src` (`3f57c76`, Step23 accepted source snapshot)
+  - current: `adreno-step24-src` (Step24 accepted source snapshot)
 - WIP checkpoint tag:
   - `adreno-step24-wip` (Step24 diagnostics checkpoint, not an accepted gate tag)
 
