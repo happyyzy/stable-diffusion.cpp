@@ -59,7 +59,7 @@ This fork uses two tag classes:
     - detail: `exp_20260218_klein_q40/step23_full_decode_mldrift/README.md`
 
 - `adreno-step24-src`
-  - commit: `tag target on work/main` (Step24 acceptance snapshot)
+  - commit: `1c92f55`
   - scope: z-image 512 qcom_ml VAE decode gate (`<=2s`) accepted on host-attn=ggml path
   - artifacts:
     - decode log: `exp_20260216_zimage_q40/step24_vae_512_opt/run_step24opt_zimg_decodeonly_qcomml_hattn_recheck.log`
