@@ -19,6 +19,7 @@ Rule:
 | `GGML_OPENCL_MLDRIFT` | `0` | Enable mldrift attention route in OpenCL backend | Step19/21 |
 | `GGML_OPENCL_MLDRIFT_H30_IO_FIRST` | `0` | IO-first scheduling for h30 kernels (z-image 1024 path) | Step19/21 |
 | `GGML_OPENCL_MLDRIFT_KV_KEEP_HEAD` | unset | Keep head slice of KV when cropping (`4352 -> 4224`) | Step18/21 |
+| `SD_FLUX2_KLEIN_MAX_LENGTH` | unset | Override Flux2-Klein conditioner max token length (used to build prompt-matched cond256) | Step28 |
 | `SD_OCL_Q4_GEMM_FP16_CHUNK_ACC_SUBSTR` | unset | Selective fp16 chunk-acc scope for q4 GEMM stability (by tensor name substring) | Step19/21 |
 | `SD_OCL_Q4_GEMM_FP16_CHUNK_ITERS` | unset | Chunk size for the selective q4 GEMM stabilization path | Step19/21 |
 | `SD_OCL_Q4_GEMM_F32_ACT_NO_AUTO` | unset | Disable auto heuristic and rely only on explicit F32 activation-read match list | Step25 |
@@ -105,3 +106,20 @@ Use this exact set for Step21 gate replay:
   - no-host-attn native route (unset `SD_QCOM_ML_VAE_HOST_ATTN*`)
 - gate run uses precomputed condition tensor:
   - `--cond-crossattn /data/local/tmp/sd_bench/host_llm_c_crossattn_256.tensor`
+
+## Step28 frozen preset (Flux2 Klein 512 edit <=70s)
+
+- trunk:
+  - `GGML_OPENCL_USE_ADRENO_KERNELS=1`
+  - `GGML_OPENCL_SOA_Q=1`
+  - `GGML_OPENCL_MLDRIFT=1`
+  - `GGML_OPENCL_MLDRIFT_DYNAMIC_4352=1`
+  - `--diffusion-fa`
+- qcom_ml vae:
+  - `SD_QCOM_ML_VAE_DIR=/data/local/tmp/sd_bench/qcom_ml_flux2_vae`
+  - `SD_QCOM_ML_VAE_DISABLE_MNN_ATTN=1`
+  - `SD_QCOM_ML_VAE_FALLBACK_ATTN_16384=1`
+- prompt-specific cond256 build:
+  - `SD_FLUX2_KLEIN_MAX_LENGTH=256` + `--llm-forward-only --llm-forward-dump /data/local/tmp/sd_bench/step28_edit_cond256.tensor`
+- gate run condition input:
+  - `--cond-crossattn /data/local/tmp/sd_bench/step28_edit_cond256.tensor`

@@ -25,7 +25,7 @@ Notes:
 - Critical attention hot path has reached 10x-class improvement in some internal baselines during the debug process.
 - End-to-end gains vary by model, resolution, sequence length, and VAE path.
 
-## Step Records (GOAL 1-27)
+## Step Records (GOAL 1-28)
 
 Each step records the debug method and a before/after outcome (image quality or speed).
 
@@ -267,13 +267,29 @@ Each step records the debug method and a before/after outcome (image quality or 
 - Full step log:
   - `docs/adreno/steps/step27.md`
 
+### Step 28 - Flux2 Klein 512 Edit Final Gate (`<=70s`) (Passed)
+- Method:
+  - keep Step27 trunk + qcom_ml VAE route;
+  - generate prompt-specific cond256 (`SD_FLUX2_KLEIN_MAX_LENGTH=256`) and use `--cond-crossattn`;
+  - keep `--diffusion-fa` for edit trunk path.
+- Run1 (runtime cond, not pass):
+  - log: `exp_20260218_klein_q40/step28_edit_512_vae_opt/run_step28_edit_512_s4_qcomml_nohattn.log`
+  - `encode 3.53s + cond 1.730s + sample 65.64s + decode 3.97s = total 74.96s`
+- Run2 (accepted):
+  - cond build log: `exp_20260218_klein_q40/step28_edit_512_vae_opt/run_step28_llm_forward_cond256.log`
+  - gate log: `exp_20260218_klein_q40/step28_edit_512_vae_opt/run_step28_edit_512_s4_qcomml_nohattn_cond256_prompt_fa.log`
+  - `encode 3.54s + cond 1ms + sample 59.47s + decode 4.33s = total 67.36s`
+  - image: `exp_20260218_klein_q40/step28_edit_512_vae_opt/step28_edit_512_s4_qcomml_nohattn_cond256_prompt_fa.png`
+- Full step log:
+  - `docs/adreno/steps/step28.md`
+
 ## Tag Map
 
 Tag policy:
 - Legacy index tags: `adreno-step01` ... `adreno-step18` (doc index only)
 - Canonical source tags (engineering): `adreno-stepXX-src`
   - first canonical source tag: `adreno-step18-src` (`b07d269`)
-  - current: `adreno-step27-src` (Step27 accepted source snapshot)
+  - current: `adreno-step28-src` (Step28 accepted source snapshot)
 - WIP checkpoint tag:
   - `adreno-step24-wip` (Step24 diagnostics checkpoint, not an accepted gate tag)
 
