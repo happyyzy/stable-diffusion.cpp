@@ -52,5 +52,10 @@
 - This step is repository packaging/documentation-focused; model kernels and acceptance numbers from Step27/28/29 remain unchanged.
 - Runtime naming migration is documented so scripts can move from `work/main` style to `pr/main` style without ambiguity.
 - Branch outputs:
-  - `work/main` snapshot commit: `2499f2a`
+  - `work/main` snapshot commit: `adreno-step30-src` (current source tag target)
   - `pr/main` clean naming commit: `d822d2f`
+
+## Build Validation
+
+- `cmake --build build-host-zimage -j4 --target sd-cli` -> pass
+- `cmake --build build-android-ndk-step20qcom -j4 --target sd-cli` -> pass
