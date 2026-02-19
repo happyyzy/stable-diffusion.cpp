@@ -1,144 +1,135 @@
-# Adreno Runtime Flags (Step-tracked)
+# Adreno Runtime Flags (Fork + PR Mapping)
 
-This file tracks non-default knobs used in accepted Adreno steps.
+This document is the single entry for all Adreno-specific knobs introduced in this fork.
 
-Rule:
-- each accepted step records the exact flags it used;
-- this file keeps the consolidated map and the latest verified step.
+- `work/main`: keeps historical knobs for experiment replay.
+- `pr/main`: uses neutral names for upstream-facing patches.
+- If both old/new names exist, **new name wins**.
 
-## Build-time
+## 1) Build-Time
 
-| Flag | Default | Purpose | Verified in |
-|---|---|---|---|
-| `SD_USE_QCOM_ML_VAE` | `OFF` | Enable qcom_ml VAE bridge build and `--vae-backend qcom_ml` route | Step20/21 |
+| Flag | Default | Purpose |
+|---|---|---|
+| `SD_USE_QCOM_ML_VAE` | `OFF` | Build qcom-ml VAE bridge and enable `--vae-backend qcom_ml` |
 
-## Runtime (trunk / attention / q4)
+## 2) Runtime - Attention Fast Path
 
-| Flag | Default | Purpose | Verified in |
-|---|---|---|---|
-| `GGML_OPENCL_MLDRIFT` | `0` | Enable mldrift attention route in OpenCL backend | Step19/21 |
-| `GGML_OPENCL_MLDRIFT_H30_IO_FIRST` | `0` | IO-first scheduling for h30 kernels (z-image 1024 path) | Step19/21 |
-| `GGML_OPENCL_MLDRIFT_KV_KEEP_HEAD` | unset | Keep head slice of KV when cropping (`4352 -> 4224`) | Step18/21 |
-| `SD_FLUX2_KLEIN_MAX_LENGTH` | unset | Override Flux2-Klein conditioner max token length (used to build prompt-matched cond256) | Step28 |
-| `SD_OCL_Q4_GEMM_FP16_CHUNK_ACC_SUBSTR` | unset | Selective fp16 chunk-acc scope for q4 GEMM stability (by tensor name substring) | Step19/21 |
-| `SD_OCL_Q4_GEMM_FP16_CHUNK_ITERS` | unset | Chunk size for the selective q4 GEMM stabilization path | Step19/21 |
-| `SD_OCL_Q4_GEMM_F32_ACT_NO_AUTO` | unset | Disable auto heuristic and rely only on explicit F32 activation-read match list | Step25 |
-| `SD_OCL_Q4_GEMM_F32_ACT_SUBSTR` | unset | Enable selective Q4 GEMM F32 activation-read by tensor-name substring | Step25 |
+### Preferred names (`pr/main`)
 
-## Runtime (qcom_ml VAE)
+| Flag | Default | Purpose |
+|---|---|---|
+| `GGML_OPENCL_REPLAY_FA` | `0` | Enable Adreno replay flash-attention fast path |
+| `GGML_OPENCL_REPLAY_DYNAMIC_4352` | `0` | Enable dynamic M support (`M < 4352`, aligned shapes) |
+| `GGML_OPENCL_REPLAY_Q_SCALE_MUL` | `1.0` | Extra multiplier on Q scaling (numeric tuning) |
+| `GGML_OPENCL_REPLAY_NO_SCALE` | `0` | Disable Q scaling in replay path |
+| `GGML_OPENCL_REPLAY_NO_REORDER_OUT` | `0` | Skip output reorder and copy raw output buffer |
+| `GGML_OPENCL_REPLAY_INPUT_MAP` | unset | Debug override for q/k/v input buffer mapping |
+| `GGML_OPENCL_REPLAY_OUTPUT_BUF` | unset | Debug override for output source buffer |
+| `GGML_OPENCL_REPLAY_H30_IO_FIRST` | `0` | IO-first schedule for h30 kernels |
+| `GGML_OPENCL_REPLAY_H30_OP_SCHEDULE` | `0` | Replay-op schedule for h30 kernels |
+| `GGML_OPENCL_REPLAY_H30_SIMPLE_ORDER` | `0` | Force simple kernel order for h30 |
+| `GGML_OPENCL_REPLAY_KV_KEEP_HEAD` | unset | Keep head tokens in KV crop mode |
+| `GGML_OPENCL_REPLAY_KV_KEEP_TAIL` | unset | Keep tail tokens in KV crop mode |
+| `GGML_OPENCL_REPLAY_KV_CROP_TAIL` | `0` | Crop KV from tail instead of head |
+| `GGML_OPENCL_REPLAY_FORCE_FINISH` | `0` | Force `clFinish` after replay attention call |
 
-| Flag | Default | Purpose | Verified in |
-|---|---|---|---|
-| `SD_QCOM_ML_VAE_DIR` | unset | Model directory for qcom_ml VAE assets | Step20/21 |
-| `SD_QCOM_ML_VAE_HOST_ATTN` | `0` | Enable host-attn fallback callback in qcom_ml route | Step20 |
-| `SD_QCOM_ML_VAE_HOST_ATTN_BACKEND` | `cpu` | Host-attn backend: `ggml|opencl|ocl|cpu` | Step20/21 |
-| `SD_QCOM_ML_VAE_TRY_TILED` | `0` | Enable tiled decode for large sequence VAE decode | Step20/21 |
-| `SD_QCOM_ML_VAE_TILE_SIZE` | `0` (auto) | Force tiled decode tile size | Step20/21/22 |
-| `SD_QCOM_ML_VAE_TILE_OVERLAP` | `0.5` (auto) | Force tiled decode overlap | Step20/21/22 |
-| `SD_QCOM_ML_VAE_HOST_ATTN_BACKEND_PROFILE` | `0` | Print backend attention timing breakdown for profiling | Step20 |
-| `SD_QCOM_ML_VAE_OPTIMIZE_MEM` | `0` | Enable optimize-device-memory model descriptor for qcom_ml bridge | Step22 |
-| `SD_QCOM_ML_VAE_PREPARE` | `1` | Pre-build qcom_ml graph before timed decode (set `0` to disable) | Step22 |
-| `SD_QCOM_ML_VAE_SANITIZE_NONFINITE` | `0` | Debug-only: clamp qcom_ml decode non-finite outputs to 0 instead of hard fail | Step24 (diagnostic) |
-| `SD_QCOM_ML_VAE_MHA_ARITH` | unset | Override native qcom_ml MHA arithmetic mode for no-host scans (`0/1/2`) | Step24 (diagnostic) |
-| `SD_QCOM_ML_VAE_MHA_SOFTMAX` | unset | Override native qcom_ml MHA softmax mode for no-host scans | Step24 (diagnostic) |
-| `SD_QCOM_ML_VAE_MHA_WT` | unset | Override native qcom_ml MHA weight transform (`0:none,1:transpose`) | Step24 (diagnostic) |
-| `SD_QCOM_ML_VAE_MHA_NO_ATTN_BIAS` | `0` | Disable q/k/v projection bias in native MHA path for scan | Step24 (diagnostic) |
-| `SD_QCOM_ML_VAE_MHA_NO_OUT_BIAS` | `0` | Disable out projection bias in native MHA path for scan | Step24 (diagnostic) |
-| `SD_QCOM_ML_VAE_MHA_FORCE_HEADS` | unset | Debug-only: force native MHA head count when divisible by channel size | Step24 (diagnostic) |
+### Legacy compatibility (`work/main`)
 
-## CLI switches (used in Step20/21)
+- `GGML_OPENCL_MLDRIFT` -> `GGML_OPENCL_REPLAY_FA`
+- `GGML_OPENCL_MLDRIFT_DYNAMIC_4352` -> `GGML_OPENCL_REPLAY_DYNAMIC_4352`
+- `GGML_OPENCL_MLDRIFT_Q_SCALE_MUL` -> `GGML_OPENCL_REPLAY_Q_SCALE_MUL`
+- `GGML_OPENCL_MLDRIFT_NO_SCALE` -> `GGML_OPENCL_REPLAY_NO_SCALE`
+- `GGML_OPENCL_MLDRIFT_NO_REORDER_OUT` -> `GGML_OPENCL_REPLAY_NO_REORDER_OUT`
+- `GGML_OPENCL_MLDRIFT_INPUT_MAP` -> `GGML_OPENCL_REPLAY_INPUT_MAP`
+- `GGML_OPENCL_MLDRIFT_OUTPUT_BUF` -> `GGML_OPENCL_REPLAY_OUTPUT_BUF`
+- `GGML_OPENCL_MLDRIFT_H30_IO_FIRST` -> `GGML_OPENCL_REPLAY_H30_IO_FIRST`
+- `GGML_OPENCL_MLDRIFT_H30_OP_SCHEDULE` -> `GGML_OPENCL_REPLAY_H30_OP_SCHEDULE`
+- `GGML_OPENCL_MLDRIFT_H30_SIMPLE_ORDER` -> `GGML_OPENCL_REPLAY_H30_SIMPLE_ORDER`
+- `GGML_OPENCL_MLDRIFT_KV_KEEP_HEAD` -> `GGML_OPENCL_REPLAY_KV_KEEP_HEAD`
+- `GGML_OPENCL_MLDRIFT_KV_KEEP_TAIL` -> `GGML_OPENCL_REPLAY_KV_KEEP_TAIL`
+- `GGML_OPENCL_MLDRIFT_KV_CROP_TAIL` -> `GGML_OPENCL_REPLAY_KV_CROP_TAIL`
+- `GGML_OPENCL_MLDRIFT_FORCE_FINISH` -> `GGML_OPENCL_REPLAY_FORCE_FINISH`
+
+## 3) Runtime - Q4 Stability Controls
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `SD_OCL_Q4_GEMM_FP16_CHUNK_ACC_SUBSTR` | unset | Enable selective fp16 chunk-acc path by tensor-name substring |
+| `SD_OCL_Q4_GEMM_FP16_CHUNK_ITERS` | unset | Chunk-acc loop count for the above path |
+| `SD_OCL_Q4_GEMM_F32_ACT_NO_AUTO` | unset | Disable auto heuristic, use explicit tensor list only |
+| `SD_OCL_Q4_GEMM_F32_ACT_SUBSTR` | unset | Enable selective f32 activation-read by tensor-name substring |
+
+## 4) Runtime - QCOM-ML VAE
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `SD_QCOM_ML_VAE_DIR` | unset | qcom-ml model directory |
+| `SD_QCOM_ML_VAE_HOST_ATTN` | `0` | Enable host-attention callback path |
+| `SD_QCOM_ML_VAE_HOST_ATTN_BACKEND` | `cpu` | `ggml/opencl/cpu/replay` |
+| `SD_QCOM_ML_VAE_HOST_ATTN_BACKEND_PROFILE` | `0` | Print host-attention backend timing |
+| `SD_QCOM_ML_VAE_TRY_TILED` | `0` | Enable tiled decode |
+| `SD_QCOM_ML_VAE_TILE_SIZE` | `0`(auto) | Tile size override |
+| `SD_QCOM_ML_VAE_TILE_OVERLAP` | `0.5`(auto) | Tile overlap override |
+| `SD_QCOM_ML_VAE_OPTIMIZE_MEM` | `0` | Enable optimize-device-memory descriptor |
+| `SD_QCOM_ML_VAE_PREPARE` | `1` | Pre-build graph before timed decode |
+| `SD_QCOM_ML_VAE_DISABLE_MNN_ATTN` | `0` | Disable MNN attention path in bridge |
+| `SD_QCOM_ML_VAE_FALLBACK_ATTN_16384` | `0` | Allow fallback route for long-seq attention |
+| `SD_QCOM_ML_VAE_REPLAY_LIB_DIR` | `/data/local/tmp/litert_bench` | Replay dispatch shared library directory |
+| `SD_QCOM_ML_VAE_REPLAY_Q_SCALE_MUL` | `1.0` | q-scale multiplier for replay host-attn backend |
+
+### Legacy compatibility (`work/main`)
+
+- `SD_QCOM_ML_VAE_MLDRIFT_LIB_DIR` -> `SD_QCOM_ML_VAE_REPLAY_LIB_DIR`
+- `SD_QCOM_ML_VAE_MLDRIFT_Q_SCALE_MUL` -> `SD_QCOM_ML_VAE_REPLAY_Q_SCALE_MUL`
+- `SD_QCOM_ML_VAE_HOST_ATTN_BACKEND=mldrift` -> `replay`
+
+## 5) CLI Switches (Adreno paths)
 
 | Switch | Value | Purpose |
 |---|---|---|
-| `--vae-backend` | `qcom_ml` | Route VAE decode to qcom_ml bridge |
+| `--vae-backend` | `qcom_ml` | Route VAE decode to qcom-ml |
 | `--vae-conv-direct` | enabled | Use direct conv path in decode graph |
+| `--diffusion-fa` | enabled | Enable diffusion flash-attention route |
+| `--disable-auto-resize-ref-image` | enabled (edit 2-ref gate) | Keep reference input shape fixed |
 
-## Step21 frozen preset
+## 6) Accepted Presets
 
-Use this exact set for Step21 gate replay:
-
-- `GGML_OPENCL_MLDRIFT=1`
-- `GGML_OPENCL_MLDRIFT_H30_IO_FIRST=1`
-- `GGML_OPENCL_MLDRIFT_KV_KEEP_HEAD=4096`
-- `SD_OCL_Q4_GEMM_FP16_CHUNK_ACC_SUBSTR=context_refiner.0.attention.out.weight,noise_refiner.0.attention.out.weight`
-- `SD_OCL_Q4_GEMM_FP16_CHUNK_ITERS=64`
-- `SD_QCOM_ML_VAE_DIR=/data/local/tmp/sd_bench/qcom_ml_zimage_ae`
-- `SD_QCOM_ML_VAE_TRY_TILED=1`
-- `SD_QCOM_ML_VAE_HOST_ATTN=1`
-- `SD_QCOM_ML_VAE_HOST_ATTN_BACKEND=ggml`
-
-## Step22 frozen preset (Klein 1024 VAE decode)
-
-- `SD_QCOM_ML_VAE_DIR=/data/local/tmp/sd_bench/qcom_ml_flux2_vae`
-- `SD_QCOM_ML_VAE_TRY_TILED=1`
-- `SD_QCOM_ML_VAE_TILE_SIZE=32`
-- `SD_QCOM_ML_VAE_TILE_OVERLAP=0`
-- `SD_QCOM_ML_VAE_HOST_ATTN=1`
-- `SD_QCOM_ML_VAE_HOST_ATTN_BACKEND=ggml`
-- `SD_QCOM_ML_VAE_OPTIMIZE_MEM=1`
-
-## Step25 frozen preset (Z-Image 512 8-step final gate)
-
-- `GGML_OPENCL_USE_ADRENO_KERNELS=1`
-- `GGML_OPENCL_SOA_Q=1`
-- `SD_QCOM_ML_VAE_DIR=/data/local/tmp/sd_bench/qcom_ml_zimage_ae`
-- `SD_QCOM_ML_VAE_HOST_ATTN=1`
-- `SD_QCOM_ML_VAE_HOST_ATTN_BACKEND=ggml`
-- `SD_OCL_Q4_GEMM_F32_ACT_NO_AUTO=1`
-- `SD_OCL_Q4_GEMM_F32_ACT_SUBSTR=attention.out.weight`
-
-## Step26 frozen preset (Flux2 Klein 512 VAE decode-only)
-
-- `GGML_OPENCL_USE_ADRENO_KERNELS=1`
-- `GGML_OPENCL_SOA_Q=1`
-- `SD_QCOM_ML_VAE_DIR=/data/local/tmp/sd_bench/qcom_ml_flux2_vae`
-- no-host-attn native route:
-  - do not set `SD_QCOM_ML_VAE_HOST_ATTN`
-  - do not set `SD_QCOM_ML_VAE_HOST_ATTN_BACKEND`
-
-## Step27 frozen preset (Flux2 Klein 512 4-step final gate)
+### Step27 (Flux2 Klein 512 4-step `<40s`)
 
 - trunk:
   - `GGML_OPENCL_USE_ADRENO_KERNELS=1`
   - `GGML_OPENCL_SOA_Q=1`
-- qcom_ml vae:
+- qcom-ml:
   - `SD_QCOM_ML_VAE_DIR=/data/local/tmp/sd_bench/qcom_ml_flux2_vae`
-  - no-host-attn native route (unset `SD_QCOM_ML_VAE_HOST_ATTN*`)
-- gate run uses precomputed condition tensor:
+- cond:
   - `--cond-crossattn /data/local/tmp/sd_bench/host_llm_c_crossattn_256.tensor`
 
-## Step28 frozen preset (Flux2 Klein 512 edit <=70s)
+### Step28 (Flux2 Klein 512 edit `<70s`)
 
 - trunk:
   - `GGML_OPENCL_USE_ADRENO_KERNELS=1`
   - `GGML_OPENCL_SOA_Q=1`
-  - `GGML_OPENCL_MLDRIFT=1`
-  - `GGML_OPENCL_MLDRIFT_DYNAMIC_4352=1`
+  - `GGML_OPENCL_REPLAY_FA=1`
+  - `GGML_OPENCL_REPLAY_DYNAMIC_4352=1`
   - `--diffusion-fa`
-- qcom_ml vae:
+- qcom-ml:
   - `SD_QCOM_ML_VAE_DIR=/data/local/tmp/sd_bench/qcom_ml_flux2_vae`
   - `SD_QCOM_ML_VAE_DISABLE_MNN_ATTN=1`
   - `SD_QCOM_ML_VAE_FALLBACK_ATTN_16384=1`
-- prompt-specific cond256 build:
-  - `SD_FLUX2_KLEIN_MAX_LENGTH=256` + `--llm-forward-only --llm-forward-dump /data/local/tmp/sd_bench/step28_edit_cond256.tensor`
-- gate run condition input:
+- cond:
   - `--cond-crossattn /data/local/tmp/sd_bench/step28_edit_cond256.tensor`
 
-## Step29 frozen preset (Flux2 Klein 512 edit, 2 refs, <=100s)
+### Step29 (Flux2 Klein 512 edit 2-ref `<100s`)
 
-- trunk:
-  - `GGML_OPENCL_USE_ADRENO_KERNELS=1`
-  - `GGML_OPENCL_SOA_Q=1`
-  - `GGML_OPENCL_MLDRIFT=1`
-  - `GGML_OPENCL_MLDRIFT_DYNAMIC_4352=1`
-  - `--diffusion-fa`
-- qcom_ml vae:
-  - `SD_QCOM_ML_VAE_DIR=/data/local/tmp/sd_bench/qcom_ml_flux2_vae`
-  - `SD_QCOM_ML_VAE_DISABLE_MNN_ATTN=1`
-  - `SD_QCOM_ML_VAE_FALLBACK_ATTN_16384=1`
+- keep Step28 trunk and qcom-ml settings, plus:
   - `SD_QCOM_ML_VAE_OPTIMIZE_MEM=1`
   - `SD_QCOM_ML_VAE_PREPARE=1`
-- condition:
-  - `--cond-crossattn /data/local/tmp/sd_bench/step28_edit_cond256.tensor`
-- 2-ref gate-specific option:
   - `--disable-auto-resize-ref-image`
+
+## 7) Migration Rule for Scripts
+
+When moving scripts from `work/main` to `pr/main`:
+
+1. replace all `*MLDRIFT*` env names with `*REPLAY*`;
+2. replace `SD_QCOM_ML_VAE_HOST_ATTN_BACKEND=mldrift` with `replay`;
+3. keep old names only for historical replay logs, not for new benchmark scripts.

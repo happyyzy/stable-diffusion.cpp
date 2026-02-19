@@ -4,7 +4,10 @@ This fork is focused on Adreno OpenCL optimization and numerical debugging for Q
 
 - Scope: FLUX.2-klein, Z-Image, Qwen3-4B (Q4_0 GGUF)
 - Goal: keep the mainline PR set clean, while preserving full debug/benchmark traceability
-- Current emphasis: attention bottleneck replacement (mldrift path), race-condition fixes, step-wise numerical alignment
+- Current emphasis: attention bottleneck replacement (Replay Flash path), race-condition fixes, step-wise numerical alignment
+- Naming policy:
+  - `work/main` keeps historical names for experiment replay compatibility.
+  - `pr/main` uses neutral upstream-facing naming (`Replay Flash`, `QCOM-ML Fast VAE`), avoiding migration-source-specific wording.
 
 ## Headline Results
 
@@ -25,7 +28,7 @@ Notes:
 - Critical attention hot path has reached 10x-class improvement in some internal baselines during the debug process.
 - End-to-end gains vary by model, resolution, sequence length, and VAE path.
 
-## Step Records (GOAL 1-29)
+## Step Records (GOAL 1-30)
 
 Each step records the debug method and a before/after outcome (image quality or speed).
 
@@ -298,6 +301,21 @@ Each step records the debug method and a before/after outcome (image quality or 
   - image: `exp_20260218_klein_q40/step29_edit_512_2ref/step29_klein_512_2ref_s4_cond256_fa_noresize512_optmem.png`
 - Full step log:
   - `docs/adreno/steps/step29.md`
+
+### Step 30 - Fork/PR Packaging (Docs + Naming Cleanup) (In Progress)
+- Goal:
+  - make fork README/records more presentation-ready (performance and image evidence visible at top level);
+  - prepare upstream-friendly branch (`pr/main`) with neutral naming and complete switch guidance.
+- Deliverables:
+  - fork showcase docs:
+    - `README.md`
+    - `docs/adreno/README.md`
+    - `docs/adreno/flags.md`
+  - step report:
+    - `docs/adreno/steps/step30.md`
+  - branch policy:
+    - `work/main`: performance + debug traceability
+    - `pr/main`: merge-oriented patch set (clean names, minimal knobs, no debug-only wording)
 
 ## Tag Map
 

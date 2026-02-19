@@ -69,6 +69,41 @@ This fork uses two tag classes:
       - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_desc_scan_v2/summary.md`
       - `exp_20260216_zimage_q40/step24_vae_512_opt/mha_desc_scan_v2/summary_note.md`
 
+- `adreno-step25-src`
+  - commit: `93d77f2`
+  - scope: z-image 512 8-step final gate (`<100s`) pass snapshot
+  - artifacts:
+    - pass log: `exp_20260216_zimage_q40/step25_final_512_8step/run_step25_zimg_512_s8_outonly_hostattn_short_step25opt_new.log`
+    - pass image: `exp_20260216_zimage_q40/step25_final_512_8step/step25_zimg_512_s8_outonly_hostattn_short_step25opt_new.png`
+
+- `adreno-step26-src`
+  - commit: `36319bc`
+  - scope: flux2-klein 512 qcom_ml VAE decode-only gate (`<=2s`)
+  - artifacts:
+    - pass log: `exp_20260218_klein_q40/step26_vae_512_opt/run_step26_flux2_512_decode_qcomml_nohattn.log`
+    - pass image: `exp_20260218_klein_q40/step26_vae_512_opt/step26_flux2_512_decode_qcomml_nohattn.png`
+
+- `adreno-step27-src`
+  - commit: `67e8696`
+  - scope: flux2-klein 512 4-step final gate (`<40s`) pass snapshot
+  - artifacts:
+    - pass log: `exp_20260218_klein_q40/step27_final_512_4step_run2_cond256.log`
+    - pass image: `exp_20260218_klein_q40/step27_final_512_4step/step27_flux2_klein_512_s4_qcomml_nohattn_cond256.png`
+
+- `adreno-step28-src`
+  - commit: `69556ce`
+  - scope: flux2-klein 512 edit final gate (`<70s`) pass snapshot
+  - artifacts:
+    - pass log: `exp_20260218_klein_q40/step28_edit_512_vae_opt/run_step28_edit_512_s4_qcomml_nohattn_cond256_prompt_fa.log`
+    - pass image: `exp_20260218_klein_q40/step28_edit_512_vae_opt/step28_edit_512_s4_qcomml_nohattn_cond256_prompt_fa.png`
+
+- `adreno-step29-src`
+  - commit: `b5e4f68`
+  - scope: flux2-klein 512 edit 2-ref final gate (`<100s`) pass snapshot
+  - artifacts:
+    - pass log: `exp_20260218_klein_q40/step29_edit_512_2ref/run_step29_klein_512_2ref_s4_cond256_fa_noresize512_optmem.log`
+    - pass image: `exp_20260218_klein_q40/step29_edit_512_2ref/step29_klein_512_2ref_s4_cond256_fa_noresize512_optmem.png`
+
 ## Index tags (legacy)
 
 - `adreno-step01` ... `adreno-step18`
