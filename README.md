@@ -34,6 +34,7 @@ This fork is purpose-built for **Adreno 830 + Q4_0** deployment (FLUX.2-klein / 
 | FLUX.2-klein 1024 flash-on trunk | sampling (s/step) | 209.81 (native flash, same-source) | 31.256 | 6.71x | `docs/adreno/README.md` Step07 + Step10 |
 | Z-Image 1024 flash-on trunk | sampling (s/step) | 341.70 (true-native flash, same-source) | 50.90 | 6.71x | `docs/adreno/steps/step18.md` + `docs/adreno/steps/step19.md` |
 | Z-Image 1024 VAE decode-only | decode (s) | 36.88 (ggml conv-direct ref) | 9.25 | 3.99x | `exp_20260216_zimage_q40/step18_1024_flashon_mldrift/run_step18_native_s1_decode_only_oclvae.log` + `docs/adreno/steps/step20.md` |
+| Z-Image 1024 VAE decode-only (fastest probe, no-attn) | decode (s) | 36.88 (ggml conv-direct ref) | 8.47 | 4.35x | `exp_20260216_zimage_q40/step20_vae_1024_opt/run_step20_noattn_t40_o40.log` |
 | FLUX.2-klein 1024 VAE decode-only | decode (s) | 32.80 (ggml decode ref) | 5.25 | 6.25x | `docs/adreno/steps/step22.md` + `docs/adreno/steps/step23.md` |
 | FLUX.2-klein 512 VAE decode-only | decode (s) | 7.70 (ggml decode-stage ref) | 0.74 | 10.41x | `exp_20260219_localdream_auto/step31_klein_512/repro_server_loop/caseR_t8_convdirect/server_full.log` + `docs/adreno/steps/step26.md` |
 
