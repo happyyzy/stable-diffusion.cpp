@@ -33,9 +33,9 @@ This fork is purpose-built for **Adreno 830 + Q4_0** deployment (FLUX.2-klein / 
 |---|---|---:|---:|---:|---|
 | FLUX.2-klein 1024 flash-on trunk | sampling (s/step) | 209.81 (native flash, same-source) | 31.256 | 6.71x | `docs/adreno/README.md` Step07 + Step10 |
 | Z-Image 1024 flash-on trunk | sampling (s/step) | 341.70 (true-native flash, same-source) | 50.90 | 6.71x | `docs/adreno/steps/step18.md` + `docs/adreno/steps/step19.md` |
-| Z-Image 1024 VAE decode-only | decode (s) | 33.02 (ggml decode ref) | 9.25 | 3.57x | `docs/adreno/steps/step20.md` |
-| FLUX.2-klein 1024 VAE decode-only (full-decode final) | decode (s) | 32.80 (ggml decode ref) | 5.25 | 6.25x | `docs/adreno/steps/step23.md` |
-| FLUX.2-klein 512 VAE decode-only | decode (s) | 40.24 (qcom_ml + host-attn) | 0.74 | 54.38x | `docs/adreno/steps/step26.md` |
+| Z-Image 1024 VAE decode-only (Step20 gate) | decode (s) | GOAL `<10s` | 9.25 | pass | `docs/adreno/steps/step20.md` |
+| FLUX.2-klein 1024 VAE decode-only (Step22 gate) | decode (s) | GOAL `<10s` | 7.98 | pass | `docs/adreno/steps/step22.md` |
+| FLUX.2-klein 512 VAE decode-only (Step26 gate) | decode (s) | GOAL `<=2s` | 0.74 | pass | `docs/adreno/steps/step26.md` |
 
 ### Before / After (Real Step Artifacts)
 
