@@ -53,6 +53,15 @@ Status: passed (2026-02-19)
 - Image:
   - `exp_20260216_zimage_q40/step25_final_512_8step/step25_zimg_512_s8_hostattn_ggml_short.png`
 
+### Slow-path reference (used by headline delta table)
+
+- Log: `exp_20260216_zimage_q40/step25_final_512_8step/run_step25_zimg_512_s8_qcomml_t1_repro2.log`
+- Timing:
+  - sampling: `204.68s`
+  - total: `209.69s`
+- Note:
+  - this run hit qcom_ml non-finite fallback and is kept only as a worst-path reference point.
+
 ### Accepted (out-proj-only F32_ACT)
 
 - Log: `exp_20260216_zimage_q40/step25_final_512_8step/run_step25_zimg_512_s8_outonly_hostattn_short_step25opt_new.log`

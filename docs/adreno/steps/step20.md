@@ -10,6 +10,10 @@ Status: passed (2026-02-18, round-d)
 
 ## Current baseline
 
+- headline-table reference baseline:
+  - decode-only `36.88s`
+  - log: `exp_20260216_zimage_q40/step18_1024_flashon_mldrift/run_step18_native_s1_decode_only_oclvae.log`
+
 - decode-only, same latent, `--vae-conv-direct`, `threads=1`
 - decode time: `33.29s`
 - log: `exp_20260216_zimage_q40/step20_vae_1024_opt/run_step20_vae_decode_ocl_convdirect_prof.log`

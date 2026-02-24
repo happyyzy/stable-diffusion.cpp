@@ -40,6 +40,15 @@ Status: passed (2026-02-19)
 
 ## Results
 
+### Decode-only pair used by headline table
+
+- ggml reference decode:
+  - `32.80s`
+  - log: `exp_20260218_klein_q40/step22_vae_1024_opt/run_step22_flux2_1024_ggml_ref.log`
+- optimized decode:
+  - `5.25s`
+  - log: `exp_20260218_klein_q40/step23_full_decode_mldrift/run_decode_full_mldrift_1024_v3_all.log`
+
 - Baseline (no prepare):
   - `11.22s`
   - `exp_20260218_klein_q40/step22_vae_1024_opt/run_step22_flux2_1024_qcomml_t32_o0_v30_optmem.log`

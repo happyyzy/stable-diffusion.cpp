@@ -29,6 +29,13 @@ Status: passed (2026-02-19)
 
 ## Attempt history
 
+### Cross-step legacy baseline (used by headline delta table)
+
+- Source log: `exp_20260214_goal_restart/step15_edit_512_attn_opt/run_step15_edit_512_ref_flashon.log`
+- Timing:
+  - sampling: `256.24s`
+  - total: `269.91s`
+
 ### Run1 (runtime cond, image correct but超时)
 
 - log:

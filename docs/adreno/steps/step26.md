@@ -31,6 +31,12 @@ Status: passed (2026-02-19)
 
 ## Results
 
+### Decode-stage reference used by headline table
+
+- log: `exp_20260219_localdream_auto/step31_klein_512/repro_server_loop/caseR_t8_convdirect/server_full.log`
+- timing:
+  - VAE decode: `7.70s`
+
 ### Accepted path (native qcom_ml, no host-attn)
 
 - log: `exp_20260218_klein_q40/step26_vae_512_opt/run_step26_flux2_512_decode_qcomml_nohattn.log`

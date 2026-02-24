@@ -16,15 +16,15 @@ This fork is focused on Adreno OpenCL optimization and numerical debugging for Q
 | Scenario | Metric | Before (scope) | After | Gain | Evidence |
 |---|---|---:|---:|---:|---|
 | FLUX.2-klein 1024 flash-on trunk | sampling (s/step) | 209.81 (native flash, same-source) | 31.256 | 6.71x | Step07 + Step10 |
-| Z-Image 1024 flash-on trunk | sampling (s/step) | 341.70 (true-native flash) | 50.90 | 6.71x | `docs/adreno/steps/step18.md` + `docs/adreno/steps/step19.md` |
-| Z-Image 1024 VAE decode-only | decode (s) | 36.88 (ggml conv-direct ref) | 8.47 | 4.35x | `exp_20260216_zimage_q40/step18_1024_flashon_mldrift/run_step18_native_s1_decode_only_oclvae.log` + `exp_20260216_zimage_q40/step20_vae_1024_opt/run_step20_noattn_t40_o40.log` |
-| FLUX.2-klein 1024 VAE decode-only | decode (s) | 32.80 (ggml decode reference) | 5.25 | 6.25x | `docs/adreno/steps/step22.md` + `docs/adreno/steps/step23.md` |
-| FLUX.2-klein 512 VAE decode-only | decode (s) | 7.70 (ggml decode-stage reference) | 0.74 | 10.41x | `exp_20260219_localdream_auto/step31_klein_512/repro_server_loop/caseR_t8_convdirect/server_full.log` + `docs/adreno/steps/step26.md` |
-| Z-Image 512 VAE decode-only | decode (s) | 8.42 (qcom_ml no-host fallback reference) | 1.79 | 4.70x | `exp_20260216_zimage_q40/step24_vae_512_opt/run_step24opt_zimg_decodeonly_qcomml_nohattn.log` + `exp_20260216_zimage_q40/step24_vae_512_opt/run_step24opt_zimg_decodeonly_qcomml_hattn_final.log` |
+| Z-Image 1024 flash-on trunk | sampling (s/step) | 341.70 (true-native flash) | 50.90 | 6.71x | Step18 + Step19 |
+| Z-Image 1024 VAE decode-only | decode (s) | 36.88 (ggml conv-direct ref) | 8.47 | 4.35x | `docs/adreno/steps/step20.md` |
+| FLUX.2-klein 1024 VAE decode-only | decode (s) | 32.80 (ggml decode reference) | 5.25 | 6.25x | `docs/adreno/steps/step22.md` |
+| FLUX.2-klein 512 VAE decode-only | decode (s) | 7.70 (ggml decode-stage reference) | 0.74 | 10.41x | `docs/adreno/steps/step26.md` |
+| Z-Image 512 VAE decode-only | decode (s) | 8.42 (qcom_ml no-host fallback reference) | 1.79 | 4.70x | `docs/adreno/steps/step24.md` |
 | FLUX.2-klein 512 full 4-step gate | total (s) | 47.81 (runtime cond) | 38.06 (cond256 gate path) | 1.26x | `docs/adreno/steps/step27.md` |
-| FLUX.2-klein 512 edit gate | total (s) | 269.91 (legacy flash edit baseline) | 67.36 (Step28 cond256 + diffusion-fa gate) | 4.01x | `exp_20260214_goal_restart/step15_edit_512_attn_opt/run_step15_edit_512_ref_flashon.log` + `exp_20260218_klein_q40/step28_edit_512_vae_opt/run_step28_edit_512_s4_qcomml_nohattn_cond256_prompt_fa.log` |
-| FLUX.2-klein 512 edit (2 refs) gate | total (s) | 269.91 (legacy flash edit baseline) | 98.93 (Step29 no-resize + optmem/prepare gate) | 2.73x | `exp_20260214_goal_restart/step15_edit_512_attn_opt/run_step15_edit_512_ref_flashon.log` + `exp_20260218_klein_q40/step29_edit_512_2ref/run_step29_klein_512_2ref_s4_cond256_fa_noresize512_optmem.log` |
-| Z-Image 512 full 8-step gate | total (s) | 209.69 (slow-path repro) | 95.99 (Step25 accepted gate) | 2.18x | `exp_20260216_zimage_q40/step25_final_512_8step/run_step25_zimg_512_s8_qcomml_t1_repro2.log` + `exp_20260216_zimage_q40/step25_final_512_8step/run_step25_zimg_512_s8_outonly_hostattn_short_step25opt_new.log` |
+| FLUX.2-klein 512 edit gate | total (s) | 269.91 (legacy flash edit baseline) | 67.36 (Step28 cond256 + diffusion-fa gate) | 4.01x | `docs/adreno/steps/step28.md` |
+| FLUX.2-klein 512 edit (2 refs) gate | total (s) | 269.91 (legacy flash edit baseline) | 98.93 (Step29 no-resize + optmem/prepare gate) | 2.73x | `docs/adreno/steps/step29.md` |
+| Z-Image 512 full 8-step gate | total (s) | 209.69 (slow-path repro) | 95.99 (Step25 accepted gate) | 2.18x | `docs/adreno/steps/step25.md` |
 
 ### B) Single-point accepted gate metrics (no strict before/after pair)
 
@@ -34,6 +34,7 @@ This fork is focused on Adreno OpenCL optimization and numerical debugging for Q
 Notes:
 - This section intentionally separates "paired deltas" from "single-point gate metrics" to avoid mixed-scope rows.
 - `Before` is log-derived and same-scope for each row; unless explicitly stated, it is **not** an upstream-vs-fork claim.
+- Raw `exp_*` experiment artifacts are kept in the local workspace (not committed to this repo); table evidence links point to in-repo step docs.
 - Step28/Step29 rows use the recorded Step15 legacy flash-edit run as pre-optimization baseline.
 - Step25 row uses a recorded slow-path repro baseline from the same step folder.
 
