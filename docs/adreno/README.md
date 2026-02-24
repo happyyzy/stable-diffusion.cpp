@@ -11,111 +11,134 @@ This fork is focused on Adreno OpenCL optimization and numerical debugging for Q
 
 ## Headline Results
 
-| Case | Before | After | Gain |
-|---|---:|---:|---:|
-| FLUX.2-klein 1024 flash-on (step forward bench) | 209.81 s/step | 31.256 s/step | 6.71x |
-| Z-Image 1024 step1 (true-native flash vs optimized mldrift path) | 341.70 s | 56.93 s | 6.00x |
-| Z-Image 1024 step1 (Step19 accepted finite path: iofirst_chunk64) | 341.70 s | 50.90 s | 6.71x |
-| Z-Image 1024 full 8-step (Step21 rerun gate) | 493.39 s total | 458.41 s total | 1.08x |
-| FLUX.2-klein 512 full phone flow (ctx=256) | 98.16 s total | 59.39 s total | 1.65x |
-| FLUX.2-klein 1024 VAE decode-only (Step22, qcom_ml) | 32.80 s | 7.98 s | 4.11x |
-| FLUX.2-klein 512 VAE decode-only (Step26, qcom_ml no-host) | 40.24 s | 0.74 s | 54.38x |
-| FLUX.2-klein 512 full 4-step final gate (Step27, cond256) | 47.81 s total | 38.06 s total | 1.26x |
-| Z-Image 512 VAE decode-only (Step24, qcom_ml host-attn) | 4.07 s | 1.79 s | 2.27x |
-| Z-Image 512 full 8-step final gate (Step25) | 104.90 s total | 95.99 s total | 1.09x |
+### A) Same-scope performance deltas (verified record pairs)
+
+| Scenario | Metric | Before (scope) | After | Gain | Evidence |
+|---|---|---:|---:|---:|---|
+| FLUX.2-klein 1024 flash-on trunk | sampling (s/step) | 209.81 (native flash, same-source) | 31.256 | 6.71x | Step07 + Step10 |
+| Z-Image 1024 flash-on trunk | sampling (s/step) | 341.70 (true-native flash) | 50.90 | 6.71x | `docs/adreno/steps/step18.md` + `docs/adreno/steps/step19.md` |
+| Z-Image 1024 VAE decode-only | decode (s) | 33.02 (ggml decode reference) | 9.25 | 3.57x | `docs/adreno/steps/step20.md` |
+| FLUX.2-klein 1024 VAE decode-only | decode (s) | 11.22 (qcom_ml no-prepare) | 7.98 | 1.41x | `docs/adreno/steps/step22.md` |
+| FLUX.2-klein 512 VAE decode-only | decode (s) | 40.24 (qcom_ml + host-attn) | 0.74 | 54.38x | `docs/adreno/steps/step26.md` |
+| FLUX.2-klein 512 full 4-step gate | total (s) | 47.81 (runtime cond) | 38.06 (cond256 gate path) | 1.26x | `docs/adreno/steps/step27.md` |
+| FLUX.2-klein 512 edit gate | total (s) | 74.96 (runtime cond) | 67.36 (cond256 + diffusion-fa) | 1.11x | `docs/adreno/steps/step28.md` |
+| FLUX.2-klein 512 edit (2 refs) gate | total (s) | 100.21 (auto-resize on) | 98.93 (no-resize + optmem/prepare) | 1.01x | `docs/adreno/steps/step29.md` |
+| Z-Image 512 full 8-step gate | total (s) | 104.90 | 95.99 | 1.09x | `docs/adreno/steps/step25.md` |
+
+### B) Single-point accepted gate metrics (no strict before/after pair)
+
+- Step24 (Z-Image 512 VAE decode, qcom_ml + host-attn backend=ggml): `1.79s`  
+  - evidence: `docs/adreno/steps/step24.md`
 
 Notes:
-- Critical attention hot path has reached 10x-class improvement in some internal baselines during the debug process.
-- End-to-end gains vary by model, resolution, sequence length, and VAE path.
+- This section intentionally separates "paired deltas" from "single-point gate metrics" to avoid mixed-scope rows.
+- `Before` is log-derived and same-scope for each row; unless explicitly stated, it is **not** an upstream-vs-fork claim.
 
 ## Step Records (GOAL 1-30)
 
 Each step records the debug method and a before/after outcome (image quality or speed).
 
 ### Step 01 - Minimal Fix Set
-- Method: bisect replay + function-level rollback to isolate first bad-image recovery point.
-- Before: bad image path, image MAE vs reference `81.4976`.
-- After: `ggml_cl_scale` fallback fix restores usable image, image MAE `29.0620`.
+- Method: bisect replay + rollback to isolate minimum recovery set.
+- Before: case A (`sd-cli-minfix-q4lock`) black image, `MAE=179.8412`.
+- After: case H (`sd-cli-g2aosscale`) image recovered to usable state, `MAE=29.4714`.
+- Evidence: `exp_20260214_goal_restart/step1_minimal_subset/README.md`.
 
 ### Step 02 - Thread=1 Baseline + Performance Path
-- Method: replay minimum patch baseline and remove non-essential overhead.
-- Before: modified source single-fwd around `~14 s`.
-- After: ctx=256 single-fwd returns to `~8.5 s` class baseline.
+- Method: keep Step1 minimum set and patch `src1 contiguous+offset`.
+- Before: `step1-min` fast path `~10.79 s/it` but bad image (`img_mae_vs_ref=29.7608`).
+- After: `src1fix` keeps `~10.79 s/it` with normal image (`img_mae_vs_ref=2.4404`).
+- Evidence: `exp_20260214_goal_restart/step2_thread1_perf/README.md`.
 
 ### Step 03 - Thread=4 Numerical Failure Root Cause
-- Method: A/B run with `SD_LOAD_THREADS=1`, then add Q4 upload lock to remove load race.
-- Before: `threads=4` bad image; image MAE vs t1 `65.8560`.
-- After: `threads=1/4` latent/image align (`MAE=0`), speed unchanged (`11.00s` vs `10.99s`, step1).
+- Method: A/B with `SD_LOAD_THREADS=1`, then add Q4 upload lock.
+- Before: `threads=4` no lock gives black output (`MAE=178.2334` vs thread=1).
+- After: add Q4 upload lock; `threads=1/4` align pixel-wise (`MAE=0.0`), speed `10.74 -> 10.81 s/it`.
+- Evidence: `exp_20260214_goal_restart/step3_thread4/README.md`, `exp_20260214_goal_restart/step3_thread4_fix/README.md`.
 
 ### Step 04 - Qwen3-4B Q4 Adreno Decode Repair
-- Method: fix Q4 transpose tail rows, embed_tokens reorder path, transpose kernel guard, gemv guard.
-- Before: LLM decode gibberish token stream.
-- After: OpenCL Adreno Q4 decode restored; 24/24 token IDs match noadq4 control.
+- Method: repair Adreno Q4 decode path and verify token-level output.
+- Before: old binary outputs gibberish (`token=53436`, multi-language garbage stream).
+- After: new binary token IDs `24/24` match noadq4; output text restored.
+- Evidence: `exp_20260214_goal_restart/step4_qwen_t4/README.md`.
 
 ### Step 05 - Chain Qwen + Klein (4-step)
-- Method: reconnect repaired Qwen condition + repaired Klein trunk pipeline.
-- Before: mixed black/noise failure modes in chain.
-- After: 4-step host-decode image returns to normal quality path.
+- Method: reconnect repaired Qwen condition + Klein trunk.
+- Before: historical chain had black/noise regressions.
+- After: chain run completed (`condition=2546 ms`, `sample=55.07 s`), host decode image normal (`img_mae_vs_ref=11.3391`).
+- Evidence: `exp_20260214_goal_restart/step5_qwen_flux_chain/README.md`.
 
 ### Step 06 - Full Phone Flow Tuning
-- Method: thread sweep + VAE path tuning (`--vae-conv-direct` on OpenCL branch).
-- Before: CPU-VAE path `98.16 s` total (ctx=256 reference run).
-- After: `cond 1.29s + sample 49.08s + vae 8.70s = 59.39s` total.
+- Method: thread sweep + VAE path tuning (`--vae-conv-direct`).
+- Before: first full-phone run `54.79s` (`cond 1.263s + sample 44.67s + vae 8.65s`).
+- After: fastest accepted chain `44.71s` (`cond 0.898s + sample 34.82s + vae 8.71s`).
+- Evidence: `exp_20260214_goal_restart/step6_phone_full/README.md`.
 
 ### Step 07 - 1024 Klein Baseline Characterization
-- Method: flash on/off profiling under 1GB OpenCL allocation constraint.
-- Before: flash-off OOM (`~4.13 GB` requested, alloc fail).
-- After: flash-on runs but slow (`209.81 s/step`) and attention-dominated.
+- Method: flash on/off profiling under OpenCL memory limit.
+- Before: flash-off OOM (`failed to allocate ~4.13GB`).
+- After: flash-on can run, but slow (`209.81 s/step`) and attention-dominated.
+- Evidence: `exp_20260214_goal_restart/step7_1024_baseline/README.md`.
 
 ### Step 08 - 1024 Klein Numeric Debug Transfer
-- Method: reuse 512 alignment workflow at 1024; per-step dumps + host decode verification.
-- Before: multi-step divergence and unstable image quality reports.
-- After: 1024 alignment workflow stabilized and used as gating pipeline for later steps.
+- Method: fix flash causal mis-detection and re-run step1/2/4 alignment.
+- Before: multi-step divergence from causal mis-route.
+- After: step1/2/4 latent mean_abs = `0.01889370 / 0.01887820 / 0.03763517`, SHA256 matches nocausal reference.
+- Evidence: `exp_20260214_goal_restart/step8_1024_mainline_fix/README.md`.
 
 ### Step 09 - 1024 End-to-End Validation
-- Method: chain repaired Qwen + repaired Klein trunk at 1024, then host decode.
-- Before: chain-level image correctness uncertain.
-- After: 1024 normal image path verified with full chain.
+- Method: run full chain on phone (Qwen condition + 4-step sampling), decode on host CPU.
+- Before: only partial-chain correctness was confirmed.
+- After: full chain ran through (`cond 2837 ms`, `sampling 1149.98 s`, host decode 100.01 s); correctness path confirmed, performance not yet accepted.
+- Evidence: `exp_20260214_goal_restart/step9_1024_full_chain_fix/README.md`.
 
 ### Step 10 - Register mldrift Attention in ggml
-- Method: integrate replayed mldrift kernels into OpenCL path and dispatch by shape.
-- Before: ggml native flash bottleneck at 1024.
-- After: FLUX.2-klein bench reaches `31.256 s/step`; attention throughput enters `1 TOPS+` class.
+- Method: integrate replay-attention path and verify throughput from existing profiling records.
+- Before: native flash bottleneck dominates 1024 trunk.
+- After: record-check reproduces `~32.167 s/step` and `~1.07 TOPS` (file-level recompute).
+- Evidence: `exp_20260214_goal_restart/step10_mldrift_record_check/README.md`.
 
 ### Step 11 - mldrift Numeric Repair
-- Method: true-native baseline rebuild + call0 q/k/v same-input flashdump diff + schedule correction.
-- Before: call0 mismatch severe (`mean_abs 4.0571` class in earlier migration state).
-- After: call0 diff improved to `mean_abs 0.06138` after mldrift path corrections.
+- Method: call0 q/k/v same-input diff + schedule/order/q_scale investigations.
+- Before: call0 mismatch was severe (`mean_abs=4.0571`, historical migration state).
+- After: call0 improved (`mean_abs=0.06138`), but step-level multi-step numeric gate still not fully passed.
+- Evidence: `exp_20260214_goal_restart/step11_mldrift_numeric/README.md`.
 
 ### Step 12 - Recover 31.256 s/step + Step1/2/4 Checks
-- Method: enforce Step10 fast path on maintainable source and re-run step dump checks.
-- Before: speed or correctness drift across variants.
-- After: speed class recovered (`31.256 s/step`) with step-level numeric checks re-established.
+- Method: separate `flux-bench` vs `sd-cli` execution-path comparison; replay on current source.
+- Before: speed/correctness conclusions mixed by different measurement paths.
+- After: `flux-bench` recovered to `30.603~31.074 s/step`; `sd-cli` path still ~`39-41 s/step`, so end-to-end speed gap remains.
+- Evidence: `exp_20260214_goal_restart/step12_speed_recheck/README.md`.
 
 ### Step 13 - 1024 Four-Step Chain (Klein)
-- Method: re-chain Qwen + 1024 trunk after Step10-12 stabilization.
-- Before: uncertain end-to-end acceptance at target speed class.
-- After: 1024 image generation path accepted in ~165s-class objective envelope.
+- Method: re-chain Qwen + 1024 trunk on current source with `--vae-conv-direct`.
+- Before: target objective was ~`125s` class.
+- After: current measured total `212.97s` (`cond 1.265s + sample 175.60s + vae 35.76s`), not meeting target.
+- Evidence: `exp_20260214_goal_restart/step13_1024_full_chain/README.md`.
 
 ### Step 14 - 512 Edit on Adreno OpenCL
-- Method: reuse stable 512 flash-off high-confidence path for edit pipeline.
-- Before: edit correctness uncertain.
-- After: edit output accepted as normal.
+- Method: verify edit path on phone OpenCL and compare with host CPU reference timing.
+- Before: host CPU edit reference total `202.89s`.
+- After: phone OpenCL edit (`src1fix`) total `39.72s` (single-ref path); reference-edit route `84.18s`.
+- Evidence: `exp_20260214_goal_restart/step14_edit_512/run_step14_*.log`.
 
 ### Step 15 - Long-Sequence Edit Attention Optimization
-- Method: intercept and replace long sequence attention (`1024+1024+128`) with mldrift path.
-- Before: expected/observed large latency inflation (>150s class concern).
-- After: optimized edit sampling observed at `63.40 s` (4-step phone run).
+- Method: replace long-seq attention (`1024+1024+128`) with replay path.
+- Before: 4-step sampling `256.24s`.
+- After: 4-step sampling `63.40s` with accepted image quality.
+- Evidence: `exp_20260214_goal_restart/step15_edit_512_attn_opt/README.md`.
 
 ### Step 16 - 768 Edit (L=2048+2048+CTX)
-- Method: apply same long-seq mldrift strategy to 768 edit shape family.
-- Before: native long-seq attention too slow.
-- After: full OpenCL edit path runs with normal image quality and acceptable speed.
+- Method: apply long-seq replay strategy to 768 edit shape family.
+- Before: no accepted 768 edit route in this line.
+- After: full OpenCL edit runs; 4-step sampling `110.47s`, image accepted.
+- Evidence: `exp_20260214_goal_restart/step16_edit_768_mldrift/README.md`.
 
 ### Step 17 - Z-Image 512 Flash-Off Repair
-- Method: replay Klein-style debugging on Z-Image flash-off path.
-- Before: image abnormal.
-- After: step4 run restored to normal image (`sampling 51.97s` in reference run).
+- Method: isolate Adreno Q4 GEMM activation-precision root cause and auto-route attention weights to f32-act.
+- Before: base step1 output all-NaN (`65536/65536`), image unusable.
+- After: step4 sampling restored (`51.97s`) and host decode image normal.
+- Evidence: `exp_20260216_zimage_q40/step17_fix_report.md`.
 
 ### Step 18 - Z-Image 1024 Flash-On + 4096+128 Attention Integration
 - Method:
@@ -127,6 +150,8 @@ Each step records the debug method and a before/after outcome (image quality or 
   - optimized mldrift step1 `56.93 s`;
   - step4 total `238.06 s` (`59.5 s/it`), step8 total `488.73 s` (`61.1 s/it`);
   - host-decoded images accepted as normal for current Step18 gate.
+- Full step log:
+  - `docs/adreno/steps/step18.md`
 
 ### Step 19 - Z-Image 1024 Step1 <52s with Finite Output
 - Method:
@@ -142,6 +167,8 @@ Each step records the debug method and a before/after outcome (image quality or 
 - Notes:
   - all finite `<52s` routes are in the same quality tier in current visual checks;
   - runtime variance is strongly thermal/clock-state dependent, so 4-step average can be slower than cold single-step.
+- Full step log:
+  - `docs/adreno/steps/step19.md`
 
 ### Step 20 - Z-Image 1024 VAE Decode Optimization (Passed)
 - Method:
@@ -202,6 +229,8 @@ Each step records the debug method and a before/after outcome (image quality or 
   - `cond 0.784s + sample 118.86s + vae 9.84s = total 129.73s`
   - gate passed (`129.73s < 142s`)
   - image: `exp_20260218_klein_q40/step23_full_decode_mldrift/images/step23_flux2_klein_1024_s4_qcomml_mldfull3.png`
+- Full step log:
+  - `docs/adreno/steps/step23.md`
 
 ### Step 24 - Z-Image 512 qcom_ml VAE (`<=2s`) (Passed)
 - Method (current round):

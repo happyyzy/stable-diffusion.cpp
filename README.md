@@ -27,15 +27,15 @@ This fork is purpose-built for **Adreno 830 + Q4_0** deployment (FLUX.2-klein / 
 - `work/main`: full Adreno optimization + debugging history (performance-first engineering branch)
 - `pr/main`: upstream-oriented clean branch (minimal patch surface, neutral naming, merge-friendly docs)
 
-### Performance Snapshot
+### Performance Snapshot (verified logs only)
 
-| Case | Baseline | Optimized | Gain |
-|---|---:|---:|---:|
-| FLUX.2-klein 1024 flash-on (step forward) | 209.81 s/step | 31.256 s/step | 6.71x |
-| Z-Image 1024 step1 flash-on | 341.70 s | 50.90 s | 6.71x |
-| FLUX.2-klein 512 full 4-step final gate | 47.81 s total | 38.06 s total | 1.26x |
-| FLUX.2-klein 512 edit final gate | 74.96 s total | 67.36 s total | 1.11x |
-| FLUX.2-klein 512 edit (2 refs) gate | 100.21 s total | 98.93 s total | pass |
+| Scenario | Metric | Baseline (scope) | Optimized | Gain | Record |
+|---|---|---:|---:|---:|---|
+| FLUX.2-klein 1024 flash-on trunk | sampling (s/step) | 209.81 (native flash, same-source) | 31.256 | 6.71x | `docs/adreno/README.md` Step07 + Step10 |
+| Z-Image 1024 flash-on trunk | sampling (s/step) | 341.70 (true-native flash, same-source) | 50.90 | 6.71x | `docs/adreno/steps/step18.md` + `docs/adreno/steps/step19.md` |
+| Z-Image 1024 VAE decode-only | decode (s) | 33.02 (ggml decode ref) | 9.25 | 3.57x | `docs/adreno/steps/step20.md` |
+| FLUX.2-klein 1024 VAE decode-only | decode (s) | 11.22 (qcom_ml, no prepare) | 7.98 | 1.41x | `docs/adreno/steps/step22.md` |
+| FLUX.2-klein 512 VAE decode-only | decode (s) | 40.24 (qcom_ml + host-attn) | 0.74 | 54.38x | `docs/adreno/steps/step26.md` |
 
 ### Before / After (Real Step Artifacts)
 
