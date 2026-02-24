@@ -17,9 +17,9 @@ This fork is focused on Adreno OpenCL optimization and numerical debugging for Q
 |---|---|---:|---:|---:|---|
 | FLUX.2-klein 1024 flash-on trunk | sampling (s/step) | 209.81 (native flash, same-source) | 31.256 | 6.71x | Step07 + Step10 |
 | Z-Image 1024 flash-on trunk | sampling (s/step) | 341.70 (true-native flash) | 50.90 | 6.71x | `docs/adreno/steps/step18.md` + `docs/adreno/steps/step19.md` |
-| Z-Image 1024 VAE decode-only (Step20 gate) | decode (s) | GOAL `<10s` | 9.25 | pass | `docs/adreno/steps/step20.md` |
-| FLUX.2-klein 1024 VAE decode-only (Step22 gate) | decode (s) | GOAL `<10s` | 7.98 | pass | `docs/adreno/steps/step22.md` |
-| FLUX.2-klein 512 VAE decode-only (Step26 gate) | decode (s) | GOAL `<=2s` | 0.74 | pass | `docs/adreno/steps/step26.md` |
+| Z-Image 1024 VAE decode-only | decode (s) | 36.88 (ggml conv-direct ref) | 9.25 | 3.99x | `exp_20260216_zimage_q40/step18_1024_flashon_mldrift/run_step18_native_s1_decode_only_oclvae.log` + `docs/adreno/steps/step20.md` |
+| FLUX.2-klein 1024 VAE decode-only | decode (s) | 32.80 (ggml decode reference) | 5.25 | 6.25x | `docs/adreno/steps/step22.md` + `docs/adreno/steps/step23.md` |
+| FLUX.2-klein 512 VAE decode-only | decode (s) | 7.70 (ggml decode-stage reference) | 0.74 | 10.41x | `exp_20260219_localdream_auto/step31_klein_512/repro_server_loop/caseR_t8_convdirect/server_full.log` + `docs/adreno/steps/step26.md` |
 | FLUX.2-klein 512 full 4-step gate | total (s) | 47.81 (runtime cond) | 38.06 (cond256 gate path) | 1.26x | `docs/adreno/steps/step27.md` |
 | FLUX.2-klein 512 edit gate | total (s) | 74.96 (runtime cond) | 67.36 (cond256 + diffusion-fa) | 1.11x | `docs/adreno/steps/step28.md` |
 | FLUX.2-klein 512 edit (2 refs) gate | total (s) | 100.21 (auto-resize on) | 98.93 (no-resize + optmem/prepare) | 1.01x | `docs/adreno/steps/step29.md` |
