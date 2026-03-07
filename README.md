@@ -31,8 +31,8 @@ This fork is purpose-built for **Adreno 830 + Q4_0** deployment (FLUX.2-klein / 
 
 | Case | Baseline | Optimized | Gain |
 |---|---:|---:|---:|
-| FLUX.2-klein 1024 flash-on (step forward) | 209.81 s/step | 31.256 s/step | 6.71x |
-| Z-Image 1024 step1 flash-on | 341.70 s | 50.90 s | 6.71x |
+| FLUX.2-klein 1024 flash-on (step forward) | 209.81 s/it | 31.256 s/it | 6.71x |
+| Z-Image 1024 step1 flash-on | 341.70 s /it| 50.90 s /it| 6.71x |
 | FLUX.2-klein 512 full 4-step final gate | 47.81 s total | 38.06 s total | 1.26x |
 | FLUX.2-klein 512 edit final gate | 74.96 s total | 67.36 s total | 1.11x |
 | FLUX.2-klein 512 edit (2 refs) gate | 100.21 s total | 98.93 s total | pass |
