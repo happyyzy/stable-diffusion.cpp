@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <vector>
+#include "ggml-htp.h"
 #include "ggml_extend.hpp"
 
 namespace Rope {
@@ -39,6 +40,80 @@ namespace Rope {
             flat_vec.insert(flat_vec.end(), sub_vec.begin(), sub_vec.end());
         }
         return flat_vec;
+    }
+
+    __STATIC_INLINE__ bool zimg_htp_rope_requested(ggml_backend_t backend) {
+        static int enabled = -1;
+        if (enabled < 0) {
+            const char* env = std::getenv("GGML_HTP_ZIMG_ROPE");
+            enabled         = (env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0) ? 1 : 0;
+        }
+
+        const bool is_htp_backend = backend != nullptr && std::strcmp(ggml_backend_name(backend), "MyHTP") == 0;
+        return enabled != 0 && is_htp_backend;
+    }
+
+    __STATIC_INLINE__ bool zimg_htp_rope_enabled(ggml_backend_t backend, struct ggml_tensor* pe_pack) {
+        return zimg_htp_rope_requested(backend) && pe_pack != nullptr;
+    }
+
+    __STATIC_INLINE__ void zimg_rope_apply_f32(struct ggml_tensor* dst,
+                                               const struct ggml_tensor* x,
+                                               const struct ggml_tensor* theta,
+                                               int ith,
+                                               int nth,
+                                               void* userdata) {
+        GGML_ASSERT(dst != nullptr && x != nullptr && theta != nullptr);
+        GGML_ASSERT(dst->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && theta->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(x) && ggml_is_contiguous(theta));
+
+        const bool interleaved =
+            (reinterpret_cast<uintptr_t>(userdata) & static_cast<uintptr_t>(GGML_HTP_ZIMG_ROPE_FLAG_INTERLEAVED)) != 0;
+
+        const int64_t d_head  = dst->ne[0];
+        const int64_t seq_len = dst->ne[1];
+        const int64_t rows    = dst->ne[2] * dst->ne[3];
+        const int64_t half    = d_head / 2;
+
+        GGML_ASSERT(d_head > 0 && (d_head % 2) == 0);
+        GGML_ASSERT(x->ne[0] == d_head && x->ne[1] == seq_len && x->ne[2] * x->ne[3] == rows);
+        GGML_ASSERT(theta->ne[0] == 2 && theta->ne[1] == 2 && theta->ne[2] == half && theta->ne[3] == seq_len);
+
+        const float* src_data   = static_cast<const float*>(x->data);
+        const float* theta_data = static_cast<const float*>(theta->data);
+        float* dst_data         = static_cast<float*>(dst->data);
+
+        const int64_t total = rows * seq_len;
+        const int64_t begin = (total * ith) / nth;
+        const int64_t end   = (total * (ith + 1)) / nth;
+
+        for (int64_t flat = begin; flat < end; ++flat) {
+            const int64_t row   = flat / seq_len;
+            const int64_t token = flat % seq_len;
+            const float* src    = src_data + (row * seq_len + token) * d_head;
+            const float* rope   = theta_data + token * (2 * d_head);
+            float* out          = dst_data + (row * seq_len + token) * d_head;
+
+            if (interleaved) {
+                for (int64_t j = 0; j < half; ++j) {
+                    const float c  = rope[4 * j + 0];
+                    const float s  = rope[4 * j + 2];
+                    const float x0 = src[2 * j + 0];
+                    const float x1 = src[2 * j + 1];
+                    out[2 * j + 0] = x0 * c - x1 * s;
+                    out[2 * j + 1] = x0 * s + x1 * c;
+                }
+            } else {
+                for (int64_t j = 0; j < half; ++j) {
+                    const float c  = rope[4 * j + 0];
+                    const float s  = rope[4 * j + 2];
+                    const float x0 = src[j];
+                    const float x1 = src[j + half];
+                    out[j]         = x0 * c - x1 * s;
+                    out[j + half]  = x0 * s + x1 * c;
+                }
+            }
+        }
     }
 
     __STATIC_INLINE__ std::vector<std::vector<float>> rope(const std::vector<float>& pos,
@@ -588,8 +663,10 @@ namespace Rope {
     }
 
     __STATIC_INLINE__ struct ggml_tensor* apply_rope(struct ggml_context* ctx,
+                                                     ggml_backend_t backend,
                                                      struct ggml_tensor* x,
                                                      struct ggml_tensor* pe,
+                                                     struct ggml_tensor* pe_pack,
                                                      bool rope_interleaved = true) {
         // x: [N, L, n_head, d_head]
         // pe: [L, d_head/2, 2, 2], [[cos, -sin], [sin, cos]]
@@ -598,6 +675,16 @@ namespace Rope {
         int64_t L      = x->ne[2];
         int64_t N      = x->ne[3];
         x              = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));  // [N, n_head, L, d_head]
+        if (zimg_htp_rope_enabled(backend, pe_pack)) {
+            auto x_base = ggml_reshape_3d(ctx, x, d_head, L, n_head * N);  // [N*n_head, L, d_head]
+            const uintptr_t flags =
+                rope_interleaved ? static_cast<uintptr_t>(GGML_HTP_ZIMG_ROPE_FLAG_INTERLEAVED) : 0;
+            auto x_out = ggml_map_custom2(ctx, x_base, pe_pack, zimg_rope_apply_f32, GGML_N_TASKS_MAX,
+                                          reinterpret_cast<void*>(flags));
+            ggml_set_name(x_out, rope_interleaved ? GGML_HTP_ZIMG_ROPE_INTERLEAVED_NAME
+                                                  : GGML_HTP_ZIMG_ROPE_NEOX_NAME);
+            return x_out;
+        }
         if (rope_interleaved) {
             x = ggml_reshape_4d(ctx, x, 2, d_head / 2, L, n_head * N);  // [N * n_head, L, d_head/2, 2]
             x = ggml_cont(ctx, ggml_permute(ctx, x, 3, 0, 1, 2));       // [2, N * n_head, L, d_head/2]
@@ -633,17 +720,29 @@ namespace Rope {
                                                     struct ggml_tensor* k,
                                                     struct ggml_tensor* v,
                                                     struct ggml_tensor* pe,
+                                                    struct ggml_tensor* pe_pack,
                                                     struct ggml_tensor* mask,
                                                     float kv_scale        = 1.0f,
                                                     bool rope_interleaved = true) {
         // q,k,v: [N, L, n_head, d_head]
         // pe: [L, d_head/2, 2, 2]
         // return: [N, L, n_head*d_head]
-        q = apply_rope(ctx->ggml_ctx, q, pe, rope_interleaved);  // [N*n_head, L, d_head]
-        k = apply_rope(ctx->ggml_ctx, k, pe, rope_interleaved);  // [N*n_head, L, d_head]
+        q = apply_rope(ctx->ggml_ctx, ctx->backend, q, pe, pe_pack, rope_interleaved);  // [N*n_head, L, d_head]
+        k = apply_rope(ctx->ggml_ctx, ctx->backend, k, pe, pe_pack, rope_interleaved);  // [N*n_head, L, d_head]
 
         auto x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, v->ne[1], mask, true, ctx->flash_attn_enabled, kv_scale);  // [N, L, n_head*d_head]
         return x;
+    }
+
+    __STATIC_INLINE__ struct ggml_tensor* attention(GGMLRunnerContext* ctx,
+                                                    struct ggml_tensor* q,
+                                                    struct ggml_tensor* k,
+                                                    struct ggml_tensor* v,
+                                                    struct ggml_tensor* pe,
+                                                    struct ggml_tensor* mask,
+                                                    float kv_scale        = 1.0f,
+                                                    bool rope_interleaved = true) {
+        return attention(ctx, q, k, v, pe, nullptr, mask, kv_scale, rope_interleaved);
     }
 };  // namespace Rope
 

@@ -3818,6 +3818,13 @@ public:
         int64_t W                  = x->ne[0] * vae_scale_factor;
         int64_t H                  = x->ne[1] * vae_scale_factor;
         int64_t C                  = 3;
+        sd_tiling_params_t decode_tiling_params = vae_tiling_params;
+#ifdef SD_USE_HEXAGON
+        if (!decode_video && !decode_tiling_params.enabled && ggml_backend_is_htp(vae_backend)) {
+            decode_tiling_params.enabled = true;
+            LOG_INFO("Auto-enabling VAE tiling for HTP decode to avoid oversized RPCMEM allocation");
+        }
+#endif
         ggml_tensor* result        = nullptr;
         if (decode_video) {
             int64_t T = x->ne[2];
@@ -3874,10 +3881,10 @@ public:
             }
             process_latent_out(x);
             // x = load_tensor_from_file(work_ctx, "wan_vae_z.bin");
-            if (vae_tiling_params.enabled) {
+            if (decode_tiling_params.enabled) {
                 float tile_overlap;
                 int tile_size_x, tile_size_y;
-                get_tile_sizes(tile_size_x, tile_size_y, tile_overlap, vae_tiling_params, x->ne[0], x->ne[1]);
+                get_tile_sizes(tile_size_x, tile_size_y, tile_overlap, decode_tiling_params, x->ne[0], x->ne[1]);
 
                 LOG_DEBUG("VAE Tile size: %dx%d", tile_size_x, tile_size_y);
 
@@ -3892,7 +3899,7 @@ public:
             first_stage_model->free_compute_buffer();
             process_vae_output_tensor(result);
         } else {
-            if (vae_tiling_params.enabled) {
+            if (decode_tiling_params.enabled) {
                 // split latent in 64x64 tiles and compute in several steps
                 auto on_tiling = [&](ggml_tensor* in, ggml_tensor* out, bool init) {
                     tae_first_stage->compute(n_threads, in, true, &out);

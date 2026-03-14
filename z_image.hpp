@@ -309,6 +309,7 @@ namespace ZImage {
         struct ggml_tensor* forward(GGMLRunnerContext* ctx,
                                     struct ggml_tensor* x,
                                     struct ggml_tensor* pe,
+                                    struct ggml_tensor* pe_pack = nullptr,
                                     struct ggml_tensor* mask = nullptr,
                                     const std::string& dump_prefix = "") {
             // x: [N, n_token, hidden_size]
@@ -482,7 +483,7 @@ namespace ZImage {
                 }
             }
 
-            x = Rope::attention(ctx, q, k, v, pe, mask, 1.f / 128.f);  // [N, n_token, num_heads * head_dim]
+            x = Rope::attention(ctx, q, k, v, pe, pe_pack, mask, 1.f / 128.f);  // [N, n_token, num_heads * head_dim]
             if (!dump_prefix.empty()) {
                 zimg_cache_tensor(ctx, dump_prefix + "attn", x);
             }
@@ -582,6 +583,7 @@ namespace ZImage {
         struct ggml_tensor* forward(GGMLRunnerContext* ctx,
                                     struct ggml_tensor* x,
                                     struct ggml_tensor* pe,
+                                    struct ggml_tensor* pe_pack    = nullptr,
                                     struct ggml_tensor* mask        = nullptr,
                                     struct ggml_tensor* adaln_input = nullptr,
                                     const std::string& dump_prefix  = "") {
@@ -615,7 +617,7 @@ namespace ZImage {
                 if (!dump_prefix.empty()) {
                     zimg_cache_tensor(ctx, dump_prefix + "attn_mod_in", x);
                 }
-                x             = attention->forward(ctx, x, pe, mask, dump_prefix.empty() ? "" : (dump_prefix + "attn_"));
+                x             = attention->forward(ctx, x, pe, pe_pack, mask, dump_prefix.empty() ? "" : (dump_prefix + "attn_"));
                 x             = attention_norm2->forward(ctx, x);
                 x             = ggml_mul(ctx->ggml_ctx, x, ggml_tanh(ctx->ggml_ctx, gate_msa));
                 x             = ggml_add(ctx->ggml_ctx, x, residual);
@@ -643,7 +645,7 @@ namespace ZImage {
                 if (!dump_prefix.empty()) {
                     zimg_cache_tensor(ctx, dump_prefix + "attn_norm_in", x);
                 }
-                x             = attention->forward(ctx, x, pe, mask, dump_prefix.empty() ? "" : (dump_prefix + "attn_"));
+                x             = attention->forward(ctx, x, pe, pe_pack, mask, dump_prefix.empty() ? "" : (dump_prefix + "attn_"));
                 x             = attention_norm2->forward(ctx, x);
                 x             = ggml_add(ctx->ggml_ctx, x, residual);
 
@@ -846,7 +848,8 @@ namespace ZImage {
                                          struct ggml_tensor* x,
                                          struct ggml_tensor* timestep,
                                          struct ggml_tensor* context,
-                                         struct ggml_tensor* pe) {
+                                         struct ggml_tensor* pe,
+                                         struct ggml_tensor* pe_pack = nullptr) {
             auto x_embedder     = std::dynamic_pointer_cast<Linear>(blocks["x_embedder"]);
             auto t_embedder     = std::dynamic_pointer_cast<TimestepEmbedder>(blocks["t_embedder"]);
             auto cap_embedder_0 = std::dynamic_pointer_cast<RMSNorm>(blocks["cap_embedder.0"]);
@@ -885,14 +888,21 @@ namespace ZImage {
             }
 
             GGML_ASSERT(txt->ne[1] + img->ne[1] == pe->ne[3]);
+            if (pe_pack != nullptr) {
+                const int64_t pe_pack_token_dim = pe_pack->ne[1] == 2 ? 3 : 2;
+                GGML_ASSERT(txt->ne[1] + img->ne[1] == pe_pack->ne[pe_pack_token_dim]);
+            }
 
             auto txt_pe = ggml_ext_slice(ctx->ggml_ctx, pe, 3, 0, txt->ne[1]);
             auto img_pe = ggml_ext_slice(ctx->ggml_ctx, pe, 3, txt->ne[1], pe->ne[3]);
+            auto txt_pe_pack = pe_pack ? ggml_ext_slice(ctx->ggml_ctx, pe_pack, pe_pack->ne[1] == 2 ? 3 : 2, 0, txt->ne[1]) : nullptr;
+            auto img_pe_pack = pe_pack ? ggml_ext_slice(ctx->ggml_ctx, pe_pack, pe_pack->ne[1] == 2 ? 3 : 2,
+                                                        txt->ne[1], txt->ne[1] + img->ne[1]) : nullptr;
 
             for (int i = 0; i < z_image_params.num_refiner_layers; i++) {
                 auto block = std::dynamic_pointer_cast<JointTransformerBlock>(blocks["context_refiner." + std::to_string(i)]);
                 const std::string ref_dump = (zimg_dump_l0_enabled() && i == 0) ? "zimg_l0_ctx_ref0_" : "";
-                txt                        = block->forward(ctx, txt, txt_pe, nullptr, nullptr, ref_dump);
+                txt                        = block->forward(ctx, txt, txt_pe, txt_pe_pack, nullptr, nullptr, ref_dump);
                 if (zimg_dump_l0_enabled()) {
                     zimg_cache_tensor(ctx, "zimg_l0_ctx_refiner_" + std::to_string(i) + "_out", txt);
                 }
@@ -901,7 +911,7 @@ namespace ZImage {
             for (int i = 0; i < z_image_params.num_refiner_layers; i++) {
                 auto block = std::dynamic_pointer_cast<JointTransformerBlock>(blocks["noise_refiner." + std::to_string(i)]);
                 const std::string ref_dump = (zimg_dump_l0_enabled() && i == 0) ? "zimg_l0_noise_ref0_" : "";
-                img                        = block->forward(ctx, img, img_pe, nullptr, t_emb, ref_dump);
+                img                        = block->forward(ctx, img, img_pe, img_pe_pack, nullptr, t_emb, ref_dump);
                 if (zimg_dump_l0_enabled()) {
                     zimg_cache_tensor(ctx, "zimg_l0_noise_refiner_" + std::to_string(i) + "_out", img);
                 }
@@ -920,7 +930,7 @@ namespace ZImage {
                 const int dump_layer          = zimg_dump_main_layer();
                 const std::string dump_prefix =
                     (zimg_dump_l0_enabled() && i == dump_layer) ? ("zimg_l" + std::to_string(i) + "_") : "";
-                txt_img                       = block->forward(ctx, txt_img, pe, nullptr, t_emb, dump_prefix);
+                txt_img                       = block->forward(ctx, txt_img, pe, pe_pack, nullptr, t_emb, dump_prefix);
                 if (!dump_prefix.empty()) {
                     zimg_cache_tensor(ctx, dump_prefix + "txt_img_out", txt_img);
                 }
@@ -944,6 +954,7 @@ namespace ZImage {
                                     struct ggml_tensor* timestep,
                                     struct ggml_tensor* context,
                                     struct ggml_tensor* pe,
+                                    struct ggml_tensor* pe_pack = nullptr,
                                     std::vector<ggml_tensor*> ref_latents = {}) {
             // Forward pass of DiT.
             // x: [N, C, H, W]
@@ -970,7 +981,7 @@ namespace ZImage {
             int64_t h_len = ((H + (z_image_params.patch_size / 2)) / z_image_params.patch_size);
             int64_t w_len = ((W + (z_image_params.patch_size / 2)) / z_image_params.patch_size);
 
-            auto out = forward_core(ctx, img, timestep, context, pe);
+            auto out = forward_core(ctx, img, timestep, context, pe, pe_pack);
             if (zimg_dump_l0_enabled()) {
                 zimg_cache_tensor(ctx, "zimg_post_forward_core_out", out);
             }
@@ -1089,11 +1100,15 @@ namespace ZImage {
                                                z_image_params.axes_dim);
             int pos_len = static_cast<int>(pe_vec.size() / z_image_params.axes_dim_sum / 2);
             // LOG_DEBUG("pos_len %d", pos_len);
-            auto pe = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, z_image_params.axes_dim_sum / 2, pos_len);
+            auto pe      = ggml_new_tensor_4d(compute_ctx, GGML_TYPE_F32, 2, 2, z_image_params.axes_dim_sum / 2, pos_len);
+            struct ggml_tensor* pe_pack = nullptr;
             // pe->data = pe_vec.data();
             // print_ggml_tensor(pe, true, "pe");
             // pe->data = nullptr;
             set_backend_tensor_data(pe, pe_vec.data());
+            if (Rope::zimg_htp_rope_requested(runtime_backend)) {
+                pe_pack = pe;
+            }
             auto runner_ctx = get_context();
 
             struct ggml_tensor* out = z_image.forward(&runner_ctx,
@@ -1101,6 +1116,7 @@ namespace ZImage {
                                                       timesteps,
                                                       context,
                                                       pe,
+                                                      pe_pack,
                                                       ref_latents);
 
             ggml_build_forward_expand(gf, out);
