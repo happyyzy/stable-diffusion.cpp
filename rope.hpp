@@ -116,6 +116,77 @@ namespace Rope {
         }
     }
 
+    __STATIC_INLINE__ void zimg_qknorm_rope_apply_f32(struct ggml_tensor* dst,
+                                                      const struct ggml_tensor* x,
+                                                      const struct ggml_tensor* weight,
+                                                      const struct ggml_tensor* theta,
+                                                      int ith,
+                                                      int nth,
+                                                      void* userdata) {
+        GGML_ASSERT(dst != nullptr && x != nullptr && weight != nullptr && theta != nullptr);
+        GGML_ASSERT(dst->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32 && theta->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(x) && ggml_is_contiguous(weight) && ggml_is_contiguous(theta));
+
+        const bool interleaved =
+            (reinterpret_cast<uintptr_t>(userdata) & static_cast<uintptr_t>(GGML_HTP_ZIMG_ROPE_FLAG_INTERLEAVED)) != 0;
+
+        const int64_t d_head  = dst->ne[0];
+        const int64_t seq_len = dst->ne[1];
+        const int64_t rows    = dst->ne[2] * dst->ne[3];
+        const int64_t half    = d_head / 2;
+        const float   eps     = 1e-6f;
+
+        GGML_ASSERT(d_head > 0 && (d_head % 2) == 0);
+        GGML_ASSERT(x->ne[0] == d_head && x->ne[1] == seq_len && x->ne[2] * x->ne[3] == rows);
+        GGML_ASSERT(weight->ne[0] == d_head && weight->ne[1] == 1 && weight->ne[2] * weight->ne[3] == rows);
+        GGML_ASSERT(theta->ne[0] == 2 && theta->ne[1] == 2 && theta->ne[2] == half && theta->ne[3] == seq_len);
+
+        const float* src_data    = static_cast<const float*>(x->data);
+        const float* weight_data = static_cast<const float*>(weight->data);
+        const float* theta_data  = static_cast<const float*>(theta->data);
+        float* dst_data          = static_cast<float*>(dst->data);
+
+        const int64_t total = rows * seq_len;
+        const int64_t begin = (total * ith) / nth;
+        const int64_t end   = (total * (ith + 1)) / nth;
+
+        for (int64_t flat = begin; flat < end; ++flat) {
+            const int64_t row   = flat / seq_len;
+            const int64_t token = flat % seq_len;
+
+            const float* src    = src_data + (row * seq_len + token) * d_head;
+            const float* w      = weight_data + row * d_head;
+            const float* rope   = theta_data + token * (2 * d_head);
+            float* out          = dst_data + (row * seq_len + token) * d_head;
+
+            float sumsq = 0.0f;
+            for (int64_t i = 0; i < d_head; ++i) {
+                sumsq += src[i] * src[i];
+            }
+            const float scale = 1.0f / std::sqrt(sumsq / static_cast<float>(d_head) + eps);
+
+            if (interleaved) {
+                for (int64_t j = 0; j < half; ++j) {
+                    const float c  = rope[4 * j + 0];
+                    const float s  = rope[4 * j + 2];
+                    const float x0 = src[2 * j + 0] * scale * w[2 * j + 0];
+                    const float x1 = src[2 * j + 1] * scale * w[2 * j + 1];
+                    out[2 * j + 0] = x0 * c - x1 * s;
+                    out[2 * j + 1] = x0 * s + x1 * c;
+                }
+            } else {
+                for (int64_t j = 0; j < half; ++j) {
+                    const float c  = rope[4 * j + 0];
+                    const float s  = rope[4 * j + 2];
+                    const float x0 = src[j]        * scale * w[j];
+                    const float x1 = src[j + half] * scale * w[j + half];
+                    out[j]         = x0 * c - x1 * s;
+                    out[j + half]  = x0 * s + x1 * c;
+                }
+            }
+        }
+    }
+
     __STATIC_INLINE__ std::vector<std::vector<float>> rope(const std::vector<float>& pos,
                                                            int dim,
                                                            int theta,

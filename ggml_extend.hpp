@@ -2920,6 +2920,10 @@ public:
         : hidden_size(hidden_size),
           eps(eps) {}
 
+    struct ggml_tensor* get_weight_tensor() {
+        return params["weight"];
+    }
+
     struct ggml_tensor* forward(GGMLRunnerContext* ctx, struct ggml_tensor* x) {
         struct ggml_tensor* w = params["weight"];
         if (ctx->weight_adapter) {

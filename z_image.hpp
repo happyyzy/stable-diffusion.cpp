@@ -27,6 +27,16 @@ namespace ZImage {
     constexpr int ADALN_EMBED_DIM    = 256;
     constexpr int SEQ_MULTI_OF       = 32;
 
+    static inline bool zimg_htp_qknorm_rope_requested(ggml_backend_t backend) {
+        static int enabled = -1;
+        if (enabled < 0) {
+            const char* env = std::getenv("GGML_HTP_ZIMG_QKNORM_ROPE");
+            enabled         = (env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0) ? 1 : 0;
+        }
+        const bool is_htp_backend = backend != nullptr && std::strcmp(ggml_backend_name(backend), "MyHTP") == 0;
+        return enabled != 0 && is_htp_backend;
+    }
+
     static inline bool zimg_dump_l0_enabled() {
         static int enabled = -1;
         if (enabled < 0) {
@@ -474,16 +484,53 @@ namespace ZImage {
             if (qk_norm) {
                 auto q_norm = std::dynamic_pointer_cast<RMSNorm>(blocks["q_norm"]);
                 auto k_norm = std::dynamic_pointer_cast<RMSNorm>(blocks["k_norm"]);
+                const bool use_htp_fused_qk_norm_rope =
+                    pe_pack != nullptr &&
+                    ctx->weight_adapter == nullptr &&
+                    Rope::zimg_htp_rope_requested(ctx->backend) &&
+                    zimg_htp_qknorm_rope_requested(ctx->backend);
 
-                q = q_norm->forward(ctx, q);
-                k = k_norm->forward(ctx, k);
+                if (use_htp_fused_qk_norm_rope) {
+                    auto q_w = q_norm->get_weight_tensor();
+                    auto k_w = k_norm->get_weight_tensor();
+
+                    auto q_in = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, q, 0, 2, 1, 3));
+                    auto k_in = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, k, 0, 2, 1, 3));
+                    q_in      = ggml_reshape_3d(ctx->ggml_ctx, q_in, head_dim, n_token, num_heads * N);
+                    k_in      = ggml_reshape_3d(ctx->ggml_ctx, k_in, head_dim, n_token, num_kv_heads * N);
+
+                    auto q_w_rep = ggml_repeat_4d(ctx->ggml_ctx, q_w, q_w->ne[0], 1, num_heads * N, 1);
+                    auto k_w_rep = ggml_repeat_4d(ctx->ggml_ctx, k_w, k_w->ne[0], 1, num_kv_heads * N, 1);
+                    q_w_rep      = ggml_reshape_3d(ctx->ggml_ctx, q_w_rep, q_w->ne[0], 1, num_heads * N);
+                    k_w_rep      = ggml_reshape_3d(ctx->ggml_ctx, k_w_rep, k_w->ne[0], 1, num_kv_heads * N);
+
+                    const uintptr_t flags =
+                        static_cast<uintptr_t>(GGML_HTP_ZIMG_ROPE_FLAG_INTERLEAVED);
+                    q = ggml_map_custom3(ctx->ggml_ctx, q_in, q_w_rep, pe_pack, Rope::zimg_qknorm_rope_apply_f32,
+                                         GGML_N_TASKS_MAX, reinterpret_cast<void*>(flags));
+                    k = ggml_map_custom3(ctx->ggml_ctx, k_in, k_w_rep, pe_pack, Rope::zimg_qknorm_rope_apply_f32,
+                                         GGML_N_TASKS_MAX, reinterpret_cast<void*>(flags));
+                    ggml_set_name(q, GGML_HTP_ZIMG_QKNORM_ROPE_INTERLEAVED_NAME);
+                    ggml_set_name(k, GGML_HTP_ZIMG_QKNORM_ROPE_INTERLEAVED_NAME);
+                } else {
+                    q = q_norm->forward(ctx, q);
+                    k = k_norm->forward(ctx, k);
+                }
+
                 if (!dump_prefix.empty()) {
                     zimg_cache_tensor(ctx, dump_prefix + "q_post_norm", q);
                     zimg_cache_tensor(ctx, dump_prefix + "k_post_norm", k);
                 }
             }
-
-            x = Rope::attention(ctx, q, k, v, pe, pe_pack, mask, 1.f / 128.f);  // [N, n_token, num_heads * head_dim]
+            if (qk_norm &&
+                pe_pack != nullptr &&
+                ctx->weight_adapter == nullptr &&
+                Rope::zimg_htp_rope_requested(ctx->backend) &&
+                zimg_htp_qknorm_rope_requested(ctx->backend)) {
+                x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, num_heads, mask, true, ctx->flash_attn_enabled, 1.f / 128.f);
+            } else {
+                x = Rope::attention(ctx, q, k, v, pe, pe_pack, mask, 1.f / 128.f);  // [N, n_token, num_heads * head_dim]
+            }
             if (!dump_prefix.empty()) {
                 zimg_cache_tensor(ctx, dump_prefix + "attn", x);
             }
