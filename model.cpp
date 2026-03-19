@@ -346,7 +346,16 @@ static bool sd_convert_htp_repack_only_permuted() {
     static int enabled = -1;
     if (enabled < 0) {
         const char* env = getenv("SD_GGUF_CONVERT_HTP_REPACK_ONLY_PERMUTED");
-        enabled         = (env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+        if (env != nullptr && env[0] != '\0') {
+            enabled = (strcmp(env, "0") != 0) ? 1 : 0;
+        } else {
+            const char* overlay = getenv("SD_DIFFUSION_MODEL_OVERLAY");
+            // Overlay convert starts from an already packed baseline GGUF and replaces
+            // only a subset of tensors from the source model. Repacking untouched
+            // baseline qweights again corrupts their on-disk layout, so in overlay mode
+            // only tensors permuted in this conversion pass may be repacked.
+            enabled = (overlay != nullptr && overlay[0] != '\0') ? 1 : 0;
+        }
     }
     return enabled != 0;
 }
@@ -766,6 +775,21 @@ void ModelLoader::add_tensor_storage(const TensorStorage& tensor_storage) {
     tensor_storage_map[tensor_storage.name] = tensor_storage;
 }
 
+void ModelLoader::overlay_tensor_storage(const TensorStorage& tensor_storage, const std::string& file_path) {
+    size_t file_index = 0;
+    auto it = std::find(file_paths_.begin(), file_paths_.end(), file_path);
+    if (it == file_paths_.end()) {
+        file_paths_.push_back(file_path);
+        file_index = file_paths_.size() - 1;
+    } else {
+        file_index = static_cast<size_t>(std::distance(file_paths_.begin(), it));
+    }
+
+    TensorStorage remapped = tensor_storage;
+    remapped.file_index = file_index;
+    add_tensor_storage(remapped);
+}
+
 bool is_zip_file(const std::string& file_path) {
     struct zip_t* zip = zip_open(file_path.c_str(), 0, 'r');
     if (zip == nullptr) {
@@ -999,6 +1023,35 @@ static void model_loader_write_npu_contract_metadata(gguf_context* gguf_ctx) {
     gguf_set_val_str(gguf_ctx, "sd.npu.contract.layout.flash_attn_ext", "f32_q_f16_kv.v1");
     gguf_set_val_bool(gguf_ctx, "sd.npu.contract.export.permute", sd_convert_htp_permute_enabled());
     gguf_set_val_bool(gguf_ctx, "sd.npu.contract.export.repack", sd_convert_htp_repack_metadata_enabled());
+}
+
+static void model_loader_write_existing_npu_contract_metadata(gguf_context* gguf_ctx,
+                                                              const std::map<std::string, std::string>& metadata) {
+    if (gguf_ctx == nullptr) {
+        return;
+    }
+
+    auto write_str = [&](const char* key) {
+        auto it = metadata.find(key);
+        if (it != metadata.end()) {
+            gguf_set_val_str(gguf_ctx, key, it->second.c_str());
+        }
+    };
+    auto write_bool = [&](const char* key) {
+        auto it = metadata.find(key);
+        if (it != metadata.end()) {
+            gguf_set_val_bool(gguf_ctx, key, it->second == "true");
+        }
+    };
+
+    write_str("sd.npu.contract.id");
+    write_str("sd.npu.contract.layout.matmul.f16");
+    write_str("sd.npu.contract.layout.matmul.q4_0");
+    write_str("sd.npu.contract.layout.matmul.q8_0");
+    write_str("sd.npu.contract.layout.matmul.iq4_nl");
+    write_str("sd.npu.contract.layout.flash_attn_ext");
+    write_bool("sd.npu.contract.export.permute");
+    write_bool("sd.npu.contract.export.repack");
 }
 
 bool ModelLoader::init_from_gguf_file(const std::string& file_path, const std::string& prefix) {
@@ -2487,7 +2540,12 @@ bool ModelLoader::save_to_gguf_file(const std::string& file_path, ggml_type type
     ggml_context* ggml_ctx = ggml_init({mem_size, nullptr, false});
 
     gguf_context* gguf_ctx = gguf_init_empty();
-    model_loader_write_npu_contract_metadata(gguf_ctx);
+    const char* overlay_path = std::getenv("SD_DIFFUSION_MODEL_OVERLAY");
+    if (overlay_path != nullptr && overlay_path[0] != '\0') {
+        model_loader_write_existing_npu_contract_metadata(gguf_ctx, gguf_metadata_);
+    } else {
+        model_loader_write_npu_contract_metadata(gguf_ctx);
+    }
 
     std::mutex tensor_mutex;
     auto on_new_tensor_cb = [&](const TensorStorage& tensor_storage, ggml_tensor** dst_tensor) -> bool {
@@ -2544,7 +2602,12 @@ bool ModelLoader::save_to_gguf_file(const std::string& file_path, ggml_type type
         return true;
     };
 
-    bool success = load_tensors(on_new_tensor_cb);
+    // Export correctness matters more than host-side conversion throughput.
+    // The convert path mutates tensor bytes in-place (cast / quantize / permute / repack)
+    // before handing them to the GGUF writer, and we have observed nondeterministic full-model
+    // corruption when many tensors are processed concurrently. Keep GGUF export single-threaded
+    // so repeated source->GGUF conversions are byte-stable.
+    bool success = load_tensors(on_new_tensor_cb, 1, false);
     ggml_backend_free(backend);
     LOG_INFO("load tensors done");
     LOG_INFO("trying to save tensors to %s", file_path.c_str());
@@ -2605,6 +2668,78 @@ bool convert(const char* input_path,
     if (!model_loader.init_from_file(input_path)) {
         LOG_ERROR("init model loader from file failed: '%s'", input_path);
         return false;
+    }
+
+    if (const char* overlay_path = std::getenv("SD_DIFFUSION_MODEL_OVERLAY");
+        overlay_path != nullptr && overlay_path[0] != '\0') {
+        struct SavedEnv {
+            bool had = false;
+            std::string value;
+        };
+        std::map<std::string, SavedEnv> saved_env;
+        for (const char* key : {
+                 "GGML_HTP_CONTRACT_ACTIVE",
+                 "GGML_HTP_CONTRACT_EXPORT_PERMUTE",
+                 "GGML_HTP_CONTRACT_EXPORT_REPACK",
+             }) {
+            const char* cur = std::getenv(key);
+            SavedEnv s;
+            s.had = (cur != nullptr);
+            if (cur != nullptr) {
+                s.value = cur;
+            }
+            saved_env.emplace(key, std::move(s));
+        }
+
+        LOG_INFO("loading diffusion model overlay for convert from '%s'", overlay_path);
+        ModelLoader overlay_loader;
+        if (!overlay_loader.init_from_file(overlay_path)) {
+            LOG_ERROR("init overlay model loader from file failed: '%s'", overlay_path);
+            return false;
+        }
+
+        const auto include = sd_parse_csv_env("SD_DIFFUSION_MODEL_OVERLAY_INCLUDE");
+        size_t overlay_count = 0;
+        for (const auto& kv : overlay_loader.get_tensor_storage_map()) {
+            TensorStorage ts = kv.second;
+            // The source overlay may come either from raw safetensors names
+            // ("layers.0....") or from a prefixed GGUF view
+            // ("model.diffusion_model.layers.0...."). Match whichever naming
+            // convention the current baseline loader uses so we replace tensors
+            // instead of appending duplicate ones.
+            const std::string raw_name = ts.name;
+            const std::string prefixed_name =
+                (raw_name.rfind("model.diffusion_model.", 0) == 0) ? raw_name : "model.diffusion_model." + raw_name;
+            const auto& base_map = model_loader.get_tensor_storage_map();
+            if (base_map.find(raw_name) != base_map.end()) {
+                ts.name = raw_name;
+            } else if (base_map.find(prefixed_name) != base_map.end()) {
+                ts.name = prefixed_name;
+            } else {
+                ts.name = raw_name;
+            }
+            if (ts.name.find(".feed_forward.w2.weight") == std::string::npos) {
+                continue;
+            }
+            if (!include.empty() && !sd_name_match_any(ts.name, include)) {
+                continue;
+            }
+            model_loader.overlay_tensor_storage(ts, overlay_path);
+            overlay_count++;
+        }
+        LOG_INFO("applied convert overlay tensors: %zu", overlay_count);
+
+        for (const auto& kv : saved_env) {
+            if (kv.second.had) {
+                model_set_env_overwrite(kv.first.c_str(), kv.second.value);
+            } else {
+#ifdef _WIN32
+                _putenv_s(kv.first.c_str(), "");
+#else
+                unsetenv(kv.first.c_str());
+#endif
+            }
+        }
     }
 
     if (vae_path != nullptr && strlen(vae_path) > 0) {

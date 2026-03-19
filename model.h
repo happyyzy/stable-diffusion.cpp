@@ -307,6 +307,7 @@ public:
     bool init_from_file_and_convert_name(const std::string& file_path,
                                          const std::string& prefix = "",
                                          SDVersion version         = VERSION_COUNT);
+    void overlay_tensor_storage(const TensorStorage& tensor_storage, const std::string& file_path);
     SDVersion get_sd_version();
     std::map<ggml_type, uint32_t> get_wtype_stat();
     std::map<ggml_type, uint32_t> get_conditioner_wtype_stat();
