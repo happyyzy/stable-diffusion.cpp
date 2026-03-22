@@ -1276,6 +1276,14 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_attention_ext(struct ggml_context
     // HTP flash-attn kernel assumes token-major physical layout but does not receive strides.
     // Keep the permuted (non-contiguous) Q/K/V views so the physical layout matches what DSP expects.
     const bool htp_flash_keep_permuted_io = is_htp_backend && flash_attn;
+    // The active HTP f16 flash core already handles tail columns internally when qk_mask is null.
+    // Keep the host-side no-pad / no-synthetic-mask path behind an env gate and only enable it for
+    // the null-mask diffusion path we are optimizing here.
+    const bool htp_flash_prepare_in_kernel =
+        is_htp_backend &&
+        flash_attn &&
+        mask == nullptr &&
+        std::getenv("GGML_HTP_FLASH_PREP_IN_KERNEL") != nullptr;
 
     // Separate Q/K/V views for flash path vs fallback path (fallback prefers contiguous tensors).
     ggml_tensor * q_flash = q;
@@ -1360,6 +1368,11 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_attention_ext(struct ggml_context
     const bool htp_flash_disable_kv_scale =
         is_htp_backend && std::getenv("GGML_HTP_FLASH_DISABLE_KV_SCALE") != nullptr;
     const float flash_kv_scale = htp_flash_disable_kv_scale ? 1.0f : kv_scale;
+    // Keep kv_scale on the host path for now. The active no-pad/null-mask route is already enough
+    // to remove the expensive PAD/CONCAT chain, while the current HVX-side kv_scale path is not
+    // numerically aligned yet under the no-pad flash path.
+    const float host_flash_kv_scale = flash_kv_scale;
+    const float kernel_flash_kv_scale = 1.0f;
 
     auto build_kqv = [&](ggml_tensor* q_in, ggml_tensor* k_in, ggml_tensor* v_in, ggml_tensor* mask_in) -> ggml_tensor* {
         if (htp_flash_keep_permuted_io) {
@@ -1382,11 +1395,16 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_attention_ext(struct ggml_context
             }
 
             ggml_tensor * k_base_local = ggml_permute(ctx, k_in_local, 0, 2, 1, 3); // back to [d_head, n_kv_head, L_k, N]
+            if (htp_flash_prepare_in_kernel && kv_pad == 0 && host_flash_kv_scale == 1.0f && flash_kv_f32) {
+                // In the no-pad path, scale/cast usually materialize a dense base tensor already.
+                // Only force contiguity when there is no later op that would do so for us.
+                k_base_local = ggml_cont(ctx, k_base_local);
+            }
             if (kv_pad != 0) {
                 k_base_local = ggml_pad(ctx, k_base_local, 0, 0, kv_pad, 0);
             }
-            if (flash_kv_scale != 1.0f) {
-                k_base_local = ggml_ext_scale(ctx, k_base_local, flash_kv_scale);
+            if (host_flash_kv_scale != 1.0f) {
+                k_base_local = ggml_ext_scale(ctx, k_base_local, host_flash_kv_scale);
             }
             if (!flash_kv_f32) {
                 k_base_local = ggml_cast(ctx, k_base_local, GGML_TYPE_F16);
@@ -1394,11 +1412,15 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_attention_ext(struct ggml_context
             ggml_tensor * k_view = ggml_permute(ctx, k_base_local, 0, 2, 1, 3); // [d_head, L_k, n_kv_head, N]
 
             ggml_tensor * v_base_local = v_in; // [d_head, n_kv_head, L_k, N]
+            if (htp_flash_prepare_in_kernel && kv_pad == 0 && host_flash_kv_scale == 1.0f && flash_kv_f32 &&
+                !ggml_is_contiguous(v_base_local)) {
+                v_base_local = ggml_cont(ctx, v_base_local);
+            }
             if (kv_pad != 0) {
                 v_base_local = ggml_pad(ctx, v_base_local, 0, 0, kv_pad, 0);
             }
-            if (flash_kv_scale != 1.0f) {
-                v_base_local = ggml_ext_scale(ctx, v_base_local, flash_kv_scale);
+            if (host_flash_kv_scale != 1.0f) {
+                v_base_local = ggml_ext_scale(ctx, v_base_local, host_flash_kv_scale);
             }
             if (!flash_kv_f32) {
                 v_base_local = ggml_cast(ctx, v_base_local, GGML_TYPE_F16);
@@ -1413,8 +1435,8 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_attention_ext(struct ggml_context
             if (kv_pad != 0) {
                 k_in = ggml_pad(ctx, k_in, 0, kv_pad, 0, 0);
             }
-            if (flash_kv_scale != 1.0f) {
-                k_in = ggml_ext_scale(ctx, k_in, flash_kv_scale);
+            if (host_flash_kv_scale != 1.0f) {
+                k_in = ggml_ext_scale(ctx, k_in, host_flash_kv_scale);
             }
             if (!flash_kv_f32) {
                 k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
@@ -1425,8 +1447,8 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_attention_ext(struct ggml_context
             if (kv_pad != 0) {
                 v_in = ggml_pad(ctx, v_in, 0, kv_pad, 0, 0);
             }
-            if (flash_kv_scale != 1.0f) {
-                v_in = ggml_ext_scale(ctx, v_in, flash_kv_scale);
+            if (host_flash_kv_scale != 1.0f) {
+                v_in = ggml_ext_scale(ctx, v_in, host_flash_kv_scale);
             }
             if (!flash_kv_f32) {
                 v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
@@ -1460,8 +1482,13 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_attention_ext(struct ggml_context
 
         auto out = ggml_flash_attn_ext(ctx, q_in, k_in, v_in, mask_in, scale / flash_kv_scale, 0, 0);
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
-        if (flash_kv_scale != 1.0f) {
-            out = ggml_ext_scale(ctx, out, 1.0f / flash_kv_scale);
+        if (kernel_flash_kv_scale != 1.0f) {
+            // flash_attn_ext op_params[3] is reserved for precision, and ggml-hexagon uses [4] for
+            // flash flags. Keep this HTP-only kv-scale side channel in a separate slot.
+            memcpy(&out->op_params[5], &kernel_flash_kv_scale, sizeof(kernel_flash_kv_scale));
+        }
+        if (host_flash_kv_scale != 1.0f) {
+            out = ggml_ext_scale(ctx, out, 1.0f / host_flash_kv_scale);
         }
         return out;
     };
@@ -1469,7 +1496,7 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_attention_ext(struct ggml_context
     if (flash_attn) {
         // LOG_DEBUG("attention_ext L_q:%d L_k:%d n_head:%d C:%d d_head:%d N:%d", L_q, L_k, n_head, C, d_head, N);
         bool can_use_flash_attn = true;
-        if (can_use_flash_attn && L_k % 256 != 0) {
+        if (can_use_flash_attn && L_k % 256 != 0 && !htp_flash_prepare_in_kernel) {
             kv_pad = GGML_PAD(L_k, 256) - static_cast<int>(L_k);
         }
 
