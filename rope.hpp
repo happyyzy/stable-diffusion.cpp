@@ -125,7 +125,7 @@ namespace Rope {
                                                       void* userdata) {
         GGML_ASSERT(dst != nullptr && x != nullptr && weight != nullptr && theta != nullptr);
         GGML_ASSERT(dst->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32 && theta->type == GGML_TYPE_F32);
-        GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(x) && ggml_is_contiguous(weight) && ggml_is_contiguous(theta));
+        GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(weight) && ggml_is_contiguous(theta));
 
         const bool interleaved =
             (reinterpret_cast<uintptr_t>(userdata) & static_cast<uintptr_t>(GGML_HTP_ZIMG_ROPE_FLAG_INTERLEAVED)) != 0;
@@ -133,6 +133,7 @@ namespace Rope {
         const int64_t d_head  = dst->ne[0];
         const int64_t seq_len = dst->ne[1];
         const int64_t rows    = dst->ne[2] * dst->ne[3];
+        const int64_t rows_per_batch = dst->ne[2];
         const int64_t half    = d_head / 2;
         const float   eps     = 1e-6f;
 
@@ -140,11 +141,16 @@ namespace Rope {
         GGML_ASSERT(x->ne[0] == d_head && x->ne[1] == seq_len && x->ne[2] * x->ne[3] == rows);
         GGML_ASSERT(weight->ne[0] == d_head && weight->ne[1] == 1 && weight->ne[2] * weight->ne[3] == rows);
         GGML_ASSERT(theta->ne[0] == 2 && theta->ne[1] == 2 && theta->ne[2] == half && theta->ne[3] == seq_len);
+        GGML_ASSERT(x->nb[0] == sizeof(float) && x->nb[1] % sizeof(float) == 0 &&
+                    x->nb[2] % sizeof(float) == 0 && x->nb[3] % sizeof(float) == 0);
 
         const float* src_data    = static_cast<const float*>(x->data);
         const float* weight_data = static_cast<const float*>(weight->data);
         const float* theta_data  = static_cast<const float*>(theta->data);
         float* dst_data          = static_cast<float*>(dst->data);
+        const int64_t src_nb1    = x->nb[1] / (int64_t) sizeof(float);
+        const int64_t src_nb2    = x->nb[2] / (int64_t) sizeof(float);
+        const int64_t src_nb3    = x->nb[3] / (int64_t) sizeof(float);
 
         const int64_t total = rows * seq_len;
         const int64_t begin = (total * ith) / nth;
@@ -153,8 +159,10 @@ namespace Rope {
         for (int64_t flat = begin; flat < end; ++flat) {
             const int64_t row   = flat / seq_len;
             const int64_t token = flat % seq_len;
+            const int64_t batch = row / rows_per_batch;
+            const int64_t row_in_batch = row % rows_per_batch;
 
-            const float* src    = src_data + (row * seq_len + token) * d_head;
+            const float* src    = src_data + batch * src_nb3 + row_in_batch * src_nb2 + token * src_nb1;
             const float* w      = weight_data + row * d_head;
             const float* rope   = theta_data + token * (2 * d_head);
             float* out          = dst_data + (row * seq_len + token) * d_head;

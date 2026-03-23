@@ -493,16 +493,47 @@ namespace ZImage {
                 if (use_htp_fused_qk_norm_rope) {
                     auto q_w = q_norm->get_weight_tensor();
                     auto k_w = k_norm->get_weight_tensor();
+                    const bool use_htp_qknorm_direct_input =
+                        N == 1 && std::getenv("GGML_HTP_ZIMG_QKNORM_ROPE_DIRECT_INPUT") != nullptr;
 
-                    auto q_in = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, q, 0, 2, 1, 3));
-                    auto k_in = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, k, 0, 2, 1, 3));
-                    q_in      = ggml_reshape_3d(ctx->ggml_ctx, q_in, head_dim, n_token, num_heads * N);
-                    k_in      = ggml_reshape_3d(ctx->ggml_ctx, k_in, head_dim, n_token, num_kv_heads * N);
+                    ggml_tensor * q_in;
+                    ggml_tensor * k_in;
+                    ggml_tensor * q_w_rep;
+                    ggml_tensor * k_w_rep;
+                    if (use_htp_qknorm_direct_input) {
+                        q_in = ggml_view_4d(ctx->ggml_ctx,
+                                            q,
+                                            q->ne[0],
+                                            q->ne[2],
+                                            q->ne[1],
+                                            q->ne[3],
+                                            q->nb[2],
+                                            q->nb[1],
+                                            q->nb[3],
+                                            0);
+                        k_in = ggml_view_4d(ctx->ggml_ctx,
+                                            k,
+                                            k->ne[0],
+                                            k->ne[2],
+                                            k->ne[1],
+                                            k->ne[3],
+                                            k->nb[2],
+                                            k->nb[1],
+                                            k->nb[3],
+                                            0);
+                        q_w_rep = ggml_repeat_4d(ctx->ggml_ctx, q_w, q_w->ne[0], 1, num_heads, N);
+                        k_w_rep = ggml_repeat_4d(ctx->ggml_ctx, k_w, k_w->ne[0], 1, num_kv_heads, N);
+                    } else {
+                        q_in = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, q, 0, 2, 1, 3));
+                        k_in = ggml_cont(ctx->ggml_ctx, ggml_permute(ctx->ggml_ctx, k, 0, 2, 1, 3));
+                        q_in = ggml_reshape_3d(ctx->ggml_ctx, q_in, head_dim, n_token, num_heads * N);
+                        k_in = ggml_reshape_3d(ctx->ggml_ctx, k_in, head_dim, n_token, num_kv_heads * N);
 
-                    auto q_w_rep = ggml_repeat_4d(ctx->ggml_ctx, q_w, q_w->ne[0], 1, num_heads * N, 1);
-                    auto k_w_rep = ggml_repeat_4d(ctx->ggml_ctx, k_w, k_w->ne[0], 1, num_kv_heads * N, 1);
-                    q_w_rep      = ggml_reshape_3d(ctx->ggml_ctx, q_w_rep, q_w->ne[0], 1, num_heads * N);
-                    k_w_rep      = ggml_reshape_3d(ctx->ggml_ctx, k_w_rep, k_w->ne[0], 1, num_kv_heads * N);
+                        q_w_rep = ggml_repeat_4d(ctx->ggml_ctx, q_w, q_w->ne[0], 1, num_heads * N, 1);
+                        k_w_rep = ggml_repeat_4d(ctx->ggml_ctx, k_w, k_w->ne[0], 1, num_kv_heads * N, 1);
+                        q_w_rep = ggml_reshape_3d(ctx->ggml_ctx, q_w_rep, q_w->ne[0], 1, num_heads * N);
+                        k_w_rep = ggml_reshape_3d(ctx->ggml_ctx, k_w_rep, k_w->ne[0], 1, num_kv_heads * N);
+                    }
 
                     const uintptr_t flags =
                         static_cast<uintptr_t>(GGML_HTP_ZIMG_ROPE_FLAG_INTERLEAVED);
