@@ -1286,7 +1286,8 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_attention_ext(struct ggml_context
         mask == nullptr &&
         std::getenv("GGML_HTP_FLASH_PREP_IN_KERNEL") != nullptr;
     const bool htp_flash_qknorm_direct =
-        htp_flash_prepare_in_kernel &&
+        is_htp_backend &&
+        flash_attn &&
         skip_reshape &&
         std::getenv("GGML_HTP_FLASH_QKNORM_DIRECT") != nullptr;
     const bool htp_flash_qknorm_direct_k =

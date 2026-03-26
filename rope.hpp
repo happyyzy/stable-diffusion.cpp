@@ -67,8 +67,10 @@ namespace Rope {
         GGML_ASSERT(dst->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && theta->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(x) && ggml_is_contiguous(theta));
 
-        const bool interleaved =
-            (reinterpret_cast<uintptr_t>(userdata) & static_cast<uintptr_t>(GGML_HTP_ZIMG_ROPE_FLAG_INTERLEAVED)) != 0;
+        const uintptr_t packed_userdata = reinterpret_cast<uintptr_t>(userdata);
+        const uint32_t rope_flags       = ggml_htp_zimg_qknorm_rope_unpack_flags(packed_userdata);
+        const uint32_t theta_start      = ggml_htp_zimg_qknorm_rope_unpack_theta_start(packed_userdata);
+        const bool interleaved          = (rope_flags & static_cast<uint32_t>(GGML_HTP_ZIMG_ROPE_FLAG_INTERLEAVED)) != 0;
 
         const int64_t d_head  = dst->ne[0];
         const int64_t seq_len = dst->ne[1];
@@ -77,7 +79,7 @@ namespace Rope {
 
         GGML_ASSERT(d_head > 0 && (d_head % 2) == 0);
         GGML_ASSERT(x->ne[0] == d_head && x->ne[1] == seq_len && x->ne[2] * x->ne[3] == rows);
-        GGML_ASSERT(theta->ne[0] == 2 && theta->ne[1] == 2 && theta->ne[2] == half && theta->ne[3] == seq_len);
+        GGML_ASSERT(theta->ne[0] == 2 && theta->ne[1] == 2 && theta->ne[2] == half && theta->ne[3] >= theta_start + seq_len);
 
         const float* src_data   = static_cast<const float*>(x->data);
         const float* theta_data = static_cast<const float*>(theta->data);
@@ -127,8 +129,10 @@ namespace Rope {
         GGML_ASSERT(dst->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && weight->type == GGML_TYPE_F32 && theta->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(weight) && ggml_is_contiguous(theta));
 
-        const bool interleaved =
-            (reinterpret_cast<uintptr_t>(userdata) & static_cast<uintptr_t>(GGML_HTP_ZIMG_ROPE_FLAG_INTERLEAVED)) != 0;
+        const uintptr_t packed_userdata = reinterpret_cast<uintptr_t>(userdata);
+        const uint32_t rope_flags       = ggml_htp_zimg_qknorm_rope_unpack_flags(packed_userdata);
+        const uint32_t theta_start      = ggml_htp_zimg_qknorm_rope_unpack_theta_start(packed_userdata);
+        const bool interleaved          = (rope_flags & static_cast<uint32_t>(GGML_HTP_ZIMG_ROPE_FLAG_INTERLEAVED)) != 0;
 
         const int64_t d_head  = dst->ne[0];
         const int64_t seq_len = dst->ne[1];
@@ -140,13 +144,13 @@ namespace Rope {
         GGML_ASSERT(d_head > 0 && (d_head % 2) == 0);
         GGML_ASSERT(x->ne[0] == d_head && x->ne[1] == seq_len && x->ne[2] * x->ne[3] == rows);
         GGML_ASSERT(weight->ne[0] == d_head && weight->ne[1] == 1 && weight->ne[2] * weight->ne[3] == rows);
-        GGML_ASSERT(theta->ne[0] == 2 && theta->ne[1] == 2 && theta->ne[2] == half && theta->ne[3] == seq_len);
+        GGML_ASSERT(theta->ne[0] == 2 && theta->ne[1] == 2 && theta->ne[2] == half && theta->ne[3] >= theta_start + seq_len);
         GGML_ASSERT(x->nb[0] == sizeof(float) && x->nb[1] % sizeof(float) == 0 &&
                     x->nb[2] % sizeof(float) == 0 && x->nb[3] % sizeof(float) == 0);
 
         const float* src_data    = static_cast<const float*>(x->data);
         const float* weight_data = static_cast<const float*>(weight->data);
-        const float* theta_data  = static_cast<const float*>(theta->data);
+        const float* theta_data  = static_cast<const float*>(theta->data) + (size_t) theta_start * (size_t) (2 * d_head);
         float* dst_data          = static_cast<float*>(dst->data);
         const int64_t src_nb1    = x->nb[1] / (int64_t) sizeof(float);
         const int64_t src_nb2    = x->nb[2] / (int64_t) sizeof(float);
