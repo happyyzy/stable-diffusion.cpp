@@ -2650,6 +2650,30 @@ public:
           force_prec_f32(force_prec_f32),
           scale(scale) {}
 
+    int64_t get_in_features() const {
+        return in_features;
+    }
+
+    int64_t get_out_features() const {
+        return out_features;
+    }
+
+    bool has_bias() const {
+        return bias;
+    }
+
+    float get_scale() const {
+        return scale;
+    }
+
+    struct ggml_tensor* get_weight_tensor() {
+        return params["weight"];
+    }
+
+    struct ggml_tensor* get_bias_tensor() {
+        return bias ? params["bias"] : nullptr;
+    }
+
     struct ggml_tensor* forward(GGMLRunnerContext* ctx, struct ggml_tensor* x) {
         struct ggml_tensor* w = params["weight"];
         struct ggml_tensor* b = nullptr;

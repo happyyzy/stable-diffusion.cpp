@@ -11,6 +11,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "ggml-cpu.h"
 #include "ggml_extend.hpp"
 #include "model.h"
 #include "rope.hpp"
@@ -322,6 +323,88 @@ namespace Flux {
 
     static inline uintptr_t flux_htp_qknorm_rope_userdata(uint32_t flags, uint32_t theta_start = 0u) {
         return ggml_htp_zimg_qknorm_rope_pack_userdata(flags, theta_start);
+    }
+
+    static inline bool flux_htp_single_stream_linear2_fused_requested(ggml_backend_t backend) {
+        static int enabled = -1;
+        if (enabled < 0) {
+            const char* env = std::getenv("GGML_HTP_FLUX_SS_LINEAR2_FUSED");
+            enabled         = (env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0) ? 1 : 0;
+        }
+        const bool is_htp_backend = backend != nullptr && std::strcmp(ggml_backend_name(backend), "MyHTP") == 0;
+        return enabled != 0 && is_htp_backend;
+    }
+
+    static inline void flux_single_stream_linear2_apply_f32(struct ggml_tensor* dst,
+                                                            const struct ggml_tensor* attn,
+                                                            const struct ggml_tensor* mlp,
+                                                            const struct ggml_tensor* weight,
+                                                            int ith,
+                                                            int nth,
+                                                            void* userdata) {
+        (void) userdata;
+        GGML_ASSERT(dst != nullptr && attn != nullptr && mlp != nullptr && weight != nullptr);
+        GGML_ASSERT(dst->type == GGML_TYPE_F32 && attn->type == GGML_TYPE_F32 && mlp->type == GGML_TYPE_F32);
+        GGML_ASSERT(dst->nb[0] == sizeof(float) && attn->nb[0] == sizeof(float) && mlp->nb[0] == sizeof(float));
+        GGML_ASSERT(ggml_is_contiguous(dst));
+
+        const int64_t out_dim = dst->ne[0];
+        const int64_t attn_k  = attn->ne[0];
+        const int64_t mlp_k   = mlp->ne[0];
+
+        GGML_ASSERT(attn->ne[1] == mlp->ne[1] && attn->ne[2] == mlp->ne[2] && attn->ne[3] == mlp->ne[3]);
+        GGML_ASSERT(dst->ne[0] == out_dim && dst->ne[1] == attn->ne[1] && dst->ne[2] == attn->ne[2] && dst->ne[3] == attn->ne[3]);
+        GGML_ASSERT(weight->ne[0] == attn_k + mlp_k && weight->ne[1] == out_dim);
+
+        const int64_t rows     = dst->ne[1] * dst->ne[2] * dst->ne[3];
+        const int64_t begin    = (rows * ith) / nth;
+        const int64_t end      = (rows * (ith + 1)) / nth;
+        const int64_t attn_nb1 = attn->nb[1] / (int64_t) sizeof(float);
+        const int64_t attn_nb2 = attn->nb[2] / (int64_t) sizeof(float);
+        const int64_t attn_nb3 = attn->nb[3] / (int64_t) sizeof(float);
+        const int64_t mlp_nb1  = mlp->nb[1] / (int64_t) sizeof(float);
+        const int64_t mlp_nb2  = mlp->nb[2] / (int64_t) sizeof(float);
+        const int64_t mlp_nb3  = mlp->nb[3] / (int64_t) sizeof(float);
+
+        const float* attn_data = static_cast<const float*>(attn->data);
+        const float* mlp_data  = static_cast<const float*>(mlp->data);
+        float* dst_data        = static_cast<float*>(dst->data);
+
+        for (int64_t flat = begin; flat < end; ++flat) {
+            const int64_t i3  = flat / (dst->ne[1] * dst->ne[2]);
+            const int64_t rem = flat % (dst->ne[1] * dst->ne[2]);
+            const int64_t i2  = rem / dst->ne[1];
+            const int64_t i1  = rem % dst->ne[1];
+
+            const float* attn_row = attn_data + i1 * attn_nb1 + i2 * attn_nb2 + i3 * attn_nb3;
+            const float* mlp_row  = mlp_data + i1 * mlp_nb1 + i2 * mlp_nb2 + i3 * mlp_nb3;
+            float* out_row        = dst_data + flat * out_dim;
+
+            for (int64_t o = 0; o < out_dim; ++o) {
+                float sum = 0.0f;
+                for (int64_t k0 = 0; k0 < attn_k; ++k0) {
+                    sum += attn_row[k0] * ggml_get_f32_nd(weight, (int) k0, (int) o, 0, 0);
+                }
+                for (int64_t k1 = 0; k1 < mlp_k; ++k1) {
+                    sum += mlp_row[k1] * ggml_get_f32_nd(weight, (int) (attn_k + k1), (int) o, 0, 0);
+                }
+                out_row[o] = sum;
+            }
+        }
+    }
+
+    static inline ggml_tensor* flux_build_fused_single_stream_linear2(struct ggml_context* ctx,
+                                                                      ggml_tensor* attn,
+                                                                      ggml_tensor* mlp,
+                                                                      ggml_tensor* weight,
+                                                                      ggml_tensor* bias) {
+        ggml_tensor* out = ggml_map_custom3(ctx, attn, mlp, weight, flux_single_stream_linear2_apply_f32,
+                                            GGML_N_TASKS_MAX, nullptr);
+        ggml_set_name(out, GGML_HTP_FLUX_SS_LINEAR2_FUSED_NAME);
+        if (bias != nullptr) {
+            out = ggml_add_inplace(ctx, out, bias);
+        }
+        return out;
     }
 
     static inline ggml_tensor* flux_build_fused_qknorm_rope_input(struct ggml_context* ctx,
@@ -1114,8 +1197,26 @@ namespace Flux {
             } else {
                 mlp = ggml_ext_gelu(ctx->ggml_ctx, mlp, true);
             }
-            auto attn_mlp = ggml_concat(ctx->ggml_ctx, attn, mlp, 0);  // [N, n_token, hidden_size + mlp_hidden_dim]
-            auto output   = linear2->forward(ctx, attn_mlp);           // [N, n_token, hidden_size]
+            ggml_tensor* output = nullptr;
+            const bool use_htp_fused_single_stream_linear2 =
+                ctx->weight_adapter == nullptr &&
+                Flux::flux_htp_single_stream_linear2_fused_requested(ctx->backend) &&
+                linear2->get_scale() == 1.0f &&
+                linear2->get_weight_tensor() != nullptr &&
+                linear2->get_weight_tensor()->type == GGML_TYPE_Q8_0 &&
+                linear2->get_in_features() == attn->ne[0] + mlp->ne[0] &&
+                linear2->get_out_features() == attn->ne[0] &&
+                attn->ne[1] == mlp->ne[1] &&
+                attn->ne[2] == mlp->ne[2] &&
+                attn->ne[3] == mlp->ne[3];
+            if (use_htp_fused_single_stream_linear2) {
+                output = Flux::flux_build_fused_single_stream_linear2(ctx->ggml_ctx, attn, mlp,
+                                                                      linear2->get_weight_tensor(),
+                                                                      linear2->get_bias_tensor());
+            } else {
+                auto attn_mlp = ggml_concat(ctx->ggml_ctx, attn, mlp, 0);  // [N, n_token, hidden_size + mlp_hidden_dim]
+                output        = linear2->forward(ctx, attn_mlp);           // [N, n_token, hidden_size]
+            }
 
             output = ggml_add(ctx->ggml_ctx, x, ggml_mul(ctx->ggml_ctx, output, mod.gate));
             return output;
