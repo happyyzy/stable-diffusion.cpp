@@ -1198,14 +1198,20 @@ namespace Flux {
                 mlp = ggml_ext_gelu(ctx->ggml_ctx, mlp, true);
             }
             ggml_tensor* output = nullptr;
+            const int64_t fused_linear2_total_k = attn->ne[0] + mlp->ne[0];
             const bool use_htp_fused_single_stream_linear2 =
                 ctx->weight_adapter == nullptr &&
                 Flux::flux_htp_single_stream_linear2_fused_requested(ctx->backend) &&
                 linear2->get_scale() == 1.0f &&
                 linear2->get_weight_tensor() != nullptr &&
                 linear2->get_weight_tensor()->type == GGML_TYPE_Q8_0 &&
-                linear2->get_in_features() == attn->ne[0] + mlp->ne[0] &&
+                linear2->get_in_features() == fused_linear2_total_k &&
                 linear2->get_out_features() == attn->ne[0] &&
+                (attn->ne[0] % 32) == 0 &&
+                (mlp->ne[0] % 32) == 0 &&
+                (linear2->get_out_features() % 32) == 0 &&
+                (fused_linear2_total_k % 32) == 0 &&
+                fused_linear2_total_k <= 16384 &&
                 attn->ne[1] == mlp->ne[1] &&
                 attn->ne[2] == mlp->ne[2] &&
                 attn->ne[3] == mlp->ne[3];
