@@ -35,7 +35,7 @@ class TensorRouteRule:
     op_family: str
 
 
-DEFAULT_VARIANTS: List[Variant] = [
+ALL_VARIANTS: List[Variant] = [
     Variant(
         name="f16-hmx",
         out_type="f16",
@@ -60,6 +60,20 @@ DEFAULT_VARIANTS: List[Variant] = [
         ),
         contract_id="sdcpp.hmx.v1.iq4q8",
     ),
+    Variant(
+        name="wf8-hmx",
+        out_type="wf8_hmx",
+        tensor_type_rules="",
+        contract_id="sdcpp.hmx.v1.wf8",
+    ),
+]
+
+VARIANT_BY_NAME = {variant.name: variant for variant in ALL_VARIANTS}
+
+DEFAULT_VARIANT_NAMES = [
+    "f16-hmx",
+    "q4_0_q8_0-hmx",
+    "iq4_nl_q8_0-hmx",
 ]
 
 
@@ -76,6 +90,7 @@ Z_IMAGE_ROUTE_RULES: List[TensorRouteRule] = [
 
 MATMUL_LAYOUT_BY_QUANT = {
     "f16": "permute_32x32.v1",
+    "wf8_hmx": "compact_f8.v1",
     "q4_0": "common_deq.v1",
     "q8_0": "common_deq.v1",
     "iq4_nl": "common_deq.v1",
@@ -113,6 +128,11 @@ def parse_args() -> argparse.Namespace:
         default="z_image",
         choices=["z_image"],
         help="routing template used for sidecar generation",
+    )
+    parser.add_argument(
+        "--variants",
+        default=",".join(DEFAULT_VARIANT_NAMES),
+        help=f"comma-separated variant names (available: {', '.join(VARIANT_BY_NAME.keys())})",
     )
     return parser.parse_args()
 
@@ -153,6 +173,26 @@ def parse_tensor_type_rules(tensor_type_rules: str) -> List[tuple[str, str]]:
         if not pattern or not qtype:
             continue
         out.append((pattern, qtype))
+    return out
+
+
+def parse_variants(spec: str) -> List[Variant]:
+    names = [item.strip() for item in spec.split(",") if item.strip()]
+    if not names:
+        raise ValueError("no variants selected")
+
+    out: List[Variant] = []
+    seen = set()
+    for name in names:
+        variant = VARIANT_BY_NAME.get(name)
+        if variant is None:
+            raise ValueError(
+                f"unknown variant '{name}', available: {', '.join(VARIANT_BY_NAME.keys())}"
+            )
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append(variant)
     return out
 
 
@@ -200,7 +240,7 @@ def build_sidecar_for_variant(model_path: Path, variant: Variant, output_path: P
                         "layout_contract_id": MATMUL_LAYOUT_BY_QUANT.get(quant_type, "unknown"),
                         "quant_type": quant_type,
                         "preferred_backend": rule.preferred_backend,
-                        "requires_prepack": quant_type in {"f16", "q4_0", "q8_0", "iq4_nl"},
+                        "requires_prepack": quant_type in {"f16", "wf8_hmx", "q4_0", "q8_0", "iq4_nl"},
                         "route_tag": rule.op_family,
                     }
                 )
@@ -213,7 +253,7 @@ def build_sidecar_for_variant(model_path: Path, variant: Variant, output_path: P
                     "layout_contract_id": MATMUL_LAYOUT_BY_QUANT.get(variant.out_type, "unknown"),
                     "quant_type": variant.out_type,
                     "preferred_backend": rule.preferred_backend,
-                    "requires_prepack": variant.out_type in {"f16", "q4_0", "q8_0", "iq4_nl"},
+                    "requires_prepack": variant.out_type in {"f16", "wf8_hmx", "q4_0", "q8_0", "iq4_nl"},
                     "route_tag": rule.op_family,
                 }
             )
@@ -252,9 +292,14 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     prefix = args.prefix.strip() or model_path.stem
+    try:
+        variants = parse_variants(args.variants)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     jobs = []
-    for variant in DEFAULT_VARIANTS:
+    for variant in variants:
         variant_dir = output_dir / variant.name
         variant_dir.mkdir(parents=True, exist_ok=True)
         out_path = variant_dir / f"{prefix}.gguf"
@@ -284,6 +329,7 @@ def main() -> int:
         "output_dir": str(output_dir),
         "cli_bin": str(cli_bin),
         "model_family": args.model_family,
+        "variants": [variant.name for variant in variants],
         "jobs": jobs,
     }
 

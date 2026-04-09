@@ -943,6 +943,12 @@ namespace ZImage {
             int64_t n_txt_token = context->ne[1];
 
             auto t_emb = t_embedder->forward(ctx, timestep);
+            if (zimg_dump_l0_enabled()) {
+                zimg_cache_tensor(ctx, "zimg_l0_x_in", x);
+                zimg_cache_tensor(ctx, "zimg_l0_timestep_in", timestep);
+                zimg_cache_tensor(ctx, "zimg_l0_context_in", context);
+                zimg_cache_tensor(ctx, "zimg_l0_t_emb", t_emb);
+            }
 
             auto txt_norm = cap_embedder_0->forward(ctx, context);
             auto txt      = cap_embedder_1->forward(ctx, txt_norm);  // [N, n_txt_token, hidden_size]

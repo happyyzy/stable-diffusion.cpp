@@ -1,7 +1,9 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <cstdarg>
 #include <cstdlib>
 #include <cstring>
@@ -236,6 +238,221 @@ void i64_to_i32_vec(int64_t* src, int32_t* dst, int64_t n) {
     }
 }
 
+static inline size_t sd_hmx_wf8_permuted_weight_index(int k, int i, int j) {
+    const int kt = k / 32;
+    const int i0 = i / 32;
+    const int i1 = i % 32;
+    const int j0 = j / 32;
+    const int j1 = j % 32;
+    const size_t tile_idx = (size_t)j0 * (size_t)kt + (size_t)i0;
+    static const uint8_t lane_perm[4] = {0, 2, 1, 3};
+    const size_t tile_row = (size_t)(i1 / 4) * 4 + (size_t)(j1 / 8);
+    const size_t tile_col = (size_t)(j1 % 8) * 4 + (size_t)lane_perm[i1 % 4];
+    return tile_idx * 1024 + tile_row * 32 + tile_col;
+}
+
+static float sd_decode_fp8_e4m3fn_export(uint8_t code) {
+    const int sign = (code & 0x80) ? -1 : 1;
+    const int exp  = (code >> 3) & 0x0f;
+    const int mant = code & 0x07;
+    if (exp == 0x0f && mant == 0x07) {
+        return 0.0f;
+    }
+    if (exp == 0) {
+        if (mant == 0) {
+            return 0.0f;
+        }
+        return sign * std::ldexp((float) mant, -9);
+    }
+    return sign * std::ldexp(1.0f + (float) mant / 8.0f, exp - 7);
+}
+
+struct sd_wf8_export_code_value {
+    float value;
+    uint8_t code;
+};
+
+static const std::array<sd_wf8_export_code_value, 254>& sd_wf8_export_sorted_codebook() {
+    static const std::array<sd_wf8_export_code_value, 254> table = []() {
+        std::array<sd_wf8_export_code_value, 254> out{};
+        size_t idx = 0;
+        for (int code = 0; code < 256; ++code) {
+            if (((code >> 3) & 0x0f) == 0x0f && (code & 0x07) == 0x07) {
+                continue;
+            }
+            if (code == 0x80) {
+                continue;
+            }
+            out[idx++] = { sd_decode_fp8_e4m3fn_export((uint8_t) code), (uint8_t) code };
+        }
+        std::sort(out.begin(), out.end(), [](const sd_wf8_export_code_value& a, const sd_wf8_export_code_value& b) {
+            if (a.value != b.value) {
+                return a.value < b.value;
+            }
+            return a.code < b.code;
+        });
+        return out;
+    }();
+    return table;
+}
+
+static uint8_t sd_encode_fp8_e4m3fn_best_export(float x) {
+    x *= 256.0f;
+    if (x == 0.0f) {
+        return 0x00;
+    }
+
+    const auto& table = sd_wf8_export_sorted_codebook();
+    auto it = std::lower_bound(
+        table.begin(), table.end(), x,
+        [](const sd_wf8_export_code_value& e, float v) {
+            return e.value < v;
+        });
+
+    const sd_wf8_export_code_value* best = nullptr;
+    auto consider = [&](const sd_wf8_export_code_value* cand) {
+        if (cand == nullptr) {
+            return;
+        }
+        if (best == nullptr) {
+            best = cand;
+            return;
+        }
+        const float cand_err = std::fabs(cand->value - x);
+        const float best_err = std::fabs(best->value - x);
+        if (cand_err < best_err || (cand_err == best_err && cand->code < best->code)) {
+            best = cand;
+        }
+    };
+
+    if (it != table.end()) {
+        consider(&(*it));
+        const float v = it->value;
+        for (auto jt = it + 1; jt != table.end() && jt->value == v; ++jt) {
+            consider(&(*jt));
+        }
+    }
+    if (it != table.begin()) {
+        auto jt = it;
+        do {
+            --jt;
+            consider(&(*jt));
+        } while (jt != table.begin() && jt->value == (jt - 1)->value);
+    }
+
+    return best ? best->code : 0;
+}
+
+static uint8_t sd_encode_fp8_e4m3fn_best_export_f16(ggml_fp16_t h) {
+    static const std::array<uint8_t, 65536> lut = []() {
+        std::array<uint8_t, 65536> out{};
+        for (uint32_t i = 0; i < out.size(); ++i) {
+            const ggml_fp16_t hval = (ggml_fp16_t) i;
+            out[i] = sd_encode_fp8_e4m3fn_best_export(ggml_fp16_to_fp32(hval));
+        }
+        return out;
+    }();
+    return lut[(uint16_t) h];
+}
+
+template<typename SrcT, typename EncodeFn>
+static void sd_pack_compact_wf8_weight_from_ggml_tensor_layout_impl(
+        uint8_t * dst,
+        const SrcT * src,
+        int k,
+        int n,
+        int nthread,
+        EncodeFn encode_fn) {
+    std::memset(dst, 0, (size_t) k * (size_t) n);
+
+    const int nthread_use = std::max(1, std::min(nthread, n));
+    if (nthread_use == 1) {
+        for (int j = 0; j < n; ++j) {
+            const size_t row_off = (size_t) j * (size_t) k;
+            for (int i = 0; i < k; ++i) {
+                dst[sd_hmx_wf8_permuted_weight_index(k, i, j)] = encode_fn(src[row_off + (size_t) i]);
+            }
+        }
+        return;
+    }
+
+    std::vector<std::thread> threads;
+    threads.reserve((size_t) nthread_use);
+    for (int tid = 0; tid < nthread_use; ++tid) {
+        const int j0 = (n * tid) / nthread_use;
+        const int j1 = (n * (tid + 1)) / nthread_use;
+        threads.emplace_back([=]() {
+            for (int j = j0; j < j1; ++j) {
+                const size_t row_off = (size_t) j * (size_t) k;
+                for (int i = 0; i < k; ++i) {
+                    dst[sd_hmx_wf8_permuted_weight_index(k, i, j)] = encode_fn(src[row_off + (size_t) i]);
+                }
+            }
+        });
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
+}
+
+static void sd_pack_compact_wf8_weight_from_ggml_tensor_layout(
+        uint8_t * dst,
+        const float * src,
+        int k,
+        int n,
+        int nthread) {
+    sd_pack_compact_wf8_weight_from_ggml_tensor_layout_impl(
+        dst, src, k, n, nthread,
+        [](float x) { return sd_encode_fp8_e4m3fn_best_export(x); });
+}
+
+static void sd_pack_compact_wf8_weight_from_f16_ggml_tensor_layout(
+        uint8_t * dst,
+        const ggml_fp16_t * src,
+        int k,
+        int n,
+        int nthread) {
+    sd_pack_compact_wf8_weight_from_ggml_tensor_layout_impl(
+        dst, src, k, n, nthread,
+        [](ggml_fp16_t x) { return sd_encode_fp8_e4m3fn_best_export_f16(x); });
+}
+
+template<typename DstT, typename StoreFn>
+static void sd_unpack_compact_wf8_weight_to_ggml_tensor_layout_impl(
+        DstT * dst,
+        const uint8_t * src,
+        int k,
+        int n,
+        StoreFn store_fn) {
+    for (int j = 0; j < n; ++j) {
+        const size_t row_off = (size_t) j * (size_t) k;
+        for (int i = 0; i < k; ++i) {
+            const float v = sd_decode_fp8_e4m3fn_export(src[sd_hmx_wf8_permuted_weight_index(k, i, j)]) / 256.0f;
+            dst[row_off + (size_t) i] = store_fn(v);
+        }
+    }
+}
+
+static void sd_unpack_compact_wf8_weight_to_f16_ggml_tensor_layout(
+        ggml_fp16_t * dst,
+        const uint8_t * src,
+        int k,
+        int n) {
+    sd_unpack_compact_wf8_weight_to_ggml_tensor_layout_impl(
+        dst, src, k, n,
+        [](float v) { return ggml_fp32_to_fp16(v); });
+}
+
+static void sd_unpack_compact_wf8_weight_to_f32_ggml_tensor_layout(
+        float * dst,
+        const uint8_t * src,
+        int k,
+        int n) {
+    sd_unpack_compact_wf8_weight_to_ggml_tensor_layout_impl(
+        dst, src, k, n,
+        [](float v) { return v; });
+}
+
 void convert_tensor(void* src,
                     ggml_type src_type,
                     void* dst,
@@ -246,6 +463,30 @@ void convert_tensor(void* src,
     if (src_type == dst_type) {
         size_t nbytes = n * ggml_type_size(src_type) / ggml_blck_size(src_type);
         memcpy(((char*)dst), ((char*)src), nbytes);
+    } else if (src_type == GGML_TYPE_WF8_HMX_PREPACK && dst_type == GGML_TYPE_F16) {
+        sd_unpack_compact_wf8_weight_to_f16_ggml_tensor_layout(
+            (ggml_fp16_t *) dst, (const uint8_t *) src, n_per_row, nrows);
+    } else if (src_type == GGML_TYPE_WF8_HMX_PREPACK && dst_type == GGML_TYPE_F32) {
+        sd_unpack_compact_wf8_weight_to_f32_ggml_tensor_layout(
+            (float *) dst, (const uint8_t *) src, n_per_row, nrows);
+    } else if (dst_type == GGML_TYPE_WF8_HMX_PREPACK) {
+        if (src_type == GGML_TYPE_F32) {
+            sd_pack_compact_wf8_weight_from_ggml_tensor_layout((uint8_t*) dst, (const float*) src, n_per_row, nrows,
+                                                               sd_get_num_physical_cores());
+        } else if (src_type == GGML_TYPE_F16) {
+            sd_pack_compact_wf8_weight_from_f16_ggml_tensor_layout((uint8_t*) dst, (const ggml_fp16_t*) src, n_per_row, nrows,
+                                                                   sd_get_num_physical_cores());
+        } else {
+            auto qtype = ggml_get_type_traits(src_type);
+            if (qtype->to_float == nullptr) {
+                throw std::runtime_error(sd_format("type %s unsupported for WF8_HMX_PREPACK conversion",
+                                                   ggml_type_name(src_type)));
+            }
+            std::vector<float> src_data_f32(n);
+            qtype->to_float(src, src_data_f32.data(), n);
+            sd_pack_compact_wf8_weight_from_ggml_tensor_layout((uint8_t*) dst, src_data_f32.data(), n_per_row, nrows,
+                                                               sd_get_num_physical_cores());
+        }
     } else if (src_type == GGML_TYPE_F32) {
         if (dst_type == GGML_TYPE_F16) {
             ggml_fp32_to_fp16_row((float*)src, (ggml_fp16_t*)dst, n);
@@ -1017,6 +1258,7 @@ static void model_loader_write_npu_contract_metadata(gguf_context* gguf_ctx) {
 
     gguf_set_val_str(gguf_ctx, "sd.npu.contract.id", contract_id);
     gguf_set_val_str(gguf_ctx, "sd.npu.contract.layout.matmul.f16", "permute_32x32.v1");
+    gguf_set_val_str(gguf_ctx, "sd.npu.contract.layout.matmul.wf8_hmx", "compact_f8.v1");
     gguf_set_val_str(gguf_ctx, "sd.npu.contract.layout.matmul.q4_0", "common_deq.v1");
     gguf_set_val_str(gguf_ctx, "sd.npu.contract.layout.matmul.q8_0", "common_deq.v1");
     gguf_set_val_str(gguf_ctx, "sd.npu.contract.layout.matmul.iq4_nl", "common_deq.v1");
@@ -1046,6 +1288,7 @@ static void model_loader_write_existing_npu_contract_metadata(gguf_context* gguf
 
     write_str("sd.npu.contract.id");
     write_str("sd.npu.contract.layout.matmul.f16");
+    write_str("sd.npu.contract.layout.matmul.wf8_hmx");
     write_str("sd.npu.contract.layout.matmul.q4_0");
     write_str("sd.npu.contract.layout.matmul.q8_0");
     write_str("sd.npu.contract.layout.matmul.iq4_nl");
@@ -1975,7 +2218,7 @@ static std::vector<std::pair<std::string, ggml_type>> parse_tensor_type_rules(co
         } else {
             for (size_t i = 0; i < GGML_TYPE_COUNT; i++) {
                 auto trait = ggml_get_type_traits((ggml_type)i);
-                if (trait->to_float && trait->type_size && type_name == trait->type_name) {
+                if (trait->type_size && type_name == trait->type_name) {
                     tensor_type = (ggml_type)i;
                 }
             }
@@ -2499,6 +2742,14 @@ bool ModelLoader::load_tensors(std::map<std::string, struct ggml_tensor*>& tenso
 bool ModelLoader::tensor_should_be_converted(const TensorStorage& tensor_storage, ggml_type type) {
     const std::string& name = tensor_storage.name;
     if (type != GGML_TYPE_COUNT) {
+        if (name == "x_embedder.weight" ||
+            name == "final_layer.adaLN_modulation.1.weight") {
+            return true;
+        }
+        if (type == GGML_TYPE_WF8_HMX_PREPACK &&
+            (tensor_storage.n_dims != 2 || (tensor_storage.ne[0] % 32) != 0 || (tensor_storage.ne[1] % 32) != 0)) {
+            // Pass, do not convert incompatible shapes to WF8 HMX prepack
+        } else
         if (ggml_is_quantized(type) && tensor_storage.ne[0] % ggml_blck_size(type) != 0) {
             // Pass, do not convert
         } else if (ends_with(name, ".bias")) {
@@ -2559,6 +2810,14 @@ bool ModelLoader::save_to_gguf_file(const std::string& file_path, ggml_type type
                 dst_type = tensor_type_rule.second;
                 break;
             }
+        }
+
+        // Keep the known BF16-only outliers off BF16 in exported GGUFs.
+        // These tensors are skipped by the generic MMDiT/FLUX conversion filters,
+        // but runtime on current CPU/HTP paths does not tolerate BF16 here.
+        if (name == "x_embedder.weight" ||
+            name == "final_layer.adaLN_modulation.1.weight") {
+            dst_type = GGML_TYPE_F16;
         }
 
         const bool should_convert = tensor_should_be_converted(tensor_storage, dst_type);
@@ -2640,6 +2899,11 @@ int64_t ModelLoader::get_params_mem_size(ggml_backend_t backend,
                 dst_type = tensor_type_rule.second;
                 break;
             }
+        }
+
+        if (name == "x_embedder.weight" ||
+            name == "final_layer.adaLN_modulation.1.weight") {
+            dst_type = GGML_TYPE_F16;
         }
 
         const bool should_convert = tensor_should_be_converted(tensor_storage, dst_type);
