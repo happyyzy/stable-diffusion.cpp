@@ -2829,7 +2829,7 @@ bool ModelLoader::save_to_gguf_file(const std::string& file_path, ggml_type type
         // are still cast to F16 to avoid BF16-only runtime gaps on some backends.
         if (!should_convert &&
             tensor_type == GGML_TYPE_BF16 &&
-            (dst_type == GGML_TYPE_F16 || ggml_is_quantized(dst_type))) {
+            (dst_type == GGML_TYPE_F16 || ggml_is_quantized(dst_type) || dst_type == GGML_TYPE_WF8_HMX_PREPACK)) {
             tensor_type = GGML_TYPE_F16;
         }
 
@@ -2910,7 +2910,7 @@ int64_t ModelLoader::get_params_mem_size(ggml_backend_t backend,
         if (should_convert) {
             tensor_storage.type = dst_type;
         } else if (tensor_storage.type == GGML_TYPE_BF16 &&
-                   (dst_type == GGML_TYPE_F16 || ggml_is_quantized(dst_type))) {
+                   (dst_type == GGML_TYPE_F16 || ggml_is_quantized(dst_type) || dst_type == GGML_TYPE_WF8_HMX_PREPACK)) {
             // Keep quantized exports BF16-free: tensors skipped from quantization
             // are still cast to F16 to avoid BF16-only runtime gaps on some backends.
             tensor_storage.type = GGML_TYPE_F16;
