@@ -1,237 +1,232 @@
-<p align="center">
-  <img src="./assets/logo.png" width="360x">
-</p>
+     
+   
+**stable-diffusion.cpp**  
+[![](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAABmJLR0QA/wD/AP+gvaeTAAAACXBIWXMAAA7EAAAOxAGVKw4bAAAADUlEQVR4nGP4//8/AwAI/AL+p5qgoAAAAABJRU5ErkJggg==)  
+](https://trendshift.io/repositories/9714 "https://trendshift.io/repositories/9714")  
+Diffusion model(SD,Flux,Wan,...) inference in pure C/C++  
+***Note that this project is under active development. ***  
+ ***  
+ API and command-line option may change frequently.***  
+**Adreno Optimization Fork**  
+This fork is purpose-built for **Adreno 830 + Q4_0** deployment (FLUX.2-klein / Z-Image / Qwen3-4B), with strict step-by-step numeric validation and reproducible logs/images.  
+- Full optimization logbook (GOAL-aligned): [docs/adreno/README.md](./docs/adreno/README.md "./docs/adreno/README.md")  
+- Per-step reports and assets: [docs/adreno/steps/ + ](./docs/adreno/steps/ "./docs/adreno/steps/")[docs/adreno/assets/](./docs/adreno/assets/ "./docs/adreno/assets/")  
+- Runtime/build switch catalog (with accepted presets): [docs/adreno/flags.md](./docs/adreno/flags.md "./docs/adreno/flags.md")  
+- Step-tag map: [docs/adreno/TAGS.md](./docs/adreno/TAGS.md "./docs/adreno/TAGS.md")  
+**Fork Branch Model**  
+- work/main: full Adreno optimization + debugging history (performance-first engineering branch)  
+- pr/main: upstream-oriented clean branch (minimal patch surface, neutral naming, merge-friendly docs)  
+**Performance Snapshot**  
+| | | | |  
+|-|-|-|-|  
+| **Case** | **Baseline** | **Optimized** | **Gain** |   
+| FLUX.2-klein 1024 flash-on (step forward) | 209.81 s/step | 31.256 s/step | 6.71x |   
+| Z-Image 1024 step1 flash-on | 341.70 s | 50.90 s | 6.71x |   
+| FLUX.2-klein 512 full 4-step final gate | 47.81 s total | 38.06 s total | 1.26x |   
+| FLUX.2-klein 512 edit final gate | 74.96 s total | 67.36 s total | 1.11x |   
+| FLUX.2-klein 512 edit (2 refs) gate | 100.21 s total | 98.93 s total | pass |   
+   
+**Before / After (Real Step Artifacts)**  
+| | | |  
+|-|-|-|  
+| **Scenario** | **Before** | **After** |   
+| FLUX.2-klein 512 final gate |   |   |   
+| FLUX.2-klein 512 edit (2 refs) |   |   |   
+| Z-Image 512 8-step |   |   |   
+   
+**Quick Entry (Adreno)**  
+1. Read the frozen presets in [docs/adreno/flags.md.](./docs/adreno/flags.md "./docs/adreno/flags.md")  
+2. Replay accepted steps from [docs/adreno/steps/.](./docs/adreno/steps/ "./docs/adreno/steps/")  
+3. Use work/main for performance experiments, and pr/main for upstream-ready patch preparation.  
 
-# stable-diffusion.cpp
+## Hexagon NPU Support
 
-<div align="center">
-<a href="https://trendshift.io/repositories/9714" target="_blank"><img src="https://trendshift.io/api/badge/repositories/9714" alt="leejet%2Fstable-diffusion.cpp | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</div>
+- Current HTP path targets Snapdragon `8 Gen1 / 8 Gen2 / 8 Gen3 / 8e / 8e5` class NPUs.
+- `FP8/WF8` models require `v79+` NPU. In practice this means the faster FP8 route is for `8e`-class `v79` and later only.
+- `FP8/WF8` gives both better throughput and better image quality than the old low-bit fallback route.
+- Current validation has already passed on `8e` and `8e5`.
 
-Diffusion model(SD,Flux,Wan,...) inference in pure C/C++
+### Z-Image Example
 
-***Note that this project is under active development. \
-API and command-line option may change frequently.***
+Prompt used in the local Z-Image compare:
 
-## Adreno Optimization Fork
-
-This fork is purpose-built for **Adreno 830 + Q4_0** deployment (FLUX.2-klein / Z-Image / Qwen3-4B), with strict step-by-step numeric validation and reproducible logs/images.
-
-- Full optimization logbook (GOAL-aligned): [`docs/adreno/README.md`](./docs/adreno/README.md)
-- Per-step reports and assets: [`docs/adreno/steps/`](./docs/adreno/steps/) + [`docs/adreno/assets/`](./docs/adreno/assets/)
-- Runtime/build switch catalog (with accepted presets): [`docs/adreno/flags.md`](./docs/adreno/flags.md)
-- Step-tag map: [`docs/adreno/TAGS.md`](./docs/adreno/TAGS.md)
-
-### Fork Branch Model
-
-- `work/main`: full Adreno optimization + debugging history (performance-first engineering branch)
-- `pr/main`: upstream-oriented clean branch (minimal patch surface, neutral naming, merge-friendly docs)
-
-### Performance Snapshot
-
-| Case | Baseline | Optimized | Gain |
-|---|---:|---:|---:|
-| FLUX.2-klein 1024 flash-on (step forward) | 209.81 s/step | 31.256 s/step | 6.71x |
-| Z-Image 1024 step1 flash-on | 341.70 s | 50.90 s | 6.71x |
-| FLUX.2-klein 512 full 4-step final gate | 47.81 s total | 38.06 s total | 1.26x |
-| FLUX.2-klein 512 edit final gate | 74.96 s total | 67.36 s total | 1.11x |
-| FLUX.2-klein 512 edit (2 refs) gate | 100.21 s total | 98.93 s total | pass |
-
-### Before / After (Real Step Artifacts)
-
-| Scenario | Before | After |
-|---|---|---|
-| FLUX.2-klein 512 final gate | <img src="./docs/adreno/assets/step27/step27_run1_full_cond.png" width="240" /> | <img src="./docs/adreno/assets/step27/step27_run2_cond256_pass.png" width="240" /> |
-| FLUX.2-klein 512 edit (2 refs) | <img src="./docs/adreno/assets/step29/step29_base_2ref_resize.png" width="240" /> | <img src="./docs/adreno/assets/step29/step29_pass_2ref_noresize_optmem.png" width="240" /> |
-| Z-Image 512 8-step | <img src="./docs/adreno/assets/step25/step25_base_qcomml_t1.png" width="240" /> | <img src="./docs/adreno/assets/step25/step25_outonly_hostattn_step25opt_new.png" width="240" /> |
-
-### Quick Entry (Adreno)
-
-1. Read the frozen presets in [`docs/adreno/flags.md`](./docs/adreno/flags.md).
-2. Replay accepted steps from [`docs/adreno/steps/`](./docs/adreno/steps/).
-3. Use `work/main` for performance experiments, and `pr/main` for upstream-ready patch preparation.
-
-## 🔥Important News
-
-* **2026/01/18** 🚀 stable-diffusion.cpp now supports **FLUX.2-klein**  
-  👉 Details: [PR #1193](https://github.com/leejet/stable-diffusion.cpp/pull/1193)
-
-* **2025/12/01** 🚀 stable-diffusion.cpp now supports **Z-Image**  
-  👉 Details: [PR #1020](https://github.com/leejet/stable-diffusion.cpp/pull/1020)
-
-* **2025/11/30** 🚀 stable-diffusion.cpp now supports **FLUX.2-dev**  
-  👉 Details: [PR #1016](https://github.com/leejet/stable-diffusion.cpp/pull/1016)
-
-* **2025/10/13** 🚀 stable-diffusion.cpp now supports **Qwen-Image-Edit / Qwen-Image-Edit 2509**  
-  👉 Details: [PR #877](https://github.com/leejet/stable-diffusion.cpp/pull/877)
-
-* **2025/10/12** 🚀 stable-diffusion.cpp now supports **Qwen-Image**  
-  👉 Details: [PR #851](https://github.com/leejet/stable-diffusion.cpp/pull/851)
-
-* **2025/09/14** 🚀 stable-diffusion.cpp now supports **Wan2.1 Vace**  
-  👉 Details: [PR #819](https://github.com/leejet/stable-diffusion.cpp/pull/819)
-
-* **2025/09/06** 🚀 stable-diffusion.cpp now supports **Wan2.1 / Wan2.2**  
-  👉 Details: [PR #778](https://github.com/leejet/stable-diffusion.cpp/pull/778)
-
-## Features
-
-- Plain C/C++ implementation based on [ggml](https://github.com/ggml-org/ggml), working in the same way as [llama.cpp](https://github.com/ggml-org/llama.cpp)
-- Super lightweight and without external dependencies
-- Supported models
-  - Image Models
-    - SD1.x, SD2.x, [SD-Turbo](https://huggingface.co/stabilityai/sd-turbo)
-    - SDXL, [SDXL-Turbo](https://huggingface.co/stabilityai/sdxl-turbo)
-    - [Some SD1.x and SDXL distilled models](./docs/distilled_sd.md)
-    - [SD3/SD3.5](./docs/sd3.md)
-    - [FLUX.1-dev/FLUX.1-schnell](./docs/flux.md)
-    - [FLUX.2-dev/FLUX.2-klein](./docs/flux2.md)
-    - [Chroma](./docs/chroma.md)
-    - [Chroma1-Radiance](./docs/chroma_radiance.md)
-    - [Qwen Image](./docs/qwen_image.md)
-    - [Z-Image](./docs/z_image.md)
-    - [Ovis-Image](./docs/ovis_image.md)
-  - Image Edit Models
-    - [FLUX.1-Kontext-dev](./docs/kontext.md)
-    - [Qwen Image Edit series](./docs/qwen_image_edit.md)
-  - Video Models
-    - [Wan2.1/Wan2.2](./docs/wan.md)
-  - [PhotoMaker](https://github.com/TencentARC/PhotoMaker) support.
-  - Control Net support with SD 1.5
-  - LoRA support, same as [stable-diffusion-webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui/wiki/Features#lora)
-  - Latent Consistency Models support (LCM/LCM-LoRA)
-  - Faster and memory efficient latent decoding with [TAESD](https://github.com/madebyollin/taesd)
-  - Upscale images generated with [ESRGAN](https://github.com/xinntao/Real-ESRGAN)
-- Supported backends
-  - CPU (AVX, AVX2 and AVX512 support for x86 architectures)
-  - CUDA
-  - Vulkan
-  - Metal
-  - OpenCL
-  - SYCL
-- Supported weight formats
-  - Pytorch checkpoint (`.ckpt` or `.pth`)
-  - Safetensors (`.safetensors`)
-  - GGUF (`.gguf`)
-- Supported platforms
-    - Linux
-    - Mac OS
-    - Windows
-    - Android (via Termux, [Local Diffusion](https://github.com/rmatif/Local-Diffusion))
-- Flash Attention for memory usage optimization
-- Negative prompt
-- [stable-diffusion-webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui) style tokenizer (not all the features, only token weighting for now)
-- VAE tiling processing for reduce memory usage
-- Sampling method
-    - `Euler A`
-    - `Euler`
-    - `Heun`
-    - `DPM2`
-    - `DPM++ 2M`
-    - [`DPM++ 2M v2`](https://github.com/AUTOMATIC1111/stable-diffusion-webui/discussions/8457)
-    - `DPM++ 2S a`
-    - [`LCM`](https://github.com/AUTOMATIC1111/stable-diffusion-webui/issues/13952)
-- Cross-platform reproducibility
-    - `--rng cuda`, default, consistent with the `stable-diffusion-webui GPU RNG`
-    - `--rng cpu`, consistent with the `comfyui RNG`
-- Embedds generation parameters into png output as webui-compatible text string
-
-## Quick Start
-
-### Get the sd executable
-
-- Download pre-built binaries from the [releases page](https://github.com/leejet/stable-diffusion.cpp/releases)
-- Or build from source by following the [build guide](./docs/build.md)
-
-### Download model weights
-
-- download weights(.ckpt or .safetensors or .gguf). For example
-    - Stable Diffusion v1.5 from https://huggingface.co/stable-diffusion-v1-5/stable-diffusion-v1-5 
-
-    ```sh
-    curl -L -O https://huggingface.co/runwayml/stable-diffusion-v1-5/resolve/main/v1-5-pruned-emaonly.safetensors
-    ```
-
-### Generate an image with just one command
-
-```sh
-./bin/sd-cli -m ../models/v1-5-pruned-emaonly.safetensors -p "a lovely cat"
+```text
+雨夜的未来上海外滩，镜头前是一辆旧式有轨电车穿过积水街道，街边霓虹牌同时写着“欢迎光临”“火锅”“Open 24 Hours”，远处玻璃摩天楼与石库门老建筑并列，空中漂浮无人机广告屏，屏幕上有清晰汉字“春风得意”，画面里有穿风衣的人群、红色雨伞、湿漉漉的柏油路反射青蓝与橙红灯光，构图复杂、层次深、电影感、超细节
 ```
 
-***For detailed command-line arguments, check out [cli doc](./examples/cli/README.md).***
+Source artifacts:
 
-## Performance
+- compare artifacts are recorded under the project validation asset pack
 
-If you want to improve performance or reduce VRAM/RAM usage, please refer to [performance guide](./docs/performance.md).
+Image compare:
 
-## More Guides
+| Nanobanana Reference | Z-Image Q40+Q80 | Z-Image FP8 |
+|---|---|---|
+| ![](./docs/adreno/assets/hexagon_npu_20260412/nanobanana_ref.png) | ![](./docs/adreno/assets/hexagon_npu_20260412/zimage_q40q80.png) | ![](./docs/adreno/assets/hexagon_npu_20260412/zimage_fp8.png) |
 
-- [SD1.x/SD2.x/SDXL](./docs/sd.md)
-- [SD3/SD3.5](./docs/sd3.md)
-- [FLUX.1-dev/FLUX.1-schnell](./docs/flux.md)
-- [FLUX.2-dev/FLUX.2-klein](./docs/flux2.md)
-- [FLUX.1-Kontext-dev](./docs/kontext.md)
-- [Chroma](./docs/chroma.md)
-- [🔥Qwen Image](./docs/qwen_image.md)
-- [🔥Qwen Image Edit series](./docs/qwen_image_edit.md)
-- [🔥Wan2.1/Wan2.2](./docs/wan.md)
-- [🔥Z-Image](./docs/z_image.md)
-- [Ovis-Image](./docs/ovis_image.md)
-- [LoRA](./docs/lora.md)
-- [LCM/LCM-LoRA](./docs/lcm.md)
-- [Using PhotoMaker to personalize image generation](./docs/photo_maker.md)
-- [Using ESRGAN to upscale results](./docs/esrgan.md)
-- [Using TAESD to faster decoding](./docs/taesd.md)
-- [Docker](./docs/docker.md)
-- [Quantization and GGUF](./docs/quantization_and_gguf.md)
-- [Inference acceleration via caching](./docs/caching.md)
+Notes:
 
-## Bindings
+- The current local `Z-Image FP8` single-step time is about `15s` on-device.
+- Full local generation is about `2 min` and the image quality is already close to the Nanobanana reference image above.
 
-These projects wrap `stable-diffusion.cpp` for easier use in other languages/frameworks.
+## Quick Start (HTP v75/v79)
 
-* Golang (non-cgo): [seasonjs/stable-diffusion](https://github.com/seasonjs/stable-diffusion)
-* Golang (cgo): [Binozo/GoStableDiffusion](https://github.com/Binozo/GoStableDiffusion)
-* C#: [DarthAffe/StableDiffusion.NET](https://github.com/DarthAffe/StableDiffusion.NET)
-* Python: [william-murray1204/stable-diffusion-cpp-python](https://github.com/william-murray1204/stable-diffusion-cpp-python)
-* Rust: [newfla/diffusion-rs](https://github.com/newfla/diffusion-rs)
-* Flutter/Dart: [rmatif/Local-Diffusion](https://github.com/rmatif/Local-Diffusion)
+Use placeholder paths below and replace them with your local checkout / SDK / NDK locations.
 
-## UIs
+Worktree root:
 
-These projects use `stable-diffusion.cpp` as a backend for their image generation.
+- `$WORKTREE_ROOT`
 
-- [Jellybox](https://jellybox.com)
-- [Stable Diffusion GUI](https://github.com/fszontagh/sd.cpp.gui.wx)
-- [Stable Diffusion CLI-GUI](https://github.com/piallai/stable-diffusion.cpp)
-- [Local Diffusion](https://github.com/rmatif/Local-Diffusion)
-- [sd.cpp-webui](https://github.com/daniandtheweb/sd.cpp-webui)
-- [LocalAI](https://github.com/mudler/LocalAI)
-- [Neural-Pixel](https://github.com/Luiz-Alcantara/Neural-Pixel)
-- [KoboldCpp](https://github.com/LostRuins/koboldcpp)
+Build rule:
 
-## Contributors
+- `htp_ops` must be built three times:
+  - Android host-side `libhtp_ops.so`
+  - Hexagon `v75` `libhtp_ops_skel.so`
+  - Hexagon `v79` `libhtp_ops_skel.so`
+- `sdcpp` Android side is built once:
+  - `sd-cli`
+  - `libggml-htp-v79.so`
+- runtime arch switch is done by choosing which `libhtp_ops_skel.so` to push to phone
 
-Thank you to all the people who have already contributed to stable-diffusion.cpp!
+Requirements:
 
-[![Contributors](https://contrib.rocks/image?repo=leejet/stable-diffusion.cpp)](https://github.com/leejet/stable-diffusion.cpp/graphs/contributors)
+- `HEXAGON_SDK_ROOT`
+- `HEXAGON_TOOLS_ROOT`
+- `ANDROID_NDK`
 
-## Star History
+Example build commands:
 
-[![Star History Chart](https://api.star-history.com/svg?repos=leejet/stable-diffusion.cpp&type=Date)](https://star-history.com/#leejet/stable-diffusion.cpp&Date)
+```sh
+set -euo pipefail
 
-## References
+ROOT=/path/to/reqfix1_hvx_rope_main
+OUT=$ROOT/scratch/quickstart_htp_build
+SDK=/path/to/Hexagon_SDK/6.5.0.0
+TOOLS=$SDK/tools/HEXAGON_Tools/19.0.07
+NDK=/path/to/android-ndk
 
-- [ggml](https://github.com/ggml-org/ggml)
-- [diffusers](https://github.com/huggingface/diffusers)
-- [stable-diffusion](https://github.com/CompVis/stable-diffusion)
-- [sd3-ref](https://github.com/Stability-AI/sd3-ref)
-- [stable-diffusion-stability-ai](https://github.com/Stability-AI/stablediffusion)
-- [stable-diffusion-webui](https://github.com/AUTOMATIC1111/stable-diffusion-webui)
-- [ComfyUI](https://github.com/comfyanonymous/ComfyUI)
-- [k-diffusion](https://github.com/crowsonkb/k-diffusion)
-- [latent-consistency-model](https://github.com/luosiallen/latent-consistency-model)
-- [generative-models](https://github.com/Stability-AI/generative-models/)
-- [PhotoMaker](https://github.com/TencentARC/PhotoMaker)
-- [Wan2.1](https://github.com/Wan-Video/Wan2.1)
-- [Wan2.2](https://github.com/Wan-Video/Wan2.2)
+mkdir -p "$OUT"
+
+cmake -S $ROOT/htp_ops -B "$OUT/htp_android_rel" \
+  -DCMAKE_TOOLCHAIN_FILE=$SDK/build/cmake/android_toolchain.cmake \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_NDK=$NDK \
+  -DANDROID_NATIVE_API_LEVEL=26 \
+  -DANDROID_STL=none \
+  -DHEXAGON_SDK_ROOT=$SDK \
+  -DOS_TYPE=HLOS \
+  -DDSP_TYPE=3 \
+  -DPREBUILT_LIB_DIR=android_aarch64 \
+  -DV=android_ReleaseG_aarch64
+
+cmake -S $ROOT/htp_ops -B "$OUT/htp_hex_v75_rel" \
+  -DCMAKE_TOOLCHAIN_FILE=$SDK/build/cmake/hexagon_toolchain.cmake \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DHEXAGON_SDK_ROOT=$SDK \
+  -DHEXAGON_TOOLS_ROOT=$TOOLS \
+  -DDSP_VERSION=v75 \
+  -DPREBUILT_LIB_DIR=hexagon_toolv19_v75 \
+  -DV=hexagon_ReleaseG_toolv19_v75
+
+cmake -S $ROOT/htp_ops -B "$OUT/htp_hex_v79_rel" \
+  -DCMAKE_TOOLCHAIN_FILE=$SDK/build/cmake/hexagon_toolchain.cmake \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DHEXAGON_SDK_ROOT=$SDK \
+  -DHEXAGON_TOOLS_ROOT=$TOOLS \
+  -DDSP_VERSION=v79 \
+  -DPREBUILT_LIB_DIR=hexagon_toolv19_v79 \
+  -DV=hexagon_ReleaseG_toolv19_v79
+
+cmake -S $ROOT/sdcpp -B "$OUT/sdcpp_android_rel" \
+  -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DANDROID_ABI=arm64-v8a \
+  -DANDROID_PLATFORM=android-28 \
+  -DSD_HEXAGON=ON \
+  -DSD_BUILD_EXAMPLES=ON \
+  -DSD_BUILD_SHARED_LIBS=OFF \
+  -DGGML_OPENMP=ON \
+  -DGGML_HTP=ON \
+  -DHEXAGON_SDK_ROOT=$SDK \
+  -DHEXAGON_TOOLS_ROOT=$TOOLS \
+  -DPREBUILT_LIB_DIR=android_aarch64 \
+  -DV=android_ReleaseG_aarch64
+
+cmake --build "$OUT/htp_android_rel" -j$(nproc)
+cmake --build "$OUT/htp_hex_v75_rel" -j$(nproc)
+cmake --build "$OUT/htp_hex_v79_rel" -j$(nproc)
+cmake --build "$OUT/sdcpp_android_rel" -j$(nproc)
+```
+
+Runtime choice:
+
+- use `htp_hex_v75_rel/libhtp_ops_skel.so` for `v75`
+- use `htp_hex_v79_rel/libhtp_ops_skel.so` for `v79`
+- `sd-cli`, `libhtp_ops.so`, and `libggml-htp-v79.so` are shared by both
+
+Release layout:
+
+- ship two Android HTP bundles:
+  - `stable-diffusion.cpp-android-htp-v75-<date>.tar.gz`
+  - `stable-diffusion.cpp-android-htp-v79-<date>.tar.gz`
+- both bundles contain:
+  - `sd-cli`
+  - `libhtp_ops.so`
+  - `libggml-htp-v79.so`
+  - `libomp.so`
+  - arch-matched `libhtp_ops_skel.so`
+- use the `v75` bundle for `q40/q80/f16` routes
+- use the `v79` bundle for `q40/q80/f16` and `FP8/WF8` routes
+
+FP8 / WF8 note:
+
+- `FP8/WF8 HMX` models require `v79+`
+- do not use `wf8/fp8` GGUF models with `v75`
+- `v75` should be used for `q40/q80/f16` style routes only
+
+Example `v79` FP8 Z-Image inference command:
+
+```sh
+set -euo pipefail
+
+RUNTIME_V79_DIR=/path/to/runtime-v79
+PHONE_MODEL_PACK=/path/to/model_pack
+PHONE_AUX=/path/to/model_pack_aux
+PHONE_ZIMG_COND=/path/to/zimg_cond.tensor
+
+cd "$RUNTIME_V79_DIR"
+
+env \
+  LD_LIBRARY_PATH="$RUNTIME_V79_DIR:/vendor/lib64:/system/lib64" \
+  ADSP_LIBRARY_PATH="$RUNTIME_V79_DIR;/vendor/lib/rfsa/adsp;/vendor/dsp" \
+  SD_ACCEL_BACKEND=HTP \
+  SD_NPU_BACKEND=HTP \
+  SD_SKIP_DECODE=1 \
+  SD_NPU_OP_PROFILE=1 \
+  SD_NPU_HTP_STATS=1 \
+  SD_NPU_HTP_FALLBACK=1 \
+  GGML_HTP_ENABLE_F16_MATMUL=0 \
+  GGML_HTP_ENABLE_QUANT_MATMUL=1 \
+  GGML_HTP_ENABLE_FLASH_ATTN=1 \
+  GGML_HTP_FLASH_PREP_IN_KERNEL=1 \
+  GGML_HTP_ENABLE_ADALN_MATMUL=1 \
+  GGML_HTP_ENABLE_CAP_EMBED_MATMUL=1 \
+  GGML_HTP_ENABLE_NOISE_REFINER_W2_MATMUL=1 \
+  GGML_HTP_ZIMG_ROPE=1 \
+  GGML_HTP_DIT_QKNORM_ROPE=1 \
+  GGML_HTP_Q8_OUTSTATIONARY=1 \
+  GGML_HTP_MAX_MAP_MIB=3072 \
+  GGML_HTP_DEFER_UNMAP=1 \
+  GGML_HTP_MAX_ACTIVE_MAPS=16 \
+  GGML_HTP_SKIP_CORE_PERMUTE_REPACK=0 \
+  GGML_HTP_RUNTIME_PERMUTE_QWEIGHTS=0 \
+  GGML_HTP_RUNTIME_REPACK_QWEIGHTS=0 \
+  ./sd-cli -v \
+    --diffusion-model "$PHONE_MODEL_PACK/z_image_turbo_f16base3_wf8hmx_20260409.gguf" \
+    --vae "$PHONE_AUX/ae.safetensors" \
+    --cond-crossattn "$PHONE_ZIMG_COND" \
+    --cfg-scale 1.0 --steps 1 --seed 42 \
+    -W 1024 -H 1024 -t 4 --diffusion-fa \
+    --output out.png
+```

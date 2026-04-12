@@ -1285,15 +1285,6 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_attention_ext(struct ggml_context
         flash_attn &&
         mask == nullptr &&
         std::getenv("GGML_HTP_FLASH_PREP_IN_KERNEL") != nullptr;
-    const bool htp_flash_qknorm_direct =
-        is_htp_backend &&
-        flash_attn &&
-        skip_reshape &&
-        std::getenv("GGML_HTP_FLASH_QKNORM_DIRECT") != nullptr;
-    const bool htp_flash_qknorm_direct_k =
-        htp_flash_qknorm_direct &&
-        std::getenv("GGML_HTP_FLASH_QKNORM_DIRECT_K") != nullptr;
-
     // Separate Q/K/V views for flash path vs fallback path (fallback prefers contiguous tensors).
     ggml_tensor * q_flash = q;
     ggml_tensor * k_flash = k;
@@ -1393,23 +1384,7 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_attention_ext(struct ggml_context
             // view matches the HTP flash-attn contract (ggml-htp checks ne/nb, and DSP doesn't receive strides).
             ggml_tensor * q_view = q_in; // expected: permuted view [d_head, L_q, n_head, N]
             ggml_tensor * k_in_local = k_in;
-            const bool can_use_qknorm_direct =
-                htp_flash_qknorm_direct &&
-                std::strcmp(q_in->name, GGML_HTP_ZIMG_QKNORM_ROPE_INTERLEAVED_NAME) == 0 &&
-                std::strcmp(k_in->name, GGML_HTP_ZIMG_QKNORM_ROPE_INTERLEAVED_NAME) == 0;
-            if (skip_reshape && can_use_qknorm_direct) {
-                ggml_tensor * q4 = ggml_reshape_4d(ctx, q_in, d_head, L_q, n_head, N);
-                ggml_tensor * k4 = ggml_reshape_4d(ctx, k_in, d_head, L_k, n_kv_head, N);
-                q_view = q4;
-                flash_flags |= GGML_HTP_FLASH_ATTN_FLAG_Q_ROW_MAJOR;
-                if (htp_flash_qknorm_direct_k) {
-                    k_in_local = k4;
-                    flash_flags |= GGML_HTP_FLASH_ATTN_FLAG_K_ROW_MAJOR;
-                } else {
-                    ggml_tensor * k_base_local = ggml_cont(ctx, ggml_permute(ctx, k4, 0, 2, 1, 3));
-                    k_in_local = ggml_permute(ctx, k_base_local, 0, 2, 1, 3); // [d_head, L_k, n_kv_head, N] (view)
-                }
-            } else if (skip_reshape) {
+            if (skip_reshape) {
                 // Reshape heads back out of the fused (n_head*N) dim: [d_head, L, n_head, N].
                 ggml_tensor * q4 = ggml_reshape_4d(ctx, q_in, d_head, L_q, n_head, N);
                 ggml_tensor * k4 = ggml_reshape_4d(ctx, k_in, d_head, L_k, n_kv_head, N);

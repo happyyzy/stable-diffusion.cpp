@@ -302,29 +302,6 @@ namespace Flux {
         return std::getenv("SD_FLUX_QKV_CHUNK_NOCONT") == nullptr;
     }
 
-    static inline bool flux_htp_qknorm_rope_requested(ggml_backend_t backend) {
-        static int enabled = -1;
-        if (enabled < 0) {
-            const char* env = std::getenv("GGML_HTP_FLUX_QKNORM_ROPE");
-            enabled         = (env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0) ? 1 : 0;
-        }
-        const bool is_htp_backend = backend != nullptr && std::strcmp(ggml_backend_name(backend), "MyHTP") == 0;
-        return enabled != 0 && is_htp_backend;
-    }
-
-    static inline bool flux_htp_qknorm_rope_direct_input_requested() {
-        static int enabled = -1;
-        if (enabled < 0) {
-            const char* env = std::getenv("GGML_HTP_FLUX_QKNORM_ROPE_DIRECT_INPUT");
-            enabled         = (env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0) ? 1 : 0;
-        }
-        return enabled != 0;
-    }
-
-    static inline uintptr_t flux_htp_qknorm_rope_userdata(uint32_t flags, uint32_t theta_start = 0u) {
-        return ggml_htp_zimg_qknorm_rope_pack_userdata(flags, theta_start);
-    }
-
     static inline bool flux_htp_single_stream_linear2_fused_requested(ggml_backend_t backend) {
         static int enabled = -1;
         if (enabled < 0) {
@@ -408,21 +385,7 @@ namespace Flux {
     }
 
     static inline ggml_tensor* flux_build_fused_qknorm_rope_input(struct ggml_context* ctx,
-                                                                  ggml_tensor* x,
-                                                                  bool direct_input) {
-        if (direct_input) {
-            return ggml_view_4d(ctx,
-                                x,
-                                x->ne[0],
-                                x->ne[2],
-                                x->ne[1],
-                                x->ne[3],
-                                x->nb[2],
-                                x->nb[1],
-                                x->nb[3],
-                                0);
-        }
-
+                                                                  ggml_tensor* x) {
         auto x_in = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));
         return ggml_reshape_3d(ctx, x_in, x->ne[0], x->ne[2], x->ne[1] * x->ne[3]);
     }
@@ -430,12 +393,7 @@ namespace Flux {
     static inline ggml_tensor* flux_repeat_fused_qknorm_weight(struct ggml_context* ctx,
                                                                ggml_tensor* w,
                                                                int64_t heads,
-                                                               int64_t batch,
-                                                               bool direct_input) {
-        if (direct_input) {
-            return ggml_repeat_4d(ctx, w, w->ne[0], 1, heads, batch);
-        }
-
+                                                               int64_t batch) {
         auto w_rep = ggml_repeat_4d(ctx, w, w->ne[0], 1, heads * batch, 1);
         return ggml_reshape_3d(ctx, w_rep, w->ne[0], 1, heads * batch);
     }
@@ -618,28 +576,25 @@ namespace Flux {
                 pe_pack != nullptr &&
                 ctx->weight_adapter == nullptr &&
                 Rope::zimg_htp_rope_requested(ctx->backend) &&
-                Flux::flux_htp_qknorm_rope_requested(ctx->backend);
+                Rope::dit_htp_qknorm_rope_requested(ctx->backend);
 
             if (use_htp_fused_qk_norm_rope) {
                 auto q_norm = norm->query_norm_block();
                 auto k_norm = norm->key_norm_block();
                 auto q_w    = q_norm->get_weight_tensor();
                 auto k_w    = k_norm->get_weight_tensor();
-                const bool direct_input =
-                    q_raw->ne[3] == 1 &&
-                    Flux::flux_htp_qknorm_rope_direct_input_requested();
-                auto q_in   = Flux::flux_build_fused_qknorm_rope_input(ctx->ggml_ctx, q_raw, direct_input);
-                auto k_in   = Flux::flux_build_fused_qknorm_rope_input(ctx->ggml_ctx, k_raw, direct_input);
-                auto q_wrep = Flux::flux_repeat_fused_qknorm_weight(ctx->ggml_ctx, q_w, num_heads, q_raw->ne[3], direct_input);
-                auto k_wrep = Flux::flux_repeat_fused_qknorm_weight(ctx->ggml_ctx, k_w, num_heads, k_raw->ne[3], direct_input);
+                auto q_in   = Flux::flux_build_fused_qknorm_rope_input(ctx->ggml_ctx, q_raw);
+                auto k_in   = Flux::flux_build_fused_qknorm_rope_input(ctx->ggml_ctx, k_raw);
+                auto q_wrep = Flux::flux_repeat_fused_qknorm_weight(ctx->ggml_ctx, q_w, num_heads, q_raw->ne[3]);
+                auto k_wrep = Flux::flux_repeat_fused_qknorm_weight(ctx->ggml_ctx, k_w, num_heads, k_raw->ne[3]);
                 const uintptr_t userdata =
-                    Flux::flux_htp_qknorm_rope_userdata(static_cast<uint32_t>(GGML_HTP_ZIMG_ROPE_FLAG_INTERLEAVED), theta_start);
-                q = ggml_map_custom3(ctx->ggml_ctx, q_in, q_wrep, pe_pack, Rope::zimg_qknorm_rope_apply_f32,
+                    ggml_htp_dit_qknorm_rope_pack_userdata(static_cast<uint32_t>(GGML_HTP_ZIMG_ROPE_FLAG_INTERLEAVED), theta_start);
+                q = ggml_map_custom3(ctx->ggml_ctx, q_in, q_wrep, pe_pack, Rope::dit_qknorm_rope_apply_f32,
                                      GGML_N_TASKS_MAX, reinterpret_cast<void*>(userdata));
-                k = ggml_map_custom3(ctx->ggml_ctx, k_in, k_wrep, pe_pack, Rope::zimg_qknorm_rope_apply_f32,
+                k = ggml_map_custom3(ctx->ggml_ctx, k_in, k_wrep, pe_pack, Rope::dit_qknorm_rope_apply_f32,
                                      GGML_N_TASKS_MAX, reinterpret_cast<void*>(userdata));
-                ggml_set_name(q, GGML_HTP_ZIMG_QKNORM_ROPE_INTERLEAVED_NAME);
-                ggml_set_name(k, GGML_HTP_ZIMG_QKNORM_ROPE_INTERLEAVED_NAME);
+                ggml_set_name(q, GGML_HTP_DIT_QKNORM_ROPE_INTERLEAVED_NAME);
+                ggml_set_name(k, GGML_HTP_DIT_QKNORM_ROPE_INTERLEAVED_NAME);
             } else {
                 q = norm->query_norm(ctx, q_raw);
                 k = norm->key_norm(ctx, k_raw);
@@ -670,7 +625,7 @@ namespace Flux {
             if (pe_pack != nullptr &&
                 ctx->weight_adapter == nullptr &&
                 Rope::zimg_htp_rope_requested(ctx->backend) &&
-                Flux::flux_htp_qknorm_rope_requested(ctx->backend)) {
+                Rope::dit_htp_qknorm_rope_requested(ctx->backend)) {
                 x = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, qkv[0], qkv[1], qkv[2], num_heads, mask, true,
                                            ctx->flash_attn_enabled, 1.f);
             } else {
@@ -996,7 +951,7 @@ namespace Flux {
                 pe_pack != nullptr &&
                 ctx->weight_adapter == nullptr &&
                 Rope::zimg_htp_rope_requested(ctx->backend) &&
-                Flux::flux_htp_qknorm_rope_requested(ctx->backend);
+                Rope::dit_htp_qknorm_rope_requested(ctx->backend);
             if (use_htp_fused_qk_norm_rope) {
                 auto q = ggml_concat(ctx->ggml_ctx, txt_q, img_q, 1);  // [d_head, total_token, n_head, N]
                 auto k = ggml_concat(ctx->ggml_ctx, txt_k, img_k, 1);  // [d_head, total_token, n_head, N]
@@ -1160,27 +1115,24 @@ namespace Flux {
                 pe_pack != nullptr &&
                 ctx->weight_adapter == nullptr &&
                 Rope::zimg_htp_rope_requested(ctx->backend) &&
-                Flux::flux_htp_qknorm_rope_requested(ctx->backend);
+                Rope::dit_htp_qknorm_rope_requested(ctx->backend);
             if (use_htp_fused_qk_norm_rope) {
                 auto q_norm = norm->query_norm_block();
                 auto k_norm = norm->key_norm_block();
                 auto q_w    = q_norm->get_weight_tensor();
                 auto k_w    = k_norm->get_weight_tensor();
-                const bool direct_input =
-                    q->ne[3] == 1 &&
-                    Flux::flux_htp_qknorm_rope_direct_input_requested();
-                auto q_in   = Flux::flux_build_fused_qknorm_rope_input(ctx->ggml_ctx, q, direct_input);
-                auto k_in   = Flux::flux_build_fused_qknorm_rope_input(ctx->ggml_ctx, k, direct_input);
-                auto q_wrep = Flux::flux_repeat_fused_qknorm_weight(ctx->ggml_ctx, q_w, num_heads, q->ne[3], direct_input);
-                auto k_wrep = Flux::flux_repeat_fused_qknorm_weight(ctx->ggml_ctx, k_w, num_heads, k->ne[3], direct_input);
+                auto q_in   = Flux::flux_build_fused_qknorm_rope_input(ctx->ggml_ctx, q);
+                auto k_in   = Flux::flux_build_fused_qknorm_rope_input(ctx->ggml_ctx, k);
+                auto q_wrep = Flux::flux_repeat_fused_qknorm_weight(ctx->ggml_ctx, q_w, num_heads, q->ne[3]);
+                auto k_wrep = Flux::flux_repeat_fused_qknorm_weight(ctx->ggml_ctx, k_w, num_heads, k->ne[3]);
                 const uintptr_t userdata =
-                    Flux::flux_htp_qknorm_rope_userdata(static_cast<uint32_t>(GGML_HTP_ZIMG_ROPE_FLAG_INTERLEAVED), 0u);
-                q = ggml_map_custom3(ctx->ggml_ctx, q_in, q_wrep, pe_pack, Rope::zimg_qknorm_rope_apply_f32,
+                    ggml_htp_dit_qknorm_rope_pack_userdata(static_cast<uint32_t>(GGML_HTP_ZIMG_ROPE_FLAG_INTERLEAVED), 0u);
+                q = ggml_map_custom3(ctx->ggml_ctx, q_in, q_wrep, pe_pack, Rope::dit_qknorm_rope_apply_f32,
                                      GGML_N_TASKS_MAX, reinterpret_cast<void*>(userdata));
-                k = ggml_map_custom3(ctx->ggml_ctx, k_in, k_wrep, pe_pack, Rope::zimg_qknorm_rope_apply_f32,
+                k = ggml_map_custom3(ctx->ggml_ctx, k_in, k_wrep, pe_pack, Rope::dit_qknorm_rope_apply_f32,
                                      GGML_N_TASKS_MAX, reinterpret_cast<void*>(userdata));
-                ggml_set_name(q, GGML_HTP_ZIMG_QKNORM_ROPE_INTERLEAVED_NAME);
-                ggml_set_name(k, GGML_HTP_ZIMG_QKNORM_ROPE_INTERLEAVED_NAME);
+                ggml_set_name(q, GGML_HTP_DIT_QKNORM_ROPE_INTERLEAVED_NAME);
+                ggml_set_name(k, GGML_HTP_DIT_QKNORM_ROPE_INTERLEAVED_NAME);
                 attn = ggml_ext_attention_ext(ctx->ggml_ctx, ctx->backend, q, k, v, num_heads, mask, true,
                                              ctx->flash_attn_enabled, 1.f);
             } else {

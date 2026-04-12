@@ -57,6 +57,20 @@ namespace Rope {
         return zimg_htp_rope_requested(backend) && pe_pack != nullptr;
     }
 
+    __STATIC_INLINE__ bool dit_htp_qknorm_rope_requested(ggml_backend_t backend) {
+        static int enabled = -1;
+        if (enabled < 0) {
+            auto env_enabled = [](const char* name) {
+                const char* env = std::getenv(name);
+                return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+            };
+            enabled = env_enabled("GGML_HTP_DIT_QKNORM_ROPE") ? 1 : 0;
+        }
+
+        const bool is_htp_backend = backend != nullptr && std::strcmp(ggml_backend_name(backend), "MyHTP") == 0;
+        return enabled != 0 && is_htp_backend;
+    }
+
     __STATIC_INLINE__ void zimg_rope_apply_f32(struct ggml_tensor* dst,
                                                const struct ggml_tensor* x,
                                                const struct ggml_tensor* theta,
@@ -68,8 +82,8 @@ namespace Rope {
         GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(x) && ggml_is_contiguous(theta));
 
         const uintptr_t packed_userdata = reinterpret_cast<uintptr_t>(userdata);
-        const uint32_t rope_flags       = ggml_htp_zimg_qknorm_rope_unpack_flags(packed_userdata);
-        const uint32_t theta_start      = ggml_htp_zimg_qknorm_rope_unpack_theta_start(packed_userdata);
+        const uint32_t rope_flags       = ggml_htp_dit_qknorm_rope_unpack_flags(packed_userdata);
+        const uint32_t theta_start      = ggml_htp_dit_qknorm_rope_unpack_theta_start(packed_userdata);
         const bool interleaved          = (rope_flags & static_cast<uint32_t>(GGML_HTP_ZIMG_ROPE_FLAG_INTERLEAVED)) != 0;
 
         const int64_t d_head  = dst->ne[0];
@@ -118,7 +132,7 @@ namespace Rope {
         }
     }
 
-    __STATIC_INLINE__ void zimg_qknorm_rope_apply_f32(struct ggml_tensor* dst,
+    __STATIC_INLINE__ void dit_qknorm_rope_apply_f32(struct ggml_tensor* dst,
                                                       const struct ggml_tensor* x,
                                                       const struct ggml_tensor* weight,
                                                       const struct ggml_tensor* theta,
@@ -130,8 +144,8 @@ namespace Rope {
         GGML_ASSERT(ggml_is_contiguous(dst) && ggml_is_contiguous(weight) && ggml_is_contiguous(theta));
 
         const uintptr_t packed_userdata = reinterpret_cast<uintptr_t>(userdata);
-        const uint32_t rope_flags       = ggml_htp_zimg_qknorm_rope_unpack_flags(packed_userdata);
-        const uint32_t theta_start      = ggml_htp_zimg_qknorm_rope_unpack_theta_start(packed_userdata);
+        const uint32_t rope_flags       = ggml_htp_dit_qknorm_rope_unpack_flags(packed_userdata);
+        const uint32_t theta_start      = ggml_htp_dit_qknorm_rope_unpack_theta_start(packed_userdata);
         const bool interleaved          = (rope_flags & static_cast<uint32_t>(GGML_HTP_ZIMG_ROPE_FLAG_INTERLEAVED)) != 0;
 
         const int64_t d_head  = dst->ne[0];

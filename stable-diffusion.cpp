@@ -187,66 +187,6 @@ static void sd_log_npu_runtime_policy(const sd_npu_runtime_policy& policy) {
 }
 #endif  // SD_USE_HEXAGON
 
-static void sd_apply_zimage_runtime_tensor_overrides(ModelLoader& model_loader, SDVersion version) {
-    if (version != VERSION_Z_IMAGE) {
-        return;
-    }
-    const char* disable = std::getenv("SD_ZIMG_DISABLE_RUNTIME_OVERRIDES");
-    if (disable != nullptr && disable[0] != '\0' && std::strcmp(disable, "0") != 0) {
-        LOG_INFO("z_image runtime overrides disabled by SD_ZIMG_DISABLE_RUNTIME_OVERRIDES");
-        return;
-    }
-
-    auto& tensor_storage_map = model_loader.get_tensor_storage_map();
-    auto override_to_f16 = [&](const std::string& name) {
-        auto it = tensor_storage_map.find(name);
-        if (it == tensor_storage_map.end()) {
-            return false;
-        }
-        TensorStorage& tensor_storage = it->second;
-        if (tensor_storage.type != GGML_TYPE_WF8_HMX_PREPACK) {
-            return false;
-        }
-        tensor_storage.expected_type = GGML_TYPE_F16;
-        LOG_INFO("z_image runtime override: %s %s -> %s",
-                 tensor_storage.name.c_str(),
-                 ggml_type_name(tensor_storage.type),
-                 ggml_type_name(tensor_storage.expected_type));
-        return true;
-    };
-
-    size_t override_count = 0;
-    override_count += override_to_f16("model.diffusion_model.cap_embedder.1.weight") ? 1 : 0;
-
-    for (auto& [name, tensor_storage] : tensor_storage_map) {
-        if (tensor_storage.type != GGML_TYPE_WF8_HMX_PREPACK) {
-            continue;
-        }
-
-        const bool is_refiner_adaln =
-            starts_with(name, "model.diffusion_model.noise_refiner.") &&
-            ends_with(name, ".adaLN_modulation.0.weight");
-        const bool is_main_adaln =
-            starts_with(name, "model.diffusion_model.layers.") &&
-            ends_with(name, ".adaLN_modulation.0.weight");
-        const bool is_final_adaln =
-            name == "model.diffusion_model.final_layer.adaLN_modulation.1.weight";
-
-        if (!is_refiner_adaln && !is_main_adaln && !is_final_adaln) {
-            continue;
-        }
-
-        tensor_storage.expected_type = GGML_TYPE_F16;
-        LOG_INFO("z_image runtime override: %s %s -> %s",
-                 tensor_storage.name.c_str(),
-                 ggml_type_name(tensor_storage.type),
-                 ggml_type_name(tensor_storage.expected_type));
-        override_count++;
-    }
-
-    LOG_INFO("z_image runtime override summary: %zu tensors forced to f16", override_count);
-}
-
 static bool sd_dump_tensor_to_file(const std::string& path, const char* name, const ggml_tensor* tensor) {
     if (tensor == nullptr) {
         LOG_ERROR("dump tensor failed: tensor is null");
@@ -1030,8 +970,6 @@ public:
         if (wtype != GGML_TYPE_COUNT || tensor_type_rules.size() > 0) {
             model_loader.set_wtype_override(wtype, tensor_type_rules);
         }
-        sd_apply_zimage_runtime_tensor_overrides(model_loader, version);
-
         std::map<ggml_type, uint32_t> wtype_stat                 = model_loader.get_wtype_stat();
         std::map<ggml_type, uint32_t> conditioner_wtype_stat     = model_loader.get_conditioner_wtype_stat();
         std::map<ggml_type, uint32_t> diffusion_model_wtype_stat = model_loader.get_diffusion_model_wtype_stat();
