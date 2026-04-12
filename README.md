@@ -1,20 +1,32 @@
+<p align="center">
+  <img src="./assets/logo.png" width="360" alt="stable-diffusion.cpp logo">
+</p>
+
 # stable-diffusion.cpp
+
+<div align="center">
+  <a href="https://trendshift.io/repositories/9714" target="_blank">
+    <img src="https://trendshift.io/api/badge/repositories/9714" alt="stable-diffusion.cpp | Trendshift" width="250" height="55">
+  </a>
+</div>
 
 Diffusion model(SD,Flux,Wan,...) inference in pure C/C++
 
-***Note that this project is under active development.***
-***API and command-line option may change frequently.***
+***Note that this project is under active development. \
+API and command-line option may change frequently.***
 
 ## Adreno Optimization Fork
 
 This fork is purpose-built for **Adreno 830 + Q4_0** deployment (FLUX.2-klein / Z-Image / Qwen3-4B), with strict step-by-step numeric validation and reproducible logs/images.
+
+**Tracking**
 
 - Full optimization logbook (GOAL-aligned): [`docs/adreno/README.md`](./docs/adreno/README.md)
 - Per-step reports and assets: [`docs/adreno/steps/`](./docs/adreno/steps/) + [`docs/adreno/assets/`](./docs/adreno/assets/)
 - Runtime/build switch catalog (with accepted presets): [`docs/adreno/flags.md`](./docs/adreno/flags.md)
 - Step-tag map: [`docs/adreno/TAGS.md`](./docs/adreno/TAGS.md)
 
-### Fork Branch Model
+**Fork Branch Model**
 
 - `work/main`: full Adreno optimization + debugging history (performance-first engineering branch)
 - `pr/main`: upstream-oriented clean branch (minimal patch surface, neutral naming, merge-friendly docs)
@@ -33,9 +45,9 @@ This fork is purpose-built for **Adreno 830 + Q4_0** deployment (FLUX.2-klein / 
 
 | Scenario | Before | After |
 |---|---|---|
-| FLUX.2-klein 512 final gate |   |   |
-| FLUX.2-klein 512 edit (2 refs) |   |   |
-| Z-Image 512 8-step |   |   |
+| FLUX.2-klein 512 final gate | <img src="./docs/adreno/assets/step27/step27_run1_full_cond.png" width="240" alt="FLUX.2-klein 512 final gate before"> | <img src="./docs/adreno/assets/step27/step27_run2_cond256_pass.png" width="240" alt="FLUX.2-klein 512 final gate after"> |
+| FLUX.2-klein 512 edit (2 refs) | <img src="./docs/adreno/assets/step29/step29_base_2ref_resize.png" width="240" alt="FLUX.2-klein 512 edit before"> | <img src="./docs/adreno/assets/step29/step29_pass_2ref_noresize_optmem.png" width="240" alt="FLUX.2-klein 512 edit after"> |
+| Z-Image 512 8-step | <img src="./docs/adreno/assets/step25/step25_base_qcomml_t1.png" width="240" alt="Z-Image 512 before"> | <img src="./docs/adreno/assets/step25/step25_outonly_hostattn_step25opt_new.png" width="240" alt="Z-Image 512 after"> |
 
 ### Quick Entry (Adreno)
 
@@ -52,26 +64,29 @@ This fork is purpose-built for **Adreno 830 + Q4_0** deployment (FLUX.2-klein / 
 
 ### Z-Image Example
 
+**Current Z-Image 1024 Snapshot**
+
+| Route | Single-step sampling |
+|---|---:|
+| `v79` Z-Image `q40+q80` | `16.27 s` |
+| `v79` Z-Image `FP8/WF8` | `15.29 s` |
+
 Prompt used in the local Z-Image compare:
 
 ```text
 雨夜的未来上海外滩，镜头前是一辆旧式有轨电车穿过积水街道，街边霓虹牌同时写着“欢迎光临”“火锅”“Open 24 Hours”，远处玻璃摩天楼与石库门老建筑并列，空中漂浮无人机广告屏，屏幕上有清晰汉字“春风得意”，画面里有穿风衣的人群、红色雨伞、湿漉漉的柏油路反射青蓝与橙红灯光，构图复杂、层次深、电影感、超细节
 ```
 
-Source artifacts:
+<p align="center">
+  <img src="./docs/adreno/assets/hexagon_npu_20260412/zimage_compare_triptych.png" width="980" alt="Nanobanana reference compared with Z-Image Q40+Q80 and Z-Image FP8">
+</p>
 
-- compare artifacts are recorded under the project validation asset pack
-
-Image compare:
-
-| Nanobanana Reference | Z-Image Q40+Q80 | Z-Image FP8 |
-|---|---|---|
-| ![](./docs/adreno/assets/hexagon_npu_20260412/nanobanana_ref.png) | ![](./docs/adreno/assets/hexagon_npu_20260412/zimage_q40q80.png) | ![](./docs/adreno/assets/hexagon_npu_20260412/zimage_fp8.png) |
-
-Notes:
+<p align="center">
+  <sub>Nanobanana reference • Z-Image Q40+Q80 • Z-Image FP8</sub>
+</p>
 
 - The current local `Z-Image FP8` single-step time is about `15s` on-device.
-- Full local generation is about `2 min` and the image quality is already close to the Nanobanana reference image above.
+- Full local generation is about `2 min`, and the image quality is already close to the Nanobanana reference above.
 
 ## Quick Start (HTP v75/v79)
 
