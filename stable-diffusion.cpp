@@ -8,6 +8,7 @@
 
 #ifdef SD_USE_HEXAGON
 #include "ggml-hexagon.h"
+#include "ggml-htp.h"
 #endif
 
 #include "model.h"
@@ -64,6 +65,127 @@ const char* model_version_to_str[] = {
     "Z-Image",
     "Ovis Image",
 };
+
+#ifdef SD_USE_HEXAGON
+struct sd_npu_runtime_policy {
+    bool enabled                 = false;
+    std::string accel_backend;
+    bool op_profile_enabled     = false;
+    std::string op_profile_csv;
+    std::string op_profile_shape_csv;
+    bool htp_stats_enabled      = false;
+    bool htp_fallback_enabled   = false;
+    std::string htp_fallback_csv;
+    bool contract_strict        = false;
+};
+
+static bool sd_env_flag(const char* key, bool default_value) {
+    const char* env = std::getenv(key);
+    if (env == nullptr || env[0] == '\0') {
+        return default_value;
+    }
+    return std::strcmp(env, "0") != 0;
+}
+
+static std::string sd_env_str(const char* key, const char* fallback = nullptr) {
+    const char* env = std::getenv(key);
+    if (env != nullptr && env[0] != '\0') {
+        return std::string(env);
+    }
+    return fallback ? std::string(fallback) : std::string();
+}
+
+static void sd_set_env_overwrite(const char* key, const std::string& value) {
+    if (key == nullptr || key[0] == '\0') {
+        return;
+    }
+#if defined(_WIN32)
+    _putenv_s(key, value.c_str());
+#else
+    setenv(key, value.c_str(), 1);
+#endif
+}
+
+static sd_npu_runtime_policy sd_load_npu_runtime_policy(const sd_ctx_params_t* sd_ctx_params) {
+    sd_npu_runtime_policy policy;
+    policy.enabled              = sd_env_flag("SD_NPU_ENABLE", true);
+    policy.accel_backend        = sd_env_str("SD_NPU_BACKEND", std::getenv("SD_ACCEL_BACKEND"));
+    policy.op_profile_enabled   = sd_env_flag("SD_NPU_OP_PROFILE", false);
+    policy.op_profile_csv       = sd_env_str("SD_NPU_OP_PROFILE_CSV");
+    policy.op_profile_shape_csv = sd_env_str("SD_NPU_OP_PROFILE_SHAPE_CSV");
+    policy.htp_stats_enabled    = sd_env_flag("SD_NPU_HTP_STATS", policy.op_profile_enabled);
+    policy.htp_fallback_enabled = sd_env_flag("SD_NPU_HTP_FALLBACK", policy.htp_stats_enabled);
+    policy.htp_fallback_csv     = sd_env_str("SD_NPU_HTP_FALLBACK_CSV");
+    policy.contract_strict      = sd_env_flag("SD_NPU_CONTRACT_STRICT", false);
+
+    if (sd_ctx_params != nullptr && sd_ctx_params->npu_runtime_opts != nullptr) {
+        const sd_npu_runtime_opts_t* opts = sd_ctx_params->npu_runtime_opts;
+        policy.enabled = opts->enabled;
+        if (opts->accel_backend != nullptr && opts->accel_backend[0] != '\0') {
+            policy.accel_backend = opts->accel_backend;
+        }
+        policy.op_profile_enabled = opts->op_profile_enabled;
+        if (opts->op_profile_csv != nullptr && opts->op_profile_csv[0] != '\0') {
+            policy.op_profile_csv = opts->op_profile_csv;
+        }
+        if (opts->op_profile_shape_csv != nullptr && opts->op_profile_shape_csv[0] != '\0') {
+            policy.op_profile_shape_csv = opts->op_profile_shape_csv;
+        }
+        policy.htp_stats_enabled = opts->htp_stats_enabled;
+        policy.htp_fallback_enabled = opts->htp_fallback_enabled;
+        if (opts->htp_fallback_csv != nullptr && opts->htp_fallback_csv[0] != '\0') {
+            policy.htp_fallback_csv = opts->htp_fallback_csv;
+        }
+        policy.contract_strict = opts->contract_strict;
+        if (opts->expected_contract_id != nullptr && opts->expected_contract_id[0] != '\0') {
+            sd_set_env_overwrite("GGML_HTP_CONTRACT_EXPECT", opts->expected_contract_id);
+        }
+    }
+    return policy;
+}
+
+static void sd_apply_npu_runtime_policy(const sd_npu_runtime_policy& policy) {
+    if (!policy.accel_backend.empty()) {
+        sd_set_env_overwrite("SD_ACCEL_BACKEND", policy.accel_backend);
+    }
+    if (policy.op_profile_enabled) {
+        sd_set_env_overwrite("GGML_OP_PROFILE", "1");
+        if (!policy.op_profile_csv.empty()) {
+            sd_set_env_overwrite("GGML_OP_PROFILE_CSV", policy.op_profile_csv);
+        }
+        if (!policy.op_profile_shape_csv.empty()) {
+            sd_set_env_overwrite("GGML_OP_PROFILE_SHAPE_CSV", policy.op_profile_shape_csv);
+        }
+    }
+
+    ggml_htp_runtime_options htp_opts = {
+        policy.htp_stats_enabled,
+        policy.htp_fallback_enabled,
+        policy.contract_strict,
+        policy.htp_fallback_csv.empty() ? nullptr : policy.htp_fallback_csv.c_str(),
+    };
+    ggml_backend_htp_apply_runtime_options(&htp_opts);
+
+    const char* expected_contract = std::getenv("SD_NPU_EXPECT_CONTRACT_ID");
+    if (expected_contract != nullptr && expected_contract[0] != '\0') {
+        sd_set_env_overwrite("GGML_HTP_CONTRACT_EXPECT", expected_contract);
+    }
+}
+
+static void sd_log_npu_runtime_policy(const sd_npu_runtime_policy& policy) {
+    LOG_INFO(
+        "NPU policy: enabled=%d backend=%s op_profile=%d profile_csv=%s shape_csv=%s htp_stats=%d htp_fallback=%d fallback_csv=%s contract_strict=%d",
+        policy.enabled ? 1 : 0,
+        policy.accel_backend.empty() ? "<default>" : policy.accel_backend.c_str(),
+        policy.op_profile_enabled ? 1 : 0,
+        policy.op_profile_csv.empty() ? "<none>" : policy.op_profile_csv.c_str(),
+        policy.op_profile_shape_csv.empty() ? "<none>" : policy.op_profile_shape_csv.c_str(),
+        policy.htp_stats_enabled ? 1 : 0,
+        policy.htp_fallback_enabled ? 1 : 0,
+        policy.htp_fallback_csv.empty() ? "<none>" : policy.htp_fallback_csv.c_str(),
+        policy.contract_strict ? 1 : 0);
+}
+#endif  // SD_USE_HEXAGON
 
 static bool sd_dump_tensor_to_file(const std::string& path, const char* name, const ggml_tensor* tensor) {
     if (tensor == nullptr) {
@@ -553,6 +675,9 @@ public:
     bool use_pmid                        = false;
     std::string cond_c_crossattn_path;
     std::string uncond_c_crossattn_path;
+#ifdef SD_USE_HEXAGON
+    sd_npu_runtime_policy npu_runtime_policy;
+#endif
 
     bool is_using_v_parameterization     = false;
     bool is_using_edm_v_parameterization = false;
@@ -630,8 +755,16 @@ public:
         backend = ggml_backend_sycl_init(0);
 #endif
 #ifdef SD_USE_HEXAGON
-        LOG_DEBUG("Using Hexagon backend");
-        backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_ACCEL, nullptr);
+        // Allow explicit ACCEL backend selection (e.g. "HTP" vs "Hexagon")
+        const char* accel_backend = getenv("SD_ACCEL_BACKEND");
+        if (accel_backend && accel_backend[0] != '\0') {
+            LOG_INFO("Using ACCEL backend by name: %s", accel_backend);
+            backend = ggml_backend_init_by_name(accel_backend, nullptr);
+        }
+        if (!backend) {
+            LOG_DEBUG("Using ACCEL backend by type");
+            backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_ACCEL, nullptr);
+        }
 #endif
 
         if (!backend) {
@@ -729,7 +862,18 @@ public:
 
         ggml_log_set(ggml_log_callback_default, nullptr);
 
+#ifdef SD_USE_HEXAGON
+        npu_runtime_policy = sd_load_npu_runtime_policy(sd_ctx_params);
+        if (npu_runtime_policy.enabled || sd_ctx_params->npu_runtime_opts != nullptr) {
+            sd_apply_npu_runtime_policy(npu_runtime_policy);
+            sd_log_npu_runtime_policy(npu_runtime_policy);
+        }
+#endif
+
         init_backend();
+        if (backend != nullptr) {
+            LOG_INFO("Initialized backend: %s", ggml_backend_name(backend));
+        }
 
         ModelLoader model_loader;
 
@@ -826,7 +970,6 @@ public:
         if (wtype != GGML_TYPE_COUNT || tensor_type_rules.size() > 0) {
             model_loader.set_wtype_override(wtype, tensor_type_rules);
         }
-
         std::map<ggml_type, uint32_t> wtype_stat                 = model_loader.get_wtype_stat();
         std::map<ggml_type, uint32_t> conditioner_wtype_stat     = model_loader.get_conditioner_wtype_stat();
         std::map<ggml_type, uint32_t> diffusion_model_wtype_stat = model_loader.get_diffusion_model_wtype_stat();
@@ -1055,8 +1198,13 @@ public:
                 }
             }
 
-            cond_stage_model->alloc_params_buffer();
-            cond_stage_model->get_param_tensors(tensors);
+            const bool use_precomputed_cond = !cond_c_crossattn_path.empty();
+            if (use_precomputed_cond) {
+                LOG_INFO("using precomputed cond crossattn, skip conditioner param init");
+            } else {
+                cond_stage_model->alloc_params_buffer();
+                cond_stage_model->get_param_tensors(tensors);
+            }
 
             diffusion_model->alloc_params_buffer();
             diffusion_model->get_param_tensors(tensors);
@@ -1253,9 +1401,16 @@ public:
         LOG_DEBUG("loading weights");
 
         std::set<std::string> ignore_tensors;
+        const bool use_precomputed_cond = !cond_c_crossattn_path.empty();
         tensors["alphas_cumprod"] = alphas_cumprod_tensor;
         if (use_tiny_autoencoder) {
             ignore_tensors.insert("first_stage_model.");
+        }
+        if (use_precomputed_cond) {
+            // Skip loading conditioner weights when cond/uncond cross-attn is injected from .tensor files.
+            ignore_tensors.insert("text_encoders.");
+            ignore_tensors.insert("cond_stage_model.");
+            LOG_INFO("using precomputed cond crossattn, skipping conditioner tensor load");
         }
         if (use_pmid) {
             ignore_tensors.insert("pmid.unet.");
@@ -3662,6 +3817,13 @@ public:
         int64_t W                  = x->ne[0] * vae_scale_factor;
         int64_t H                  = x->ne[1] * vae_scale_factor;
         int64_t C                  = 3;
+        sd_tiling_params_t decode_tiling_params = vae_tiling_params;
+#ifdef SD_USE_HEXAGON
+        if (!decode_video && !decode_tiling_params.enabled && ggml_backend_is_htp(vae_backend)) {
+            decode_tiling_params.enabled = true;
+            LOG_INFO("Auto-enabling VAE tiling for HTP decode to avoid oversized RPCMEM allocation");
+        }
+#endif
         ggml_tensor* result        = nullptr;
         if (decode_video) {
             int64_t T = x->ne[2];
@@ -3718,10 +3880,10 @@ public:
             }
             process_latent_out(x);
             // x = load_tensor_from_file(work_ctx, "wan_vae_z.bin");
-            if (vae_tiling_params.enabled) {
+            if (decode_tiling_params.enabled) {
                 float tile_overlap;
                 int tile_size_x, tile_size_y;
-                get_tile_sizes(tile_size_x, tile_size_y, tile_overlap, vae_tiling_params, x->ne[0], x->ne[1]);
+                get_tile_sizes(tile_size_x, tile_size_y, tile_overlap, decode_tiling_params, x->ne[0], x->ne[1]);
 
                 LOG_DEBUG("VAE Tile size: %dx%d", tile_size_x, tile_size_y);
 
@@ -3736,7 +3898,7 @@ public:
             first_stage_model->free_compute_buffer();
             process_vae_output_tensor(result);
         } else {
-            if (vae_tiling_params.enabled) {
+            if (decode_tiling_params.enabled) {
                 // split latent in 64x64 tiles and compute in several steps
                 auto on_tiling = [&](ggml_tensor* in, ggml_tensor* out, bool init) {
                     tae_first_stage->compute(n_threads, in, true, &out);
@@ -3973,6 +4135,25 @@ void sd_cache_params_init(sd_cache_params_t* cache_params) {
     cache_params->scm_policy_dynamic          = true;
 }
 
+void sd_npu_runtime_opts_init(sd_npu_runtime_opts_t* npu_runtime_opts) {
+    if (npu_runtime_opts == nullptr) {
+        return;
+    }
+    *npu_runtime_opts                 = {};
+    npu_runtime_opts->enabled         = true;
+    npu_runtime_opts->op_profile_enabled = false;
+    npu_runtime_opts->htp_stats_enabled = false;
+    npu_runtime_opts->htp_fallback_enabled = false;
+    npu_runtime_opts->contract_strict = false;
+}
+
+void sd_npu_offload_stats_init(sd_npu_offload_stats_t* offload_stats) {
+    if (offload_stats == nullptr) {
+        return;
+    }
+    *offload_stats = {};
+}
+
 void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     *sd_ctx_params                         = {};
     sd_ctx_params->vae_decode_only         = true;
@@ -3998,6 +4179,7 @@ void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params) {
     sd_ctx_params->flow_shift              = INFINITY;
     sd_ctx_params->cond_c_crossattn_path   = nullptr;
     sd_ctx_params->uncond_c_crossattn_path = nullptr;
+    sd_ctx_params->npu_runtime_opts        = nullptr;
 }
 
 char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
@@ -4041,7 +4223,8 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              "chroma_use_t5_mask: %s\n"
              "chroma_t5_mask_pad: %d\n"
              "cond_c_crossattn_path: %s\n"
-             "uncond_c_crossattn_path: %s\n",
+             "uncond_c_crossattn_path: %s\n"
+             "npu_runtime_opts: %s\n",
              SAFE_STR(sd_ctx_params->model_path),
              SAFE_STR(sd_ctx_params->clip_l_path),
              SAFE_STR(sd_ctx_params->clip_g_path),
@@ -4076,7 +4259,8 @@ char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params) {
              BOOL_STR(sd_ctx_params->chroma_use_t5_mask),
              sd_ctx_params->chroma_t5_mask_pad,
              SAFE_STR(sd_ctx_params->cond_c_crossattn_path),
-             SAFE_STR(sd_ctx_params->uncond_c_crossattn_path));
+             SAFE_STR(sd_ctx_params->uncond_c_crossattn_path),
+             sd_ctx_params->npu_runtime_opts ? "set" : "null");
 
     return buf;
 }
@@ -4564,6 +4748,14 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
     }
     int64_t t3 = ggml_time_ms();
     LOG_INFO("generating %" PRId64 " latent images completed, taking %.2fs", final_latents.size(), (t3 - t1) * 1.0f / 1000);
+
+    const char* skip_decode = std::getenv("SD_SKIP_DECODE");
+    if (skip_decode != nullptr && skip_decode[0] != '\0' && strcmp(skip_decode, "0") != 0) {
+        LOG_INFO("SD_SKIP_DECODE is enabled, skip VAE decode and return empty image outputs");
+        sd_image_t* result_images = (sd_image_t*)calloc(batch_count, sizeof(sd_image_t));
+        ggml_free(work_ctx);
+        return result_images;
+    }
 
     // Decode to image
     LOG_INFO("decoding %zu latents", final_latents.size());

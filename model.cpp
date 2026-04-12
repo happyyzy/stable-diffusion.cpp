@@ -1,7 +1,12 @@
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <cctype>
+#include <cmath>
 #include <cstdarg>
+#include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <mutex>
@@ -233,6 +238,221 @@ void i64_to_i32_vec(int64_t* src, int32_t* dst, int64_t n) {
     }
 }
 
+static inline size_t sd_hmx_wf8_permuted_weight_index(int k, int i, int j) {
+    const int kt = k / 32;
+    const int i0 = i / 32;
+    const int i1 = i % 32;
+    const int j0 = j / 32;
+    const int j1 = j % 32;
+    const size_t tile_idx = (size_t)j0 * (size_t)kt + (size_t)i0;
+    static const uint8_t lane_perm[4] = {0, 2, 1, 3};
+    const size_t tile_row = (size_t)(i1 / 4) * 4 + (size_t)(j1 / 8);
+    const size_t tile_col = (size_t)(j1 % 8) * 4 + (size_t)lane_perm[i1 % 4];
+    return tile_idx * 1024 + tile_row * 32 + tile_col;
+}
+
+static float sd_decode_fp8_e4m3fn_export(uint8_t code) {
+    const int sign = (code & 0x80) ? -1 : 1;
+    const int exp  = (code >> 3) & 0x0f;
+    const int mant = code & 0x07;
+    if (exp == 0x0f && mant == 0x07) {
+        return 0.0f;
+    }
+    if (exp == 0) {
+        if (mant == 0) {
+            return 0.0f;
+        }
+        return sign * std::ldexp((float) mant, -9);
+    }
+    return sign * std::ldexp(1.0f + (float) mant / 8.0f, exp - 7);
+}
+
+struct sd_wf8_export_code_value {
+    float value;
+    uint8_t code;
+};
+
+static const std::array<sd_wf8_export_code_value, 254>& sd_wf8_export_sorted_codebook() {
+    static const std::array<sd_wf8_export_code_value, 254> table = []() {
+        std::array<sd_wf8_export_code_value, 254> out{};
+        size_t idx = 0;
+        for (int code = 0; code < 256; ++code) {
+            if (((code >> 3) & 0x0f) == 0x0f && (code & 0x07) == 0x07) {
+                continue;
+            }
+            if (code == 0x80) {
+                continue;
+            }
+            out[idx++] = { sd_decode_fp8_e4m3fn_export((uint8_t) code), (uint8_t) code };
+        }
+        std::sort(out.begin(), out.end(), [](const sd_wf8_export_code_value& a, const sd_wf8_export_code_value& b) {
+            if (a.value != b.value) {
+                return a.value < b.value;
+            }
+            return a.code < b.code;
+        });
+        return out;
+    }();
+    return table;
+}
+
+static uint8_t sd_encode_fp8_e4m3fn_best_export(float x) {
+    x *= 256.0f;
+    if (x == 0.0f) {
+        return 0x00;
+    }
+
+    const auto& table = sd_wf8_export_sorted_codebook();
+    auto it = std::lower_bound(
+        table.begin(), table.end(), x,
+        [](const sd_wf8_export_code_value& e, float v) {
+            return e.value < v;
+        });
+
+    const sd_wf8_export_code_value* best = nullptr;
+    auto consider = [&](const sd_wf8_export_code_value* cand) {
+        if (cand == nullptr) {
+            return;
+        }
+        if (best == nullptr) {
+            best = cand;
+            return;
+        }
+        const float cand_err = std::fabs(cand->value - x);
+        const float best_err = std::fabs(best->value - x);
+        if (cand_err < best_err || (cand_err == best_err && cand->code < best->code)) {
+            best = cand;
+        }
+    };
+
+    if (it != table.end()) {
+        consider(&(*it));
+        const float v = it->value;
+        for (auto jt = it + 1; jt != table.end() && jt->value == v; ++jt) {
+            consider(&(*jt));
+        }
+    }
+    if (it != table.begin()) {
+        auto jt = it;
+        do {
+            --jt;
+            consider(&(*jt));
+        } while (jt != table.begin() && jt->value == (jt - 1)->value);
+    }
+
+    return best ? best->code : 0;
+}
+
+static uint8_t sd_encode_fp8_e4m3fn_best_export_f16(ggml_fp16_t h) {
+    static const std::array<uint8_t, 65536> lut = []() {
+        std::array<uint8_t, 65536> out{};
+        for (uint32_t i = 0; i < out.size(); ++i) {
+            const ggml_fp16_t hval = (ggml_fp16_t) i;
+            out[i] = sd_encode_fp8_e4m3fn_best_export(ggml_fp16_to_fp32(hval));
+        }
+        return out;
+    }();
+    return lut[(uint16_t) h];
+}
+
+template<typename SrcT, typename EncodeFn>
+static void sd_pack_compact_wf8_weight_from_ggml_tensor_layout_impl(
+        uint8_t * dst,
+        const SrcT * src,
+        int k,
+        int n,
+        int nthread,
+        EncodeFn encode_fn) {
+    std::memset(dst, 0, (size_t) k * (size_t) n);
+
+    const int nthread_use = std::max(1, std::min(nthread, n));
+    if (nthread_use == 1) {
+        for (int j = 0; j < n; ++j) {
+            const size_t row_off = (size_t) j * (size_t) k;
+            for (int i = 0; i < k; ++i) {
+                dst[sd_hmx_wf8_permuted_weight_index(k, i, j)] = encode_fn(src[row_off + (size_t) i]);
+            }
+        }
+        return;
+    }
+
+    std::vector<std::thread> threads;
+    threads.reserve((size_t) nthread_use);
+    for (int tid = 0; tid < nthread_use; ++tid) {
+        const int j0 = (n * tid) / nthread_use;
+        const int j1 = (n * (tid + 1)) / nthread_use;
+        threads.emplace_back([=]() {
+            for (int j = j0; j < j1; ++j) {
+                const size_t row_off = (size_t) j * (size_t) k;
+                for (int i = 0; i < k; ++i) {
+                    dst[sd_hmx_wf8_permuted_weight_index(k, i, j)] = encode_fn(src[row_off + (size_t) i]);
+                }
+            }
+        });
+    }
+    for (auto& t : threads) {
+        t.join();
+    }
+}
+
+static void sd_pack_compact_wf8_weight_from_ggml_tensor_layout(
+        uint8_t * dst,
+        const float * src,
+        int k,
+        int n,
+        int nthread) {
+    sd_pack_compact_wf8_weight_from_ggml_tensor_layout_impl(
+        dst, src, k, n, nthread,
+        [](float x) { return sd_encode_fp8_e4m3fn_best_export(x); });
+}
+
+static void sd_pack_compact_wf8_weight_from_f16_ggml_tensor_layout(
+        uint8_t * dst,
+        const ggml_fp16_t * src,
+        int k,
+        int n,
+        int nthread) {
+    sd_pack_compact_wf8_weight_from_ggml_tensor_layout_impl(
+        dst, src, k, n, nthread,
+        [](ggml_fp16_t x) { return sd_encode_fp8_e4m3fn_best_export_f16(x); });
+}
+
+template<typename DstT, typename StoreFn>
+static void sd_unpack_compact_wf8_weight_to_ggml_tensor_layout_impl(
+        DstT * dst,
+        const uint8_t * src,
+        int k,
+        int n,
+        StoreFn store_fn) {
+    for (int j = 0; j < n; ++j) {
+        const size_t row_off = (size_t) j * (size_t) k;
+        for (int i = 0; i < k; ++i) {
+            const float v = sd_decode_fp8_e4m3fn_export(src[sd_hmx_wf8_permuted_weight_index(k, i, j)]) / 256.0f;
+            dst[row_off + (size_t) i] = store_fn(v);
+        }
+    }
+}
+
+static void sd_unpack_compact_wf8_weight_to_f16_ggml_tensor_layout(
+        ggml_fp16_t * dst,
+        const uint8_t * src,
+        int k,
+        int n) {
+    sd_unpack_compact_wf8_weight_to_ggml_tensor_layout_impl(
+        dst, src, k, n,
+        [](float v) { return ggml_fp32_to_fp16(v); });
+}
+
+static void sd_unpack_compact_wf8_weight_to_f32_ggml_tensor_layout(
+        float * dst,
+        const uint8_t * src,
+        int k,
+        int n) {
+    sd_unpack_compact_wf8_weight_to_ggml_tensor_layout_impl(
+        dst, src, k, n,
+        [](float v) { return v; });
+}
+
 void convert_tensor(void* src,
                     ggml_type src_type,
                     void* dst,
@@ -243,6 +463,30 @@ void convert_tensor(void* src,
     if (src_type == dst_type) {
         size_t nbytes = n * ggml_type_size(src_type) / ggml_blck_size(src_type);
         memcpy(((char*)dst), ((char*)src), nbytes);
+    } else if (src_type == GGML_TYPE_WF8_HMX_PREPACK && dst_type == GGML_TYPE_F16) {
+        sd_unpack_compact_wf8_weight_to_f16_ggml_tensor_layout(
+            (ggml_fp16_t *) dst, (const uint8_t *) src, n_per_row, nrows);
+    } else if (src_type == GGML_TYPE_WF8_HMX_PREPACK && dst_type == GGML_TYPE_F32) {
+        sd_unpack_compact_wf8_weight_to_f32_ggml_tensor_layout(
+            (float *) dst, (const uint8_t *) src, n_per_row, nrows);
+    } else if (dst_type == GGML_TYPE_WF8_HMX_PREPACK) {
+        if (src_type == GGML_TYPE_F32) {
+            sd_pack_compact_wf8_weight_from_ggml_tensor_layout((uint8_t*) dst, (const float*) src, n_per_row, nrows,
+                                                               sd_get_num_physical_cores());
+        } else if (src_type == GGML_TYPE_F16) {
+            sd_pack_compact_wf8_weight_from_f16_ggml_tensor_layout((uint8_t*) dst, (const ggml_fp16_t*) src, n_per_row, nrows,
+                                                                   sd_get_num_physical_cores());
+        } else {
+            auto qtype = ggml_get_type_traits(src_type);
+            if (qtype->to_float == nullptr) {
+                throw std::runtime_error(sd_format("type %s unsupported for WF8_HMX_PREPACK conversion",
+                                                   ggml_type_name(src_type)));
+            }
+            std::vector<float> src_data_f32(n);
+            qtype->to_float(src, src_data_f32.data(), n);
+            sd_pack_compact_wf8_weight_from_ggml_tensor_layout((uint8_t*) dst, src_data_f32.data(), n_per_row, nrows,
+                                                               sd_get_num_physical_cores());
+        }
     } else if (src_type == GGML_TYPE_F32) {
         if (dst_type == GGML_TYPE_F16) {
             ggml_fp32_to_fp16_row((float*)src, (ggml_fp16_t*)dst, n);
@@ -284,10 +528,507 @@ void convert_tensor(void* src,
     }
 }
 
+static bool sd_convert_htp_permute_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* env = getenv("SD_GGUF_CONVERT_HTP_PERMUTE");
+        enabled         = (env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
+// Inverse of the HMX 32x32 weight layout permute, used to build host-side CPU
+// references from a permuted+repacked GGUF. Mutually exclusive with PERMUTE.
+static bool sd_convert_htp_invpermute_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* env = getenv("SD_GGUF_CONVERT_HTP_INVPERMUTE");
+        enabled         = (env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
+static bool sd_convert_htp_permute_core_only() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* env = getenv("SD_GGUF_CONVERT_HTP_PERMUTE_CORE_ONLY");
+        enabled         = (env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
+static bool sd_convert_htp_permute_log_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* env = getenv("SD_GGUF_CONVERT_HTP_PERMUTE_LOG");
+        enabled         = (env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
+static std::atomic<int>& sd_convert_htp_permute_count() {
+    static std::atomic<int> count(0);
+    return count;
+}
+
+static bool sd_convert_htp_repack_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* env = getenv("SD_GGUF_CONVERT_HTP_REPACK");
+        enabled         = (env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return enabled != 0;
+}
+
+// When enabled, only weights that were permuted in this conversion run will be
+// repacked into the HMX packed-quant layout. This keeps small CPU-only matmuls
+// (e.g. cap_embed / adaLN) compatible with vanilla ggml execution.
+static bool sd_convert_htp_repack_only_permuted() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* env = getenv("SD_GGUF_CONVERT_HTP_REPACK_ONLY_PERMUTED");
+        if (env != nullptr && env[0] != '\0') {
+            enabled = (strcmp(env, "0") != 0) ? 1 : 0;
+        } else {
+            const char* overlay = getenv("SD_DIFFUSION_MODEL_OVERLAY");
+            // Overlay convert starts from an already packed baseline GGUF and replaces
+            // only a subset of tensors from the source model. Repacking untouched
+            // baseline qweights again corrupts their on-disk layout, so in overlay mode
+            // only tensors permuted in this conversion pass may be repacked.
+            enabled = (overlay != nullptr && overlay[0] != '\0') ? 1 : 0;
+        }
+    }
+    return enabled != 0;
+}
+
+// Optional override for the GGUF metadata flag sd.npu.contract.export.repack.
+// This can be used to keep CPU fallback in vanilla mode even if we repack a
+// subset of weights for the HMX fast-path.
+static bool sd_convert_htp_repack_metadata_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* env = getenv("SD_GGUF_CONVERT_HTP_REPACK_META");
+        if (env != nullptr && env[0] != '\0') {
+            enabled = (strcmp(env, "0") != 0 && strcmp(env, "false") != 0) ? 1 : 0;
+        } else {
+            enabled = sd_convert_htp_repack_enabled() ? 1 : 0;
+        }
+    }
+    return enabled != 0;
+}
+
+static std::atomic<int>& sd_convert_htp_repack_count() {
+    static std::atomic<int> count(0);
+    return count;
+}
+
+static std::vector<std::string> sd_parse_csv_env(const char* name) {
+    std::vector<std::string> out;
+    const char* env = getenv(name);
+    if (env == nullptr || env[0] == '\0') {
+        return out;
+    }
+    std::string s(env);
+    size_t start = 0;
+    while (start < s.size()) {
+        size_t end = s.find(',', start);
+        if (end == std::string::npos) {
+            end = s.size();
+        }
+        size_t b = start;
+        while (b < end && std::isspace((unsigned char)s[b])) {
+            ++b;
+        }
+        size_t e = end;
+        while (e > b && std::isspace((unsigned char)s[e - 1])) {
+            --e;
+        }
+        if (e > b) {
+            out.emplace_back(s.substr(b, e - b));
+        }
+        start = end + 1;
+    }
+    return out;
+}
+
+static bool sd_name_match_any(const std::string& name, const std::vector<std::string>& keys) {
+    for (const auto& k : keys) {
+        if (!k.empty() && name.find(k) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool sd_convert_htp_permute_name_allowed(const std::string& name) {
+    static std::vector<std::string> include = sd_parse_csv_env("SD_GGUF_CONVERT_HTP_PERMUTE_INCLUDE");
+    static std::vector<std::string> exclude = sd_parse_csv_env("SD_GGUF_CONVERT_HTP_PERMUTE_EXCLUDE");
+
+    if (!include.empty() && !sd_name_match_any(name, include)) {
+        return false;
+    }
+    if (!exclude.empty() && sd_name_match_any(name, exclude)) {
+        return false;
+    }
+    return true;
+}
+
+static bool sd_convert_should_hmx_permute(const TensorStorage& tensor_storage, const ggml_tensor* dst_tensor) {
+    const bool do_perm = sd_convert_htp_permute_enabled();
+    const bool do_inv  = sd_convert_htp_invpermute_enabled();
+    if (do_perm && do_inv) {
+        LOG_ERROR("SD_GGUF_CONVERT_HTP_PERMUTE and SD_GGUF_CONVERT_HTP_INVPERMUTE are both enabled; pick one");
+        return false;
+    }
+    if (!do_perm && !do_inv) {
+        return false;
+    }
+    if (dst_tensor == nullptr) {
+        return false;
+    }
+    const bool supported_dst_type =
+        ggml_is_quantized(dst_tensor->type) ||
+        dst_tensor->type == GGML_TYPE_F16 ||
+        dst_tensor->type == GGML_TYPE_BF16 ||
+        dst_tensor->type == GGML_TYPE_F32;
+    if (!supported_dst_type) {
+        return false;
+    }
+    if (tensor_storage.n_dims != 2) {
+        return false;
+    }
+    const int64_t k = tensor_storage.ne[0];
+    const int64_t n = tensor_storage.ne[1];
+    if ((n % 32) != 0) {
+        return false;
+    }
+    if (do_inv) {
+        // For INVPERMUTE, only handle quantized weights. In our diffusion exports, fp16 tensors are
+        // kept in vanilla basis (CPU-friendly) and should not be unpermuted.
+        if (!ggml_is_quantized(tensor_storage.type)) {
+            return false;
+        }
+        if ((k % 256) != 0) {
+            return false;
+        }
+    } else {
+        // Match HTP matmul constraints for the target weight dtype:
+        // - Quant (q4/q8/iq4): k % 256 == 0, n % 32 == 0
+        // - F16 weight matmul: k % 32 == 0, n % 32 == 0
+        if (ggml_is_quantized(dst_tensor->type)) {
+            if ((k % 256) != 0) {
+                return false;
+            }
+        } else if (dst_tensor->type == GGML_TYPE_F16) {
+            if ((k % 32) != 0) {
+                return false;
+            }
+        } else {
+            // NOTE: HTP offload currently consumes permuted weights for quant/f16 matmul only.
+            // Keep other dtypes conservative to avoid breaking CPU fallback correctness.
+            return false;
+        }
+    }
+    if (ends_with(tensor_storage.name, ".bias") || ends_with(tensor_storage.name, ".scale")) {
+        return false;
+    }
+    if (sd_convert_htp_permute_core_only()) {
+        const std::string& name = tensor_storage.name;
+        const bool core_linear =
+            ends_with(name, ".attention.qkv.weight") ||
+            ends_with(name, ".attention.out.weight") ||
+            ends_with(name, ".feed_forward.w1.weight") ||
+            ends_with(name, ".feed_forward.w2.weight") ||
+            ends_with(name, ".feed_forward.w3.weight");
+        if (!core_linear) {
+            return false;
+        }
+    }
+    if (!sd_convert_htp_permute_name_allowed(tensor_storage.name)) {
+        return false;
+    }
+    return true;
+}
+
+static void sd_hmx_permute_linear_weight_f32(const float* src, float* dst, int n, int k) {
+    const int n_chunks = n / 32;
+    const int k_chunks = k / 32;
+    const int k_stride = k_chunks * 32;
+
+    for (int r = 0; r < n; ++r) {
+        const int64_t row_base = (int64_t)r * k_stride;
+        for (int c = 0; c < k_stride; ++c) {
+            int64_t t = row_base + c;
+            int u     = (int)(t & 1);
+            t >>= 1;
+            int i = (int)(t & 31);
+            t >>= 5;
+            int g = (int)(t & 15);
+            t >>= 4;
+            int b = (int)(t % k_chunks);
+            int a = (int)(t / k_chunks);
+
+            if (a < 0 || a >= n_chunks) {
+                continue;
+            }
+
+            int src_row = a * 32 + i;
+            int src_col = b * 32 + g * 2 + u;
+            dst[row_base + c] = src[(int64_t)src_row * k + src_col];
+        }
+    }
+}
+
+// Inverse mapping of sd_hmx_permute_linear_weight_f32():
+// - src: permuted basis (as stored for HMX matmul)
+// - dst: vanilla basis (row-major [n,k])
+static void sd_hmx_invpermute_linear_weight_f32(const float* src, float* dst, int n, int k) {
+    const int n_chunks = n / 32;
+    const int k_chunks = k / 32;
+    const int k_stride = k_chunks * 32;
+
+    for (int r = 0; r < n; ++r) {
+        const int64_t row_base = (int64_t)r * k_stride;
+        for (int c = 0; c < k_stride; ++c) {
+            int64_t t = row_base + c;
+            int u     = (int)(t & 1);
+            t >>= 1;
+            int i = (int)(t & 31);
+            t >>= 5;
+            int g = (int)(t & 15);
+            t >>= 4;
+            int b = (int)(t % k_chunks);
+            int a = (int)(t / k_chunks);
+
+            if (a < 0 || a >= n_chunks) {
+                continue;
+            }
+
+            int src_row = a * 32 + i;
+            int src_col = b * 32 + g * 2 + u;
+            dst[(int64_t)src_row * k + src_col] = src[row_base + c];
+        }
+    }
+}
+
+struct sd_std_block_q4_like {
+    uint16_t d;
+    uint8_t  qs[16];
+} __attribute__((packed));
+static_assert(sizeof(sd_std_block_q4_like) == 18, "unexpected q4-like block size");
+
+struct sd_std_block_q8_0 {
+    uint16_t d;
+    int8_t   qs[32];
+} __attribute__((packed));
+static_assert(sizeof(sd_std_block_q8_0) == 34, "unexpected q8_0 block size");
+
+struct sd_my_block_q4_0_like {
+    uint16_t scales[8];
+    uint8_t  quants[8 * 16];
+} __attribute__((packed));
+static_assert(sizeof(sd_my_block_q4_0_like) == 144, "unexpected packed q4-like super-block size");
+
+struct sd_my_block_q8_0 {
+    uint16_t scales[8];
+    int8_t   quants[8 * 32];
+} __attribute__((packed));
+static_assert(sizeof(sd_my_block_q8_0) == 272, "unexpected packed q8_0 super-block size");
+
+static void sd_hmx_repack_row_q4_like_inplace(uint8_t* row, size_t n_super_blocks) {
+    for (size_t sb = 0; sb < n_super_blocks; ++sb) {
+        const size_t src_off = sb * 8 * sizeof(sd_std_block_q4_like);
+        const auto* src_ptr  = reinterpret_cast<const sd_std_block_q4_like*>(row + src_off);
+
+        sd_std_block_q4_like src_blocks[8];
+        std::memcpy(src_blocks, src_ptr, sizeof(src_blocks));
+
+        sd_my_block_q4_0_like dst_block{};
+        uint8_t unpacked_qs[256];
+        for (size_t bi = 0; bi < 8; ++bi) {
+            dst_block.scales[bi] = src_blocks[bi].d;
+            for (size_t j = 0; j < sizeof(src_blocks[bi].qs); ++j) {
+                uint8_t q = src_blocks[bi].qs[j];
+                unpacked_qs[bi * 32 + j + 0]  = q & 0x0F;
+                unpacked_qs[bi * 32 + j + 16] = q >> 4;
+            }
+        }
+        for (size_t j = 0; j < sizeof(dst_block.quants) / 2; ++j) {
+            dst_block.quants[j * 2 + 0] = (uint8_t)((unpacked_qs[j + 128] << 4) | unpacked_qs[j + 0]);
+            dst_block.quants[j * 2 + 1] = (uint8_t)((unpacked_qs[j + 192] << 4) | unpacked_qs[j + 64]);
+        }
+
+        const size_t dst_off = sb * sizeof(sd_my_block_q4_0_like);
+        std::memcpy(row + dst_off, &dst_block, sizeof(dst_block));
+    }
+}
+
+static void sd_hmx_unrepack_row_q4_like_inplace(uint8_t* row, size_t n_super_blocks) {
+    for (size_t sb = 0; sb < n_super_blocks; ++sb) {
+        const size_t src_off = sb * sizeof(sd_my_block_q4_0_like);
+        const auto* src_ptr  = reinterpret_cast<const sd_my_block_q4_0_like*>(row + src_off);
+
+        sd_my_block_q4_0_like src_block{};
+        std::memcpy(&src_block, src_ptr, sizeof(src_block));
+
+        uint8_t unpacked_qs[256];
+        for (size_t j = 0; j < sizeof(src_block.quants) / 2; ++j) {
+            const uint8_t q0 = src_block.quants[j * 2 + 0];
+            const uint8_t q1 = src_block.quants[j * 2 + 1];
+
+            unpacked_qs[j + 0]   = q0 & 0x0F;
+            unpacked_qs[j + 128] = q0 >> 4;
+            unpacked_qs[j + 64]  = q1 & 0x0F;
+            unpacked_qs[j + 192] = q1 >> 4;
+        }
+
+        sd_std_block_q4_like dst_blocks[8];
+        for (size_t bi = 0; bi < 8; ++bi) {
+            dst_blocks[bi].d = src_block.scales[bi];
+            for (size_t j = 0; j < sizeof(dst_blocks[bi].qs); ++j) {
+                const uint8_t lo = unpacked_qs[bi * 32 + j + 0];
+                const uint8_t hi = unpacked_qs[bi * 32 + j + 16];
+                dst_blocks[bi].qs[j] = (uint8_t)((hi << 4) | lo);
+            }
+        }
+
+        const size_t dst_off = sb * 8 * sizeof(sd_std_block_q4_like);
+        std::memcpy(row + dst_off, dst_blocks, sizeof(dst_blocks));
+    }
+}
+
+static void sd_hmx_repack_row_q8_0_inplace(uint8_t* row, size_t n_super_blocks) {
+    for (size_t sb = 0; sb < n_super_blocks; ++sb) {
+        const size_t src_off = sb * 8 * sizeof(sd_std_block_q8_0);
+        const auto* src_ptr  = reinterpret_cast<const sd_std_block_q8_0*>(row + src_off);
+
+        sd_std_block_q8_0 src_blocks[8];
+        std::memcpy(src_blocks, src_ptr, sizeof(src_blocks));
+
+        sd_my_block_q8_0 dst_block{};
+        for (size_t i = 0; i < 8; ++i) {
+            dst_block.scales[i] = src_blocks[i].d;
+            std::memcpy(dst_block.quants + i * sizeof(src_blocks[i].qs), src_blocks[i].qs, sizeof(src_blocks[i].qs));
+        }
+
+        const size_t dst_off = sb * sizeof(sd_my_block_q8_0);
+        std::memcpy(row + dst_off, &dst_block, sizeof(dst_block));
+    }
+}
+
+static void sd_hmx_unrepack_row_q8_0_inplace(uint8_t* row, size_t n_super_blocks) {
+    for (size_t sb = 0; sb < n_super_blocks; ++sb) {
+        const size_t src_off = sb * sizeof(sd_my_block_q8_0);
+        const auto* src_ptr  = reinterpret_cast<const sd_my_block_q8_0*>(row + src_off);
+
+        sd_my_block_q8_0 src_block{};
+        std::memcpy(&src_block, src_ptr, sizeof(src_block));
+
+        sd_std_block_q8_0 dst_blocks[8];
+        for (size_t bi = 0; bi < 8; ++bi) {
+            dst_blocks[bi].d = src_block.scales[bi];
+            std::memcpy(dst_blocks[bi].qs,
+                        src_block.quants + bi * sizeof(dst_blocks[bi].qs),
+                        sizeof(dst_blocks[bi].qs));
+        }
+
+        const size_t dst_off = sb * 8 * sizeof(sd_std_block_q8_0);
+        std::memcpy(row + dst_off, dst_blocks, sizeof(dst_blocks));
+    }
+}
+
+static void sd_hmx_repack_quant_weight_inplace_if_needed(char* data, ggml_type type, int nrows, int n_per_row, const std::string& name) {
+    if (!sd_convert_htp_repack_enabled()) {
+        return;
+    }
+    const bool is_q4_like = type == GGML_TYPE_Q4_0 || type == GGML_TYPE_IQ4_NL;
+    const bool is_q8_0    = type == GGML_TYPE_Q8_0;
+    if (!is_q4_like && !is_q8_0) {
+        return;
+    }
+    if (n_per_row <= 0 || (n_per_row % 256) != 0) {
+        return;
+    }
+    const size_t n_super_blocks = (size_t)n_per_row / 256;
+    const size_t row_size       = ggml_row_size(type, n_per_row);
+    const size_t expected_row_size =
+        is_q4_like ? n_super_blocks * sizeof(sd_my_block_q4_0_like) : n_super_blocks * sizeof(sd_my_block_q8_0);
+    if (row_size != expected_row_size) {
+        if (sd_convert_htp_permute_log_enabled()) {
+            LOG_WARN("hmx repack skip (row-size mismatch): %s type=%s row=%zu expect=%zu",
+                     name.c_str(), ggml_type_name(type), row_size, expected_row_size);
+        }
+        return;
+    }
+    for (int r = 0; r < nrows; ++r) {
+        uint8_t* row = reinterpret_cast<uint8_t*>(data + (size_t)r * row_size);
+        if (is_q4_like) {
+            sd_hmx_repack_row_q4_like_inplace(row, n_super_blocks);
+        } else {
+            sd_hmx_repack_row_q8_0_inplace(row, n_super_blocks);
+        }
+    }
+    const int repack_id = sd_convert_htp_repack_count().fetch_add(1) + 1;
+    if (sd_convert_htp_permute_log_enabled() && repack_id <= 128) {
+        LOG_INFO("hmx repack #%d: %s type=%s shape=[%d,%d]", repack_id, name.c_str(), ggml_type_name(type), n_per_row, nrows);
+    }
+}
+
+static void sd_hmx_unrepack_quant_weight_inplace_if_needed(char* data, ggml_type type, int nrows, int n_per_row, const std::string& name) {
+    // Unrepack is only used in GGUF conversion when reading a mixed-layout model exported
+    // with "repack-only-permuted": permuted 2D weights are repacked for HMX fast-path,
+    // while 1D weights remain vanilla ggml layout for CPU correctness.
+    const bool is_q4_like = type == GGML_TYPE_Q4_0 || type == GGML_TYPE_IQ4_NL;
+    const bool is_q8_0    = type == GGML_TYPE_Q8_0;
+    if (!is_q4_like && !is_q8_0) {
+        return;
+    }
+    if (n_per_row <= 0 || (n_per_row % 256) != 0) {
+        return;
+    }
+    const size_t n_super_blocks = (size_t)n_per_row / 256;
+    const size_t row_size       = ggml_row_size(type, n_per_row);
+    const size_t expected_row_size =
+        is_q4_like ? n_super_blocks * sizeof(sd_my_block_q4_0_like) : n_super_blocks * sizeof(sd_my_block_q8_0);
+    if (row_size != expected_row_size) {
+        if (sd_convert_htp_permute_log_enabled()) {
+            LOG_WARN("hmx unrepack skip (row-size mismatch): %s type=%s row=%zu expect=%zu",
+                     name.c_str(), ggml_type_name(type), row_size, expected_row_size);
+        }
+        return;
+    }
+    for (int r = 0; r < nrows; ++r) {
+        uint8_t* row = reinterpret_cast<uint8_t*>(data + (size_t)r * row_size);
+        if (is_q4_like) {
+            sd_hmx_unrepack_row_q4_like_inplace(row, n_super_blocks);
+        } else {
+            sd_hmx_unrepack_row_q8_0_inplace(row, n_super_blocks);
+        }
+    }
+    if (sd_convert_htp_permute_log_enabled()) {
+        LOG_INFO("hmx unrepack: %s type=%s shape=[%d,%d]", name.c_str(), ggml_type_name(type), n_per_row, nrows);
+    }
+}
+
 /*================================================= ModelLoader ==================================================*/
 
 void ModelLoader::add_tensor_storage(const TensorStorage& tensor_storage) {
     tensor_storage_map[tensor_storage.name] = tensor_storage;
+}
+
+void ModelLoader::overlay_tensor_storage(const TensorStorage& tensor_storage, const std::string& file_path) {
+    size_t file_index = 0;
+    auto it = std::find(file_paths_.begin(), file_paths_.end(), file_path);
+    if (it == file_paths_.end()) {
+        file_paths_.push_back(file_path);
+        file_index = file_paths_.size() - 1;
+    } else {
+        file_index = static_cast<size_t>(std::distance(file_paths_.begin(), it));
+    }
+
+    TensorStorage remapped = tensor_storage;
+    remapped.file_index = file_index;
+    add_tensor_storage(remapped);
 }
 
 bool is_zip_file(const std::string& file_path) {
@@ -412,10 +1153,155 @@ bool ModelLoader::init_from_file_and_convert_name(const std::string& file_path, 
 
 /*================================================= GGUFModelLoader ==================================================*/
 
+static bool sd_env_truthy(const char* key, bool default_value = false) {
+    const char* env = std::getenv(key);
+    if (env == nullptr || env[0] == '\0') {
+        return default_value;
+    }
+    return std::strcmp(env, "0") != 0;
+}
+
+static void model_set_env_overwrite(const char* key, const std::string& value) {
+#ifdef _WIN32
+    _putenv_s(key, value.c_str());
+#else
+    setenv(key, value.c_str(), 1);
+#endif
+}
+
+static std::string gguf_scalar_to_string(const gguf_context* ctx, int64_t key_id, gguf_type type) {
+    switch (type) {
+        case GGUF_TYPE_UINT8: return std::to_string(gguf_get_val_u8(ctx, key_id));
+        case GGUF_TYPE_INT8: return std::to_string(gguf_get_val_i8(ctx, key_id));
+        case GGUF_TYPE_UINT16: return std::to_string(gguf_get_val_u16(ctx, key_id));
+        case GGUF_TYPE_INT16: return std::to_string(gguf_get_val_i16(ctx, key_id));
+        case GGUF_TYPE_UINT32: return std::to_string(gguf_get_val_u32(ctx, key_id));
+        case GGUF_TYPE_INT32: return std::to_string(gguf_get_val_i32(ctx, key_id));
+        case GGUF_TYPE_FLOAT32: return std::to_string(gguf_get_val_f32(ctx, key_id));
+        case GGUF_TYPE_UINT64: return std::to_string(gguf_get_val_u64(ctx, key_id));
+        case GGUF_TYPE_INT64: return std::to_string(gguf_get_val_i64(ctx, key_id));
+        case GGUF_TYPE_FLOAT64: return std::to_string(gguf_get_val_f64(ctx, key_id));
+        case GGUF_TYPE_BOOL: return gguf_get_val_bool(ctx, key_id) ? "true" : "false";
+        case GGUF_TYPE_STRING: {
+            const char* s = gguf_get_val_str(ctx, key_id);
+            return s ? std::string(s) : std::string();
+        }
+        default:
+            return std::string("<unsupported>");
+    }
+}
+
+static void model_loader_read_gguf_metadata(const gguf_context* ctx, std::map<std::string, std::string>& out) {
+    out.clear();
+    if (ctx == nullptr) {
+        return;
+    }
+    const int64_t n_kv = gguf_get_n_kv(ctx);
+    for (int64_t i = 0; i < n_kv; ++i) {
+        const char* key = gguf_get_key(ctx, i);
+        if (key == nullptr || key[0] == '\0') {
+            continue;
+        }
+        const gguf_type type = gguf_get_kv_type(ctx, i);
+        if (type == GGUF_TYPE_ARRAY) {
+            continue;
+        }
+        out[std::string(key)] = gguf_scalar_to_string(ctx, i, type);
+    }
+}
+
+static bool model_loader_validate_npu_contract(const std::map<std::string, std::string>& metadata,
+                                               const std::string& file_path) {
+    const char* expected_env = std::getenv("GGML_HTP_CONTRACT_EXPECT");
+    if (expected_env == nullptr || expected_env[0] == '\0') {
+        return true;
+    }
+
+    const bool strict = sd_env_truthy("GGML_HTP_CONTRACT_STRICT", false);
+    auto it = metadata.find("sd.npu.contract.id");
+    if (it == metadata.end()) {
+        model_set_env_overwrite("GGML_HTP_CONTRACT_ACTIVE", "<missing>");
+        if (strict) {
+            LOG_ERROR("GGUF '%s' missing required key sd.npu.contract.id (expected '%s')", file_path.c_str(), expected_env);
+            return false;
+        }
+        LOG_WARN("GGUF '%s' has no sd.npu.contract.id; expected '%s'", file_path.c_str(), expected_env);
+        return true;
+    }
+
+    if (it->second != expected_env) {
+        model_set_env_overwrite("GGML_HTP_CONTRACT_ACTIVE", it->second);
+        if (strict) {
+            LOG_ERROR("GGUF '%s' contract mismatch: got '%s', expected '%s'", file_path.c_str(), it->second.c_str(),
+                      expected_env);
+            return false;
+        }
+        LOG_WARN("GGUF '%s' contract mismatch: got '%s', expected '%s'", file_path.c_str(), it->second.c_str(),
+                 expected_env);
+        return true;
+    }
+
+    model_set_env_overwrite("GGML_HTP_CONTRACT_ACTIVE", it->second);
+    LOG_INFO("GGUF '%s' contract id = %s", file_path.c_str(), it->second.c_str());
+    return true;
+}
+
+static void model_loader_write_npu_contract_metadata(gguf_context* gguf_ctx) {
+    if (gguf_ctx == nullptr) {
+        return;
+    }
+
+    const char* contract_id = std::getenv("SD_NPU_CONTRACT_ID");
+    if (contract_id == nullptr || contract_id[0] == '\0') {
+        contract_id = "sdcpp.hmx.v1";
+    }
+
+    gguf_set_val_str(gguf_ctx, "sd.npu.contract.id", contract_id);
+    gguf_set_val_str(gguf_ctx, "sd.npu.contract.layout.matmul.f16", "permute_32x32.v1");
+    gguf_set_val_str(gguf_ctx, "sd.npu.contract.layout.matmul.wf8_hmx", "compact_f8.v1");
+    gguf_set_val_str(gguf_ctx, "sd.npu.contract.layout.matmul.q4_0", "common_deq.v1");
+    gguf_set_val_str(gguf_ctx, "sd.npu.contract.layout.matmul.q8_0", "common_deq.v1");
+    gguf_set_val_str(gguf_ctx, "sd.npu.contract.layout.matmul.iq4_nl", "common_deq.v1");
+    gguf_set_val_str(gguf_ctx, "sd.npu.contract.layout.flash_attn_ext", "f32_q_f16_kv.v1");
+    gguf_set_val_bool(gguf_ctx, "sd.npu.contract.export.permute", sd_convert_htp_permute_enabled());
+    gguf_set_val_bool(gguf_ctx, "sd.npu.contract.export.repack", sd_convert_htp_repack_metadata_enabled());
+}
+
+static void model_loader_write_existing_npu_contract_metadata(gguf_context* gguf_ctx,
+                                                              const std::map<std::string, std::string>& metadata) {
+    if (gguf_ctx == nullptr) {
+        return;
+    }
+
+    auto write_str = [&](const char* key) {
+        auto it = metadata.find(key);
+        if (it != metadata.end()) {
+            gguf_set_val_str(gguf_ctx, key, it->second.c_str());
+        }
+    };
+    auto write_bool = [&](const char* key) {
+        auto it = metadata.find(key);
+        if (it != metadata.end()) {
+            gguf_set_val_bool(gguf_ctx, key, it->second == "true");
+        }
+    };
+
+    write_str("sd.npu.contract.id");
+    write_str("sd.npu.contract.layout.matmul.f16");
+    write_str("sd.npu.contract.layout.matmul.wf8_hmx");
+    write_str("sd.npu.contract.layout.matmul.q4_0");
+    write_str("sd.npu.contract.layout.matmul.q8_0");
+    write_str("sd.npu.contract.layout.matmul.iq4_nl");
+    write_str("sd.npu.contract.layout.flash_attn_ext");
+    write_bool("sd.npu.contract.export.permute");
+    write_bool("sd.npu.contract.export.repack");
+}
+
 bool ModelLoader::init_from_gguf_file(const std::string& file_path, const std::string& prefix) {
     LOG_DEBUG("init from '%s'", file_path.c_str());
     file_paths_.push_back(file_path);
     size_t file_index = file_paths_.size() - 1;
+    gguf_metadata_.clear();
 
     gguf_context* ctx_gguf_ = nullptr;
     ggml_context* ctx_meta_ = nullptr;
@@ -449,7 +1335,35 @@ bool ModelLoader::init_from_gguf_file(const std::string& file_path, const std::s
             add_tensor_storage(tensor_storage);
         }
 
+        LOG_WARN("loaded GGUF tensors via fallback reader; GGUF metadata is not available for contract validation");
+
         return true;
+    }
+
+    model_loader_read_gguf_metadata(ctx_gguf_, gguf_metadata_);
+    auto cid_it = gguf_metadata_.find("sd.npu.contract.id");
+    if (cid_it != gguf_metadata_.end()) {
+        model_set_env_overwrite("GGML_HTP_CONTRACT_ACTIVE", cid_it->second);
+    } else {
+        model_set_env_overwrite("GGML_HTP_CONTRACT_ACTIVE", "<missing>");
+    }
+
+    // Export contract booleans are needed for CPU fallback to interpret prepacked
+    // qweights correctly (e.g. hmx repack layout).
+    //
+    // NOTE: model_loader_read_gguf_metadata() stores bools as "true"/"false".
+    const auto perm_it = gguf_metadata_.find("sd.npu.contract.export.permute");
+    if (perm_it != gguf_metadata_.end()) {
+        model_set_env_overwrite("GGML_HTP_CONTRACT_EXPORT_PERMUTE", perm_it->second == "true" ? "1" : "0");
+    }
+    const auto repack_it = gguf_metadata_.find("sd.npu.contract.export.repack");
+    if (repack_it != gguf_metadata_.end()) {
+        model_set_env_overwrite("GGML_HTP_CONTRACT_EXPORT_REPACK", repack_it->second == "true" ? "1" : "0");
+    }
+    if (!model_loader_validate_npu_contract(gguf_metadata_, file_path)) {
+        gguf_free(ctx_gguf_);
+        ggml_free(ctx_meta_);
+        return false;
     }
 
     int n_tensors = static_cast<int>(gguf_get_n_tensors(ctx_gguf_));
@@ -1304,7 +2218,7 @@ static std::vector<std::pair<std::string, ggml_type>> parse_tensor_type_rules(co
         } else {
             for (size_t i = 0; i < GGML_TYPE_COUNT; i++) {
                 auto trait = ggml_get_type_traits((ggml_type)i);
-                if (trait->to_float && trait->type_size && type_name == trait->type_name) {
+                if (trait->type_size && type_name == trait->type_name) {
                     tensor_type = (ggml_type)i;
                 }
             }
@@ -1381,6 +2295,9 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
     LOG_DEBUG("using %d threads for model loading", num_threads_to_use);
 
     int64_t start_time = ggml_time_ms();
+    if (sd_convert_htp_permute_log_enabled()) {
+        sd_convert_htp_permute_count().store(0);
+    }
 
     std::vector<TensorStorage> processed_tensor_storages;
     for (const auto& [name, tensor_storage] : tensor_storage_map) {
@@ -1563,7 +2480,104 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                     } else if (tensor_storage.is_i64) {
                         i64_to_i32_vec((int64_t*)read_buf, (int32_t*)target_buf, tensor_storage.nelements());
                     }
-                    if (tensor_storage.type != dst_tensor->type) {
+                    const int nrows     = (int)tensor_storage.nelements() / (int)tensor_storage.ne[0];
+                    const int n_per_row = (int)tensor_storage.ne[0];
+                    bool did_hmx_permute = false;
+                    if (sd_convert_should_hmx_permute(tensor_storage, dst_tensor)) {
+                        did_hmx_permute = true;
+                        if (convert_buf == nullptr) {
+                            // Type may be unchanged (e.g. q4_0 -> q4_0): permute still needs a temp output slot.
+                            convert_buffer.resize(ggml_nbytes(dst_tensor));
+                            convert_buf = (char*)convert_buffer.data();
+                        }
+                        const int permute_id = sd_convert_htp_permute_count().fetch_add(1) + 1;
+                        if (sd_convert_htp_permute_log_enabled() && permute_id <= 128) {
+                            LOG_INFO("hmx permute #%d: %s shape=[%lld,%lld] src=%s dst=%s",
+                                     permute_id,
+                                     tensor_storage.name.c_str(),
+                                     (long long)tensor_storage.ne[0],
+                                     (long long)tensor_storage.ne[1],
+                                     ggml_type_name(tensor_storage.type),
+                                     ggml_type_name(dst_tensor->type));
+                        }
+                        if (sd_convert_htp_invpermute_enabled()) {
+                            // Build a vanilla-basis tensor from a permuted one (input is assumed to already be in
+                            // HMX permuted basis). NOTE: some exported GGUFs are mixed-layout (repack-only-permuted):
+                            // permuted 2D weights are repacked for HMX, while 1D weights remain vanilla ggml blocks.
+                            // For INVPERMUTE we unrepack the permuted weights into vanilla blocks, then dequantize.
+                            std::vector<float> src_f32((size_t)nrows * n_per_row);
+                            std::vector<float> inv_f32((size_t)nrows * n_per_row);
+                            if (ggml_is_quantized(tensor_storage.type)) {
+                                // If export.repack is enabled, ggml dequant handles repacked rows directly.
+                                // If it's disabled (mixed-layout export), unrepack permuted weights to vanilla blocks first.
+                                const char* env_repack = std::getenv("GGML_HTP_CONTRACT_EXPORT_REPACK");
+                                const bool export_repack =
+                                    (env_repack != nullptr && env_repack[0] != '\0' && std::strcmp(env_repack, "0") != 0 && std::strcmp(env_repack, "false") != 0);
+                                if (!export_repack) {
+                                    sd_hmx_unrepack_quant_weight_inplace_if_needed(target_buf, tensor_storage.type, nrows, n_per_row, tensor_storage.name);
+                                }
+                            }
+                            convert_tensor((void*)target_buf,
+                                           tensor_storage.type,
+                                           (void*)src_f32.data(),
+                                           GGML_TYPE_F32,
+                                           nrows,
+                                           n_per_row);
+                            sd_hmx_invpermute_linear_weight_f32(src_f32.data(), inv_f32.data(), nrows, n_per_row);
+                            convert_tensor((void*)inv_f32.data(),
+                                           GGML_TYPE_F32,
+                                           convert_buf,
+                                           dst_tensor->type,
+                                           nrows,
+                                           n_per_row);
+                        } else {
+                            // IMPORTANT: for quant weights, match runtime prepack semantics:
+                            //   (1) quantize (vanilla) -> (2) dequant -> (3) permute -> (4) requant -> (5) repack.
+                            // Direct "permute then quantize from bf16/f16" produces different qblocks and can
+                            // break HMX matmul correctness for diffusion.
+                            if (ggml_is_quantized(dst_tensor->type)) {
+                                std::vector<char> q0;
+                                q0.resize(ggml_nbytes(dst_tensor));
+                                convert_tensor((void*)target_buf,
+                                               tensor_storage.type,
+                                               (void*)q0.data(),
+                                               dst_tensor->type,
+                                               nrows,
+                                               n_per_row);
+
+                                auto qtype = ggml_get_type_traits(dst_tensor->type);
+                                GGML_ASSERT(qtype != nullptr && qtype->to_float != nullptr);
+
+                                std::vector<float> q0_f32((size_t)nrows * n_per_row);
+                                std::vector<float> permuted_f32((size_t)nrows * n_per_row);
+                                qtype->to_float((const void*)q0.data(), q0_f32.data(), (int64_t)nrows * n_per_row);
+                                sd_hmx_permute_linear_weight_f32(q0_f32.data(), permuted_f32.data(), nrows, n_per_row);
+                                convert_tensor((void*)permuted_f32.data(),
+                                               GGML_TYPE_F32,
+                                               convert_buf,
+                                               dst_tensor->type,
+                                               nrows,
+                                               n_per_row);
+                            } else {
+                                std::vector<float> src_f32((size_t)nrows * n_per_row);
+                                std::vector<float> permuted_f32((size_t)nrows * n_per_row);
+                                convert_tensor((void*)target_buf,
+                                               tensor_storage.type,
+                                               (void*)src_f32.data(),
+                                               GGML_TYPE_F32,
+                                               nrows,
+                                               n_per_row);
+                                sd_hmx_permute_linear_weight_f32(src_f32.data(), permuted_f32.data(), nrows, n_per_row);
+                                convert_tensor((void*)permuted_f32.data(),
+                                               GGML_TYPE_F32,
+                                               convert_buf,
+                                               dst_tensor->type,
+                                               nrows,
+                                               n_per_row);
+                            }
+                            sd_hmx_repack_quant_weight_inplace_if_needed(convert_buf, dst_tensor->type, nrows, n_per_row, tensor_storage.name);
+                        }
+                    } else if (tensor_storage.type != dst_tensor->type) {
                         if (convert_buf == nullptr) {
                             LOG_ERROR("read tensor data failed: too less memory for conversion");
                             failed = true;
@@ -1573,10 +2587,19 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                                        tensor_storage.type,
                                        convert_buf,
                                        dst_tensor->type,
-                                       (int)tensor_storage.nelements() / (int)tensor_storage.ne[0],
-                                       (int)tensor_storage.ne[0]);
+                                       nrows,
+                                       n_per_row);
                     } else {
                         convert_buf = read_buf;
+                    }
+
+                    // Optional HMX repack without permute (repack-only) for CPU fallback correctness.
+                    // This is required when exporting a mixed offload model: some qweights stay in
+                    // vanilla basis (no permute), but we still want a single on-disk repack contract.
+                    if (!did_hmx_permute) {
+                        if (!sd_convert_htp_repack_only_permuted()) {
+                            sd_hmx_repack_quant_weight_inplace_if_needed(convert_buf, dst_tensor->type, nrows, n_per_row, tensor_storage.name);
+                        }
                     }
                     t1 = ggml_time_ms();
                     convert_time_ms.fetch_add(t1 - t0);
@@ -1586,6 +2609,13 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                         ggml_backend_tensor_set(dst_tensor, convert_buf, 0, ggml_nbytes(dst_tensor));
                         t1 = ggml_time_ms();
                         copy_to_backend_time_ms.fetch_add(t1 - t0);
+                    } else if (convert_buf != (char*)dst_tensor->data) {
+                        // Same-type convert path (e.g. q4_0->q4_0 with HMX pre-permute) uses a temp buffer.
+                        // Copy back so converted bytes are persisted before GGUF save.
+                        t0 = ggml_time_ms();
+                        memcpy(dst_tensor->data, convert_buf, ggml_nbytes(dst_tensor));
+                        t1 = ggml_time_ms();
+                        memcpy_time_ms.fetch_add(t1 - t0);
                     }
                 }
                 if (zip != nullptr) {
@@ -1627,6 +2657,10 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
              (memcpy_time_ms.load() / (float)last_n_threads) / 1000.f,
              (convert_time_ms.load() / (float)last_n_threads) / 1000.f,
              (copy_to_backend_time_ms.load() / (float)last_n_threads) / 1000.f);
+    if (sd_convert_htp_permute_log_enabled()) {
+        LOG_INFO("hmx permute total tensors: %d", sd_convert_htp_permute_count().load());
+        LOG_INFO("hmx repack total tensors: %d", sd_convert_htp_repack_count().load());
+    }
     return success;
 }
 
@@ -1708,6 +2742,14 @@ bool ModelLoader::load_tensors(std::map<std::string, struct ggml_tensor*>& tenso
 bool ModelLoader::tensor_should_be_converted(const TensorStorage& tensor_storage, ggml_type type) {
     const std::string& name = tensor_storage.name;
     if (type != GGML_TYPE_COUNT) {
+        if (name == "x_embedder.weight" ||
+            name == "final_layer.adaLN_modulation.1.weight") {
+            return true;
+        }
+        if (type == GGML_TYPE_WF8_HMX_PREPACK &&
+            (tensor_storage.n_dims != 2 || (tensor_storage.ne[0] % 32) != 0 || (tensor_storage.ne[1] % 32) != 0)) {
+            // Pass, do not convert incompatible shapes to WF8 HMX prepack
+        } else
         if (ggml_is_quantized(type) && tensor_storage.ne[0] % ggml_blck_size(type) != 0) {
             // Pass, do not convert
         } else if (ends_with(name, ".bias")) {
@@ -1739,16 +2781,22 @@ bool ModelLoader::tensor_should_be_converted(const TensorStorage& tensor_storage
 }
 
 bool ModelLoader::save_to_gguf_file(const std::string& file_path, ggml_type type, const std::string& tensor_type_rules_str) {
+    auto tensor_type_rules = parse_tensor_type_rules(tensor_type_rules_str);
+
     auto backend    = ggml_backend_cpu_init();
     size_t mem_size = 1 * 1024 * 1024;  // for padding
     mem_size += tensor_storage_map.size() * ggml_tensor_overhead();
-    mem_size += get_params_mem_size(backend, type);
+    mem_size += get_params_mem_size(backend, type, tensor_type_rules);
     LOG_INFO("model tensors mem size: %.2fMB", mem_size / 1024.f / 1024.f);
     ggml_context* ggml_ctx = ggml_init({mem_size, nullptr, false});
 
     gguf_context* gguf_ctx = gguf_init_empty();
-
-    auto tensor_type_rules = parse_tensor_type_rules(tensor_type_rules_str);
+    const char* overlay_path = std::getenv("SD_DIFFUSION_MODEL_OVERLAY");
+    if (overlay_path != nullptr && overlay_path[0] != '\0') {
+        model_loader_write_existing_npu_contract_metadata(gguf_ctx, gguf_metadata_);
+    } else {
+        model_loader_write_npu_contract_metadata(gguf_ctx);
+    }
 
     std::mutex tensor_mutex;
     auto on_new_tensor_cb = [&](const TensorStorage& tensor_storage, ggml_tensor** dst_tensor) -> bool {
@@ -1764,6 +2812,14 @@ bool ModelLoader::save_to_gguf_file(const std::string& file_path, ggml_type type
             }
         }
 
+        // Keep the known BF16-only outliers off BF16 in exported GGUFs.
+        // These tensors are skipped by the generic MMDiT/FLUX conversion filters,
+        // but runtime on current CPU/HTP paths does not tolerate BF16 here.
+        if (name == "x_embedder.weight" ||
+            name == "final_layer.adaLN_modulation.1.weight") {
+            dst_type = GGML_TYPE_F16;
+        }
+
         const bool should_convert = tensor_should_be_converted(tensor_storage, dst_type);
         if (should_convert) {
             tensor_type = dst_type;
@@ -1773,7 +2829,7 @@ bool ModelLoader::save_to_gguf_file(const std::string& file_path, ggml_type type
         // are still cast to F16 to avoid BF16-only runtime gaps on some backends.
         if (!should_convert &&
             tensor_type == GGML_TYPE_BF16 &&
-            (dst_type == GGML_TYPE_F16 || ggml_is_quantized(dst_type))) {
+            (dst_type == GGML_TYPE_F16 || ggml_is_quantized(dst_type) || dst_type == GGML_TYPE_WF8_HMX_PREPACK)) {
             tensor_type = GGML_TYPE_F16;
         }
 
@@ -1805,7 +2861,12 @@ bool ModelLoader::save_to_gguf_file(const std::string& file_path, ggml_type type
         return true;
     };
 
-    bool success = load_tensors(on_new_tensor_cb);
+    // Export correctness matters more than host-side conversion throughput.
+    // The convert path mutates tensor bytes in-place (cast / quantize / permute / repack)
+    // before handing them to the GGUF writer, and we have observed nondeterministic full-model
+    // corruption when many tensors are processed concurrently. Keep GGUF export single-threaded
+    // so repeated source->GGUF conversions are byte-stable.
+    bool success = load_tensors(on_new_tensor_cb, 1, false);
     ggml_backend_free(backend);
     LOG_INFO("load tensors done");
     LOG_INFO("trying to save tensors to %s", file_path.c_str());
@@ -1817,19 +2878,42 @@ bool ModelLoader::save_to_gguf_file(const std::string& file_path, ggml_type type
     return success;
 }
 
-int64_t ModelLoader::get_params_mem_size(ggml_backend_t backend, ggml_type type) {
+int64_t ModelLoader::get_params_mem_size(ggml_backend_t backend,
+                                         ggml_type type,
+                                         const std::vector<std::pair<std::string, ggml_type>>& tensor_type_rules) {
     size_t alignment = 128;
     if (backend != nullptr) {
         alignment = ggml_backend_get_alignment(backend);
     }
     int64_t mem_size = 0;
-    std::vector<TensorStorage> processed_tensor_storages;
+
     for (auto [name, tensor_storage] : tensor_storage_map) {
         if (is_unused_tensor(tensor_storage.name)) {
             continue;
         }
-        if (tensor_should_be_converted(tensor_storage, type)) {
-            tensor_storage.type = type;
+
+        ggml_type dst_type = type;
+        for (const auto& tensor_type_rule : tensor_type_rules) {
+            std::regex pattern(tensor_type_rule.first);
+            if (std::regex_search(name, pattern)) {
+                dst_type = tensor_type_rule.second;
+                break;
+            }
+        }
+
+        if (name == "x_embedder.weight" ||
+            name == "final_layer.adaLN_modulation.1.weight") {
+            dst_type = GGML_TYPE_F16;
+        }
+
+        const bool should_convert = tensor_should_be_converted(tensor_storage, dst_type);
+        if (should_convert) {
+            tensor_storage.type = dst_type;
+        } else if (tensor_storage.type == GGML_TYPE_BF16 &&
+                   (dst_type == GGML_TYPE_F16 || ggml_is_quantized(dst_type) || dst_type == GGML_TYPE_WF8_HMX_PREPACK)) {
+            // Keep quantized exports BF16-free: tensors skipped from quantization
+            // are still cast to F16 to avoid BF16-only runtime gaps on some backends.
+            tensor_storage.type = GGML_TYPE_F16;
         }
         mem_size += tensor_storage.nbytes() + alignment;
     }
@@ -1848,6 +2932,78 @@ bool convert(const char* input_path,
     if (!model_loader.init_from_file(input_path)) {
         LOG_ERROR("init model loader from file failed: '%s'", input_path);
         return false;
+    }
+
+    if (const char* overlay_path = std::getenv("SD_DIFFUSION_MODEL_OVERLAY");
+        overlay_path != nullptr && overlay_path[0] != '\0') {
+        struct SavedEnv {
+            bool had = false;
+            std::string value;
+        };
+        std::map<std::string, SavedEnv> saved_env;
+        for (const char* key : {
+                 "GGML_HTP_CONTRACT_ACTIVE",
+                 "GGML_HTP_CONTRACT_EXPORT_PERMUTE",
+                 "GGML_HTP_CONTRACT_EXPORT_REPACK",
+             }) {
+            const char* cur = std::getenv(key);
+            SavedEnv s;
+            s.had = (cur != nullptr);
+            if (cur != nullptr) {
+                s.value = cur;
+            }
+            saved_env.emplace(key, std::move(s));
+        }
+
+        LOG_INFO("loading diffusion model overlay for convert from '%s'", overlay_path);
+        ModelLoader overlay_loader;
+        if (!overlay_loader.init_from_file(overlay_path)) {
+            LOG_ERROR("init overlay model loader from file failed: '%s'", overlay_path);
+            return false;
+        }
+
+        const auto include = sd_parse_csv_env("SD_DIFFUSION_MODEL_OVERLAY_INCLUDE");
+        size_t overlay_count = 0;
+        for (const auto& kv : overlay_loader.get_tensor_storage_map()) {
+            TensorStorage ts = kv.second;
+            // The source overlay may come either from raw safetensors names
+            // ("layers.0....") or from a prefixed GGUF view
+            // ("model.diffusion_model.layers.0...."). Match whichever naming
+            // convention the current baseline loader uses so we replace tensors
+            // instead of appending duplicate ones.
+            const std::string raw_name = ts.name;
+            const std::string prefixed_name =
+                (raw_name.rfind("model.diffusion_model.", 0) == 0) ? raw_name : "model.diffusion_model." + raw_name;
+            const auto& base_map = model_loader.get_tensor_storage_map();
+            if (base_map.find(raw_name) != base_map.end()) {
+                ts.name = raw_name;
+            } else if (base_map.find(prefixed_name) != base_map.end()) {
+                ts.name = prefixed_name;
+            } else {
+                ts.name = raw_name;
+            }
+            if (ts.name.find(".feed_forward.w2.weight") == std::string::npos) {
+                continue;
+            }
+            if (!include.empty() && !sd_name_match_any(ts.name, include)) {
+                continue;
+            }
+            model_loader.overlay_tensor_storage(ts, overlay_path);
+            overlay_count++;
+        }
+        LOG_INFO("applied convert overlay tensors: %zu", overlay_count);
+
+        for (const auto& kv : saved_env) {
+            if (kv.second.had) {
+                model_set_env_overwrite(kv.first.c_str(), kv.second.value);
+            } else {
+#ifdef _WIN32
+                _putenv_s(kv.first.c_str(), "");
+#else
+                unsetenv(kv.first.c_str());
+#endif
+            }
+        }
     }
 
     if (vae_path != nullptr && strlen(vae_path) > 0) {

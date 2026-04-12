@@ -285,6 +285,7 @@ protected:
     SDVersion version_ = VERSION_COUNT;
     std::vector<std::string> file_paths_;
     String2TensorStorage tensor_storage_map;
+    std::map<std::string, std::string> gguf_metadata_;
 
     void add_tensor_storage(const TensorStorage& tensor_storage);
 
@@ -306,6 +307,7 @@ public:
     bool init_from_file_and_convert_name(const std::string& file_path,
                                          const std::string& prefix = "",
                                          SDVersion version         = VERSION_COUNT);
+    void overlay_tensor_storage(const TensorStorage& tensor_storage, const std::string& file_path);
     SDVersion get_sd_version();
     std::map<ggml_type, uint32_t> get_wtype_stat();
     std::map<ggml_type, uint32_t> get_conditioner_wtype_stat();
@@ -327,9 +329,13 @@ public:
         return names;
     }
 
+    const std::map<std::string, std::string>& get_gguf_metadata() const { return gguf_metadata_; }
+
     bool save_to_gguf_file(const std::string& file_path, ggml_type type, const std::string& tensor_type_rules);
     bool tensor_should_be_converted(const TensorStorage& tensor_storage, ggml_type type);
-    int64_t get_params_mem_size(ggml_backend_t backend, ggml_type type = GGML_TYPE_COUNT);
+    int64_t get_params_mem_size(ggml_backend_t backend,
+                                ggml_type type = GGML_TYPE_COUNT,
+                                const std::vector<std::pair<std::string, ggml_type>>& tensor_type_rules = {});
     ~ModelLoader() = default;
 
     static std::string load_merges();

@@ -26,6 +26,7 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
+#include "ggml-htp.h"
 
 #include "model.h"
 
@@ -1271,6 +1272,23 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_attention_ext(struct ggml_context
     int64_t N;
     int64_t d_head;
     int64_t n_kv_head;
+    const bool is_htp_backend = backend != nullptr && std::strcmp(ggml_backend_name(backend), "MyHTP") == 0;
+
+    // HTP flash-attn kernel assumes token-major physical layout but does not receive strides.
+    // Keep the permuted (non-contiguous) Q/K/V views so the physical layout matches what DSP expects.
+    const bool htp_flash_keep_permuted_io = is_htp_backend && flash_attn;
+    // The active HTP f16 flash core already handles tail columns internally when qk_mask is null.
+    // Keep the host-side no-pad / no-synthetic-mask path behind an env gate and only enable it for
+    // the null-mask diffusion path we are optimizing here.
+    const bool htp_flash_prepare_in_kernel =
+        is_htp_backend &&
+        flash_attn &&
+        mask == nullptr &&
+        std::getenv("GGML_HTP_FLASH_PREP_IN_KERNEL") != nullptr;
+    // Separate Q/K/V views for flash path vs fallback path (fallback prefers contiguous tensors).
+    ggml_tensor * q_flash = q;
+    ggml_tensor * k_flash = k;
+    ggml_tensor * v_flash = v;
     if (!skip_reshape) {
         L_q       = q->ne[1];
         L_k       = k->ne[1];
@@ -1279,15 +1297,24 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_attention_ext(struct ggml_context
         d_head    = C / n_head;
         n_kv_head = k->ne[0] / d_head;
 
-        q = ggml_reshape_4d(ctx, q, d_head, n_head, L_q, N);       // [N, L_q, n_head, d_head]
-        q = ggml_ext_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));  // [N, n_head, L_q, d_head]
-        q = ggml_reshape_3d(ctx, q, d_head, L_q, n_head * N);      // [N * n_head, L_q, d_head]
+        // Base token-major layout: [d_head, n_head, L, N]
+        ggml_tensor * q_base = ggml_reshape_4d(ctx, q, d_head, n_head, L_q, N);
+        ggml_tensor * k_base = ggml_reshape_4d(ctx, k, d_head, n_kv_head, L_k, N);
+        ggml_tensor * v_base = ggml_reshape_4d(ctx, v, d_head, n_kv_head, L_k, N);
 
-        k = ggml_reshape_4d(ctx, k, d_head, n_kv_head, L_k, N);    // [N, L_k, n_kv_head, d_head]
-        k = ggml_ext_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));  // [N, n_kv_head, L_k, d_head]
-        k = ggml_reshape_3d(ctx, k, d_head, L_k, n_kv_head * N);   // [N * n_kv_head, L_k, d_head]
+        // Flash path uses permuted views (no cont) to preserve token-major physical layout.
+        q_flash = ggml_permute(ctx, q_base, 0, 2, 1, 3); // [d_head, L_q, n_head, N] (view)
+        k_flash = ggml_permute(ctx, k_base, 0, 2, 1, 3); // [d_head, L_k, n_kv_head, N] (view)
+        v_flash = v_base;                                // [d_head, n_kv_head, L_k, N]
 
-        v = ggml_reshape_4d(ctx, v, d_head, n_kv_head, L_k, N);  // [N, L_k, n_kv_head, d_head]
+        // Fallback path keeps the legacy contiguous layout (used by non-flash attention).
+        q = ggml_ext_cont(ctx, q_flash);               // materialize [d_head, L_q, n_head, N]
+        q = ggml_reshape_3d(ctx, q, d_head, L_q, n_head * N);
+
+        k = ggml_ext_cont(ctx, k_flash);               // materialize [d_head, L_k, n_kv_head, N]
+        k = ggml_reshape_3d(ctx, k, d_head, L_k, n_kv_head * N);
+
+        v = v_base;
     } else {
         L_q       = q->ne[1];
         L_k       = k->ne[1];
@@ -1336,27 +1363,103 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_attention_ext(struct ggml_context
     const bool flash_kv_f32 = std::getenv("GGML_OPENCL_FLASH_FORCE_F32") != nullptr ||
                               std::getenv("SD_FLASH_KV_F32") != nullptr;
 
-    auto build_kqv = [&](ggml_tensor* q_in, ggml_tensor* k_in, ggml_tensor* v_in, ggml_tensor* mask_in) -> ggml_tensor* {
-        if (kv_pad != 0) {
-            k_in = ggml_pad(ctx, k_in, 0, kv_pad, 0, 0);
-        }
-        if (kv_scale != 1.0f) {
-            k_in = ggml_ext_scale(ctx, k_in, kv_scale);
-        }
-        if (!flash_kv_f32) {
-            k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
-        }
+    // HTP flash currently shows strong sensitivity to the diffusion kv pre-scale path.
+    // Keep legacy behavior by default; allow explicit override for strict A/B diagnostics.
+    const bool htp_flash_disable_kv_scale =
+        is_htp_backend && std::getenv("GGML_HTP_FLASH_DISABLE_KV_SCALE") != nullptr;
+    const float flash_kv_scale = htp_flash_disable_kv_scale ? 1.0f : kv_scale;
+    // Keep kv_scale on the host path for now. The active no-pad/null-mask route is already enough
+    // to remove the expensive PAD/CONCAT chain, while the current HVX-side kv_scale path is not
+    // numerically aligned yet under the no-pad flash path.
+    const float host_flash_kv_scale = flash_kv_scale;
+    const float kernel_flash_kv_scale = 1.0f;
 
-        v_in = ggml_ext_cont(ctx, ggml_permute(ctx, v_in, 0, 2, 1, 3));
-        v_in = ggml_reshape_3d(ctx, v_in, d_head, L_k, n_kv_head * N);
-        if (kv_pad != 0) {
-            v_in = ggml_pad(ctx, v_in, 0, kv_pad, 0, 0);
-        }
-        if (kv_scale != 1.0f) {
-            v_in = ggml_ext_scale(ctx, v_in, kv_scale);
-        }
-        if (!flash_kv_f32) {
-            v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
+    auto build_kqv = [&](ggml_tensor* q_in, ggml_tensor* k_in, ggml_tensor* v_in, ggml_tensor* mask_in) -> ggml_tensor* {
+        uint32_t flash_flags = 0;
+        if (htp_flash_keep_permuted_io) {
+            // HTP expects token-major physical layout. Apply pad/scale/cast on base tensors
+            // (token-major contiguous), then permute to [d_head, L, n_head, N] views.
+            // NOTE: for skip_reshape=true (e.g. Rope::attention), q/k arrive as contiguous [d_head, L, n_head*N]
+            // which is *not* token-major. Materialize a base [d_head, n_head, L, N] tensor so the permuted
+            // view matches the HTP flash-attn contract (ggml-htp checks ne/nb, and DSP doesn't receive strides).
+            ggml_tensor * q_view = q_in; // expected: permuted view [d_head, L_q, n_head, N]
+            ggml_tensor * k_in_local = k_in;
+            if (skip_reshape) {
+                // Reshape heads back out of the fused (n_head*N) dim: [d_head, L, n_head, N].
+                ggml_tensor * q4 = ggml_reshape_4d(ctx, q_in, d_head, L_q, n_head, N);
+                ggml_tensor * k4 = ggml_reshape_4d(ctx, k_in, d_head, L_k, n_kv_head, N);
+                // Make base contiguous in [d_head, n_head, L, N], then take the token-major permuted view.
+                ggml_tensor * q_base_local = ggml_cont(ctx, ggml_permute(ctx, q4, 0, 2, 1, 3));
+                ggml_tensor * k_base_local = ggml_cont(ctx, ggml_permute(ctx, k4, 0, 2, 1, 3));
+                q_view    = ggml_permute(ctx, q_base_local, 0, 2, 1, 3); // [d_head, L_q, n_head, N] (view)
+                k_in_local = ggml_permute(ctx, k_base_local, 0, 2, 1, 3); // [d_head, L_k, n_kv_head, N] (view)
+            }
+
+            ggml_tensor * k_base_local =
+                (flash_flags & GGML_HTP_FLASH_ATTN_FLAG_K_ROW_MAJOR) != 0 ?
+                    k_in_local :
+                    ggml_permute(ctx, k_in_local, 0, 2, 1, 3); // back to [d_head, n_kv_head, L_k, N]
+            if (htp_flash_prepare_in_kernel && kv_pad == 0 && host_flash_kv_scale == 1.0f && flash_kv_f32) {
+                // In the no-pad path, scale/cast usually materialize a dense base tensor already.
+                // Only force contiguity when there is no later op that would do so for us.
+                k_base_local = ggml_cont(ctx, k_base_local);
+            }
+            if (kv_pad != 0) {
+                k_base_local = ggml_pad(ctx, k_base_local, 0, 0, kv_pad, 0);
+            }
+            if (host_flash_kv_scale != 1.0f) {
+                k_base_local = ggml_ext_scale(ctx, k_base_local, host_flash_kv_scale);
+            }
+            if (!flash_kv_f32) {
+                k_base_local = ggml_cast(ctx, k_base_local, GGML_TYPE_F16);
+            }
+            ggml_tensor * k_view =
+                (flash_flags & GGML_HTP_FLASH_ATTN_FLAG_K_ROW_MAJOR) != 0 ?
+                    ggml_reshape_4d(ctx, k_base_local, d_head, L_k, n_kv_head, N) :
+                    ggml_permute(ctx, k_base_local, 0, 2, 1, 3); // [d_head, L_k, n_kv_head, N]
+
+            ggml_tensor * v_base_local = v_in; // [d_head, n_kv_head, L_k, N]
+            if (htp_flash_prepare_in_kernel && kv_pad == 0 && host_flash_kv_scale == 1.0f && flash_kv_f32 &&
+                !ggml_is_contiguous(v_base_local)) {
+                v_base_local = ggml_cont(ctx, v_base_local);
+            }
+            if (kv_pad != 0) {
+                v_base_local = ggml_pad(ctx, v_base_local, 0, 0, kv_pad, 0);
+            }
+            if (host_flash_kv_scale != 1.0f) {
+                v_base_local = ggml_ext_scale(ctx, v_base_local, host_flash_kv_scale);
+            }
+            if (!flash_kv_f32) {
+                v_base_local = ggml_cast(ctx, v_base_local, GGML_TYPE_F16);
+            }
+            ggml_tensor * v_view = ggml_permute(ctx, v_base_local, 0, 2, 1, 3); // [d_head, L_k, n_kv_head, N]
+
+            // NOTE: q/k/v are non-contiguous views; backend must understand their physical layout contract.
+            q_in = q_view;
+            k_in = k_view;
+            v_in = v_view;
+        } else {
+            if (kv_pad != 0) {
+                k_in = ggml_pad(ctx, k_in, 0, kv_pad, 0, 0);
+            }
+            if (host_flash_kv_scale != 1.0f) {
+                k_in = ggml_ext_scale(ctx, k_in, host_flash_kv_scale);
+            }
+            if (!flash_kv_f32) {
+                k_in = ggml_cast(ctx, k_in, GGML_TYPE_F16);
+            }
+
+            v_in = ggml_ext_cont(ctx, ggml_permute(ctx, v_in, 0, 2, 1, 3));
+            v_in = ggml_reshape_3d(ctx, v_in, d_head, L_k, n_kv_head * N);
+            if (kv_pad != 0) {
+                v_in = ggml_pad(ctx, v_in, 0, kv_pad, 0, 0);
+            }
+            if (host_flash_kv_scale != 1.0f) {
+                v_in = ggml_ext_scale(ctx, v_in, host_flash_kv_scale);
+            }
+            if (!flash_kv_f32) {
+                v_in = ggml_cast(ctx, v_in, GGML_TYPE_F16);
+            }
         }
 
         if (mask_in != nullptr) {
@@ -1384,10 +1487,18 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_attention_ext(struct ggml_context
             mask_in = ggml_cast(ctx, mask_in, GGML_TYPE_F16);
         }
 
-        auto out = ggml_flash_attn_ext(ctx, q_in, k_in, v_in, mask_in, scale / kv_scale, 0, 0);
+        auto out = ggml_flash_attn_ext(ctx, q_in, k_in, v_in, mask_in, scale / flash_kv_scale, 0, 0);
         ggml_flash_attn_ext_set_prec(out, GGML_PREC_F32);
-        if (kv_scale != 1.0f) {
-            out = ggml_ext_scale(ctx, out, 1.0f / kv_scale);
+        if (flash_flags != 0) {
+            memcpy(&out->op_params[4], &flash_flags, sizeof(flash_flags));
+        }
+        if (kernel_flash_kv_scale != 1.0f) {
+            // flash_attn_ext op_params[3] is reserved for precision, and ggml-hexagon uses [4] for
+            // flash flags. Keep this HTP-only kv-scale side channel in a separate slot.
+            memcpy(&out->op_params[5], &kernel_flash_kv_scale, sizeof(kernel_flash_kv_scale));
+        }
+        if (host_flash_kv_scale != 1.0f) {
+            out = ggml_ext_scale(ctx, out, 1.0f / host_flash_kv_scale);
         }
         return out;
     };
@@ -1395,7 +1506,7 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_attention_ext(struct ggml_context
     if (flash_attn) {
         // LOG_DEBUG("attention_ext L_q:%d L_k:%d n_head:%d C:%d d_head:%d N:%d", L_q, L_k, n_head, C, d_head, N);
         bool can_use_flash_attn = true;
-        if (can_use_flash_attn && L_k % 256 != 0) {
+        if (can_use_flash_attn && L_k % 256 != 0 && !htp_flash_prepare_in_kernel) {
             kv_pad = GGML_PAD(L_k, 256) - static_cast<int>(L_k);
         }
 
@@ -1405,7 +1516,7 @@ __STATIC_INLINE__ struct ggml_tensor* ggml_ext_attention_ext(struct ggml_context
         }
 
         if (can_use_flash_attn) {
-            kqv = build_kqv(q, k, v, mask);
+            kqv = build_kqv(q_flash, k_flash, v_flash, mask);
             if (!ggml_backend_supports_op(backend, kqv)) {
                 kqv = nullptr;
             } else {
@@ -1880,15 +1991,72 @@ protected:
         free_cache_ctx_and_buffer();
         alloc_cache_ctx();
         GGML_ASSERT(cache_buffer == nullptr);
+        // Dump/debug caching can be enabled on device to compare intermediates against host CPU.
+        // For Hexagon/HTP runs, allocating the cache buffer on the runtime backend (RPCMEM/DSP)
+        // can perturb mapper/memory behavior and, in worst cases, corrupt results. Allow forcing
+        // the cache buffer to live on CPU instead (env: GGML_RUNNER_CACHE_BACKEND=cpu).
+        ggml_backend_t cache_backend = runtime_backend;
+        if (const char * env = std::getenv("GGML_RUNNER_CACHE_BACKEND")) {
+            if (std::strcmp(env, "cpu") == 0 && cpu_backend != nullptr) {
+                cache_backend = cpu_backend;
+            }
+        }
         std::map<ggml_tensor*, ggml_tensor*> runtime_tensor_to_cache_tensor;
         for (auto kv : cache_tensor_map) {
             auto cache_tensor = ggml_dup_tensor(cache_ctx, kv.second);
+            // Preserve non-standard (strided/view-like) layouts. Otherwise the backend copy
+            // path asserts on mismatched `nb[]` (layout) even when type + shape match.
+            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                cache_tensor->nb[i] = kv.second->nb[i];
+            }
             ggml_set_name(cache_tensor, kv.first.c_str());
             runtime_tensor_to_cache_tensor[kv.second] = cache_tensor;
         }
         size_t num_tensors = ggml_tensor_num(cache_ctx);
-        cache_buffer       = ggml_backend_alloc_ctx_tensors(cache_ctx, runtime_backend);
+        cache_buffer       = ggml_backend_alloc_ctx_tensors(cache_ctx, cache_backend);
         GGML_ASSERT(cache_buffer != nullptr);
+        const bool cache_debug = std::getenv("GGML_RUNNER_CACHE_DEBUG") != nullptr;
+        auto debug_head_f32 = [&](const char * tag, const ggml_tensor * t) {
+            if (!cache_debug || t == nullptr || t->type != GGML_TYPE_F32) {
+                return;
+            }
+            const int64_t n_elem = ggml_nelements(t);
+            const size_t n = (size_t) std::min<int64_t>(16, n_elem);
+            std::vector<float> head(n);
+            ggml_backend_tensor_get(t, head.data(), 0, n*sizeof(float));
+            int n_nan = 0;
+            int n_inf = 0;
+            float mn = 0.f, mx = 0.f;
+            bool any_finite = false;
+            for (size_t i = 0; i < n; ++i) {
+                const float v = head[i];
+                if (std::isnan(v)) {
+                    n_nan++;
+                    continue;
+                }
+                if (!std::isfinite(v)) {
+                    n_inf++;
+                    continue;
+                }
+                if (!any_finite) {
+                    mn = mx = v;
+                    any_finite = true;
+                } else {
+                    mn = std::min(mn, v);
+                    mx = std::max(mx, v);
+                }
+            }
+            LOG_INFO("%s cache_debug %s: name='%s' op=%s shape=%lldx%lldx%lldx%lld head_nan=%d head_inf=%d head_min=%g head_max=%g",
+                     get_desc().c_str(),
+                     tag,
+                     ggml_get_name(t),
+                     ggml_op_desc(t),
+                     (long long)t->ne[0], (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3],
+                     n_nan,
+                     n_inf,
+                     any_finite ? mn : std::numeric_limits<float>::quiet_NaN(),
+                     any_finite ? mx : std::numeric_limits<float>::quiet_NaN());
+        };
         for (auto kv : runtime_tensor_to_cache_tensor) {
             if (kv.second->buffer == nullptr) {
                 LOG_ERROR("%s cache copy skipped: tensor '%s' dst buffer is null (src=%p op=%s)",
@@ -1933,15 +2101,16 @@ protected:
                 ggml_backend_tensor_set(kv.second, kv.first->data, 0, nbytes);
                 continue;
             }
-            if (ggml_are_same_shape(kv.first, kv.second) && ggml_are_same_stride(kv.first, kv.second)) {
+            debug_head_f32("src", kv.first);
+            if (cache_backend == runtime_backend) {
                 ggml_backend_tensor_copy(kv.first, kv.second);
             } else {
-                // Fallback for view/permute debug dumps whose runtime/backend layouts differ.
-                size_t nbytes = ggml_nbytes(kv.second);
+                const size_t nbytes = ggml_nbytes(kv.second);
                 std::vector<uint8_t> tmp(nbytes);
                 ggml_backend_tensor_get(kv.first, tmp.data(), 0, nbytes);
                 ggml_backend_tensor_set(kv.second, tmp.data(), 0, nbytes);
             }
+            debug_head_f32("dst", kv.second);
         }
         ggml_backend_synchronize(runtime_backend);
         cache_tensor_map.clear();
@@ -1949,7 +2118,7 @@ protected:
         LOG_DEBUG("%s cache backend buffer size = % 6.2f MB(%s) (%i tensors)",
                   get_desc().c_str(),
                   cache_buffer_size / (1024.f * 1024.f),
-                  ggml_backend_is_cpu(runtime_backend) ? "RAM" : "VRAM",
+                  ggml_backend_is_cpu(cache_backend) ? "RAM" : "VRAM",
                   num_tensors);
     }
 
@@ -2456,6 +2625,30 @@ public:
           force_prec_f32(force_prec_f32),
           scale(scale) {}
 
+    int64_t get_in_features() const {
+        return in_features;
+    }
+
+    int64_t get_out_features() const {
+        return out_features;
+    }
+
+    bool has_bias() const {
+        return bias;
+    }
+
+    float get_scale() const {
+        return scale;
+    }
+
+    struct ggml_tensor* get_weight_tensor() {
+        return params["weight"];
+    }
+
+    struct ggml_tensor* get_bias_tensor() {
+        return bias ? params["bias"] : nullptr;
+    }
+
     struct ggml_tensor* forward(GGMLRunnerContext* ctx, struct ggml_tensor* x) {
         struct ggml_tensor* w = params["weight"];
         struct ggml_tensor* b = nullptr;
@@ -2787,6 +2980,10 @@ public:
             float eps = 1e-06f)
         : hidden_size(hidden_size),
           eps(eps) {}
+
+    struct ggml_tensor* get_weight_tensor() {
+        return params["weight"];
+    }
 
     struct ggml_tensor* forward(GGMLRunnerContext* ctx, struct ggml_tensor* x) {
         struct ggml_tensor* w = params["weight"];

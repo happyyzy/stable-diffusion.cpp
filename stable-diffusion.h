@@ -119,8 +119,10 @@ enum sd_type_t {
     // SD_TYPE_IQ4_NL_4_4 = 36,
     // SD_TYPE_IQ4_NL_4_8 = 37,
     // SD_TYPE_IQ4_NL_8_8 = 38,
-    SD_TYPE_MXFP4 = 39,  // MXFP4 (1 block)
-    SD_TYPE_COUNT = 40,
+    SD_TYPE_WF8_HMX_PREPACK = 39,  // HMX-consumable compact WF8 prepack
+    SD_TYPE_W16_HMX_PREPACK = 40,  // HMX-consumable compact W16 prepack
+    SD_TYPE_MXFP4 = 41,            // MXFP4 (1 block)
+    SD_TYPE_COUNT = 42,
 };
 
 enum sd_log_level_t {
@@ -164,6 +166,29 @@ typedef struct {
     const char* name;
     const char* path;
 } sd_embedding_t;
+
+typedef struct {
+    bool enabled;
+    const char* accel_backend;
+    bool op_profile_enabled;
+    const char* op_profile_csv;
+    const char* op_profile_shape_csv;
+    bool htp_stats_enabled;
+    bool htp_fallback_enabled;
+    const char* htp_fallback_csv;
+    bool contract_strict;
+    const char* expected_contract_id;
+} sd_npu_runtime_opts_t;
+
+typedef struct {
+    bool valid;
+    uint64_t offloaded_ops;
+    uint64_t offloaded_mul_mat;
+    uint64_t offloaded_flash_attn;
+    uint64_t offloaded_other;
+    uint64_t offload_time_us;
+    uint64_t fallback_events;
+} sd_npu_offload_stats_t;
 
 typedef struct {
     const char* model_path;
@@ -211,6 +236,7 @@ typedef struct {
     float flow_shift;
     const char* cond_c_crossattn_path;
     const char* uncond_c_crossattn_path;
+    const sd_npu_runtime_opts_t* npu_runtime_opts;
 } sd_ctx_params_t;
 
 typedef struct {
@@ -366,6 +392,8 @@ SD_API const char* sd_vae_backend_name(enum sd_vae_backend_t backend);
 SD_API enum sd_vae_backend_t str_to_sd_vae_backend(const char* str);
 
 SD_API void sd_cache_params_init(sd_cache_params_t* cache_params);
+SD_API void sd_npu_runtime_opts_init(sd_npu_runtime_opts_t* npu_runtime_opts);
+SD_API void sd_npu_offload_stats_init(sd_npu_offload_stats_t* offload_stats);
 
 SD_API void sd_ctx_params_init(sd_ctx_params_t* sd_ctx_params);
 SD_API char* sd_ctx_params_to_str(const sd_ctx_params_t* sd_ctx_params);
