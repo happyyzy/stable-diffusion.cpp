@@ -2775,6 +2775,7 @@ void sd_img_gen_params_init(sd_img_gen_params_t* sd_img_gen_params) {
     *sd_img_gen_params = {};
     sd_sample_params_init(&sd_img_gen_params->sample_params);
     sd_img_gen_params->clip_skip         = -1;
+    sd_img_gen_params->text_ctx          = 0;
     sd_img_gen_params->ref_images_count  = 0;
     sd_img_gen_params->width             = 512;
     sd_img_gen_params->height            = 512;
@@ -2800,6 +2801,7 @@ char* sd_img_gen_params_to_str(const sd_img_gen_params_t* sd_img_gen_params) {
              "prompt: %s\n"
              "negative_prompt: %s\n"
              "clip_skip: %d\n"
+             "text_ctx: %d\n"
              "width: %d\n"
              "height: %d\n"
              "sample_params: %s\n"
@@ -2817,6 +2819,7 @@ char* sd_img_gen_params_to_str(const sd_img_gen_params_t* sd_img_gen_params) {
              SAFE_STR(sd_img_gen_params->prompt),
              SAFE_STR(sd_img_gen_params->negative_prompt),
              sd_img_gen_params->clip_skip,
+             sd_img_gen_params->text_ctx,
              sd_img_gen_params->width,
              sd_img_gen_params->height,
              SAFE_STR(sample_params_str),
@@ -3065,6 +3068,7 @@ struct GenerationRequest {
     int width                                = -1;
     int height                               = -1;
     int clip_skip                            = -1;
+    int text_ctx                             = 0;
     int vae_scale_factor                     = -1;
     int diffusion_model_down_factor          = -1;
     int64_t seed                             = -1;
@@ -3100,6 +3104,7 @@ struct GenerationRequest {
         seed                        = sd_img_gen_params->seed;
         batch_count                 = sd_img_gen_params->batch_count;
         clip_skip                   = sd_img_gen_params->clip_skip;
+        text_ctx                    = sd_img_gen_params->text_ctx;
         shifted_timestep            = sd_img_gen_params->sample_params.shifted_timestep;
         strength                    = sd_img_gen_params->strength;
         control_strength            = sd_img_gen_params->control_strength;
@@ -3730,6 +3735,32 @@ struct ConditionerRunnerDoneOnExit {
     }
 };
 
+static void truncate_text_context_tensor(sd::Tensor<float>* tensor, int text_ctx, const char* name) {
+    if (tensor == nullptr || text_ctx <= 0 || tensor->empty() || tensor->dim() < 2) {
+        return;
+    }
+
+    const int64_t old_ctx = tensor->shape()[1];
+    if (old_ctx <= text_ctx) {
+        return;
+    }
+
+    *tensor = sd::ops::slice(*tensor, 1, 0, text_ctx);
+    LOG_INFO("truncated %s text context from %" PRId64 " to %d", name, old_ctx, text_ctx);
+}
+
+static void truncate_text_context_condition(SDCondition* condition, int text_ctx, const char* name) {
+    if (condition == nullptr || text_ctx <= 0) {
+        return;
+    }
+
+    truncate_text_context_tensor(&condition->c_crossattn, text_ctx, name);
+    for (size_t i = 0; i < condition->extra_c_crossattns.size(); ++i) {
+        std::string extra_name = std::string(name) + ".extra_c_crossattns[" + std::to_string(i) + "]";
+        truncate_text_context_tensor(&condition->extra_c_crossattns[i], text_ctx, extra_name.c_str());
+    }
+}
+
 struct CircularAxesState {
     bool circular_x = false;
     bool circular_y = false;
@@ -4094,6 +4125,10 @@ static std::optional<ImageGenerationEmbeds> prepare_image_generation_embeds(sd_c
             }
         }
     }
+
+    truncate_text_context_condition(&cond, request->text_ctx, "cond");
+    truncate_text_context_condition(&uncond, request->text_ctx, "uncond");
+    truncate_text_context_condition(&img_uncond, request->text_ctx, "img_uncond");
 
     int64_t t1 = ggml_time_ms();
     LOG_INFO("get_learned_condition completed, taking %.2fs", (t1 - prepare_start_ms) * 1.0f / 1000);

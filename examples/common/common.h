@@ -191,6 +191,7 @@ struct SDGenerationParams {
     std::string prompt;
     std::string negative_prompt;
     int clip_skip              = -1;  // <= 0 represents unspecified
+    int text_ctx               = 0;   // <= 0 disables text context truncation
     int width                  = -1;
     int height                 = -1;
     int batch_count            = 1;
